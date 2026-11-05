@@ -1,0 +1,3 @@
+# Recordings are outputs: they are regenerable from a session file in a few
+# seconds, and they name paths and ids from the machine that made them.
+*.cast
