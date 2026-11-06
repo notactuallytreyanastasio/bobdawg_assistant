@@ -141,6 +141,21 @@ behind the work, and `/hints off` to stop them. Changes take effect at the next
 conversation boundary without rebuilding the cached context. New and resumed
 sessions start with hints off.
 
+An interactive session asks before bash, write and edit, and lets through commands
+that only read; `--permissions ask|edits|all` or `/permissions` changes that, and
+`--non-interactive` runs with `all` unless told otherwise. `/undo` restores what the
+last turn changed with the file tools, and does not cover bash. `AGENT.md`, `AGENTS.md`
+or `CLAUDE.md` is read into the system prompt from `~/.ds4`, the repository's root and
+the directories down to here (`--instructions off` skips them). In a prompt, `@path`
+adds a file and `!command` runs one for the model to see. `/init` writes an `AGENT.md`,
+`/review` reviews uncommitted changes, and `.ds4/commands/<name>.md` makes `/<name>`,
+with `$ARGUMENTS` for what follows it.
+
+For longer work the model keeps a task list with the `todo` tool. It shows in the
+footer as `tasks 2/5`, `/todo` prints it even mid-turn, and it survives compaction.
+`edit` takes `all=true` to replace every match, and `--continue` opens the newest
+saved session for this model, which can be from another project.
+
 When a decision graph exists for the workspace, the agent records why the work
 happened, not only what it changed. The graph is server state: it lives on the
 shared deciduous server over its MCP/HTTP API, and that server is the only

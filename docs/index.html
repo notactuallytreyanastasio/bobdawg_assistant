@@ -146,6 +146,33 @@ without one.</p>
   <li><strong>A browsing tool</strong> for the chat is still only an idea.</li>
 </ul>
 
+<h2 id="2026-11-06-agent-trust">An agent you can leave your files with</h2>
+<p><time datetime="2026-11-06">2026-11-06</time></p>
+
+<p>Held up against Claude Code, <code>ds4-agent</code> already had the tools. What it lacked was
+what makes it safe to hand a real repository: it ran every command unasked, ignored a project's
+own instructions, and had no way back from a bad edit.</p>
+
+<p>Now an interactive session asks before bash, write or edit. Commands that provably only read
+go through, on a short list that refuses anything with shell control or an option that writes.
+<code>/undo</code> puts back what the last turn changed with the file tools and tells the model
+it happened, though it cannot answer for bash. <code>AGENT.md</code>, <code>AGENTS.md</code> or
+<code>CLAUDE.md</code> go into the system prompt. <code>!command</code>, <code>@file</code>,
+<code>/init</code>, <code>/review</code> and commands of your own in
+<code>.ds4/commands</code> round it out.</p>
+
+<p>The agent also keeps a task list now. It shows in the footer, survives compaction, and is the
+model's to use or not. Asked to write a module and its tests, run them, fix what failed and write
+notes, Qwen said "Let me start by creating a todo list since this is a multi-step task", finished
+the job on its own, and its six test functions pass. Given three trivial files, it skipped the
+list. <code>edit</code> can replace every match in one change, and <code>--continue</code> reopens
+the newest saved session.</p>
+
+<p>Testing it in a real terminal with the real model found two older problems. The agent could
+only start from the repository, and a terminal that stopped reading for a moment silently lost
+output, because stdin and stdout shared the non-blocking flag. Both are fixed, and a six-second
+stall now loses nothing.</p>
+
 <h2 id="2026-11-06-pages">Whole pages, and links to them</h2>
 <p><time datetime="2026-11-06">2026-11-06</time> ·
 <a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/f9e67a2">f9e67a2</a>,
