@@ -324,6 +324,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     opt(fp, c, "--goal TEXT", "Record TEXT as this workspace's goal node on the deciduous server; the opening prompt becomes the goal otherwise.");
     opt(fp, c, "--label LABEL", "Who this session is when it writes decisions or posts to the board. Default: DECIDUOUS_AGENT_LABEL or ds4.");
+    opt(fp, c, "--hooks on|off", "Run the repository's .ds4/hooks at session and tool events. Default: on");
     opt(fp, c, "--graph on|off", "Talk to the deciduous server for this workspace, found by walking up from it. ds4 keeps no local graph. Default: on");
     fputc('\n', fp);
 }

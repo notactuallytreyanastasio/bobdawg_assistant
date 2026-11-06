@@ -1,0 +1,9 @@
+# Rules ds4-agent keeps for this repository. See ds4_hooks.h for the format.
+# <event>  <tool>  <pattern>  <command>
+
+# A commit that skips the hooks has no goal on it and no node behind it, and a push that
+# skips them is the audit not running. A person can still do either; the agent cannot.
+pre_tool  bash  *--no-verify*  echo "Refused: --no-verify skips the decision graph hooks. Fix what they report instead."; exit 2
+
+# Say what the audit would say at the push while it is still cheap to act on.
+post_tool bash  *git?commit*  ./ds4-graph audit 2>&1 | tail -n 12; exit 0

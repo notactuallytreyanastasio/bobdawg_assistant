@@ -23,7 +23,7 @@
 
 #define DEC_TIMEOUT_MS 20000
 #define DEC_ARG_MAX 48
-#define DEC_BODY_MAX (512 * 1024)
+#define DEC_BODY_MAX (16 * 1024 * 1024) /* a whole graph with details, for the audit */
 #define DEC_URL_MAX 512
 #define DEC_TOKEN_MAX 256
 #define DEC_ID_MAX 64
@@ -39,6 +39,7 @@ struct ds4_dec {
     char label[64];
     char session[DEC_SESSION_MAX];
     char instructions[DEC_INSTR_MAX];
+    char root[PATH_MAX];
     char goal_id[DEC_ID_MAX];
     char goal_title[DS4_DEC_GOAL_TITLE_MAX];
     char goal_change_id[DEC_ID_MAX];
@@ -1341,6 +1342,13 @@ static char *dec_open_goals(ds4_dec *d) {
     return b.p ? b.p : strdup("");
 }
 
+/* What this session commits belongs to its goal, and the commands it runs inherit this
+ * process's environment, which is how the commit-msg hook finds out. */
+static void dec_export_goal(const ds4_dec *d) {
+    if (d->goal_id[0]) setenv("DS4_DEC_GOAL", d->goal_id, 1);
+    else unsetenv("DS4_DEC_GOAL");
+}
+
 static char *dec_op_goal(ds4_dec *d, const char *text) {
     if (!text || !text[0]) {
         dec_buf b = {0};
@@ -1399,6 +1407,7 @@ static char *dec_op_goal(ds4_dec *d, const char *text) {
     snprintf(d->goal_title, sizeof(d->goal_title), "%s", title);
     d->goal_bound = true;
     d->offered_goal_id[0] = '\0';
+    dec_export_goal(d);
     dec_buf b = {0};
     dec_buf_addf(&b, "Goal recorded on the server%s\nid %s, held by this session\n",
                  created ? "" : " (a goal with this change id already existed)", id);
@@ -1716,6 +1725,7 @@ static char *dec_op_status(ds4_dec *d, const ds4_dec_call *c) {
         d->offered_goal_id[0] = '\0';
         snprintf(d->goal_id, sizeof(d->goal_id), "%s", node_id);
         snprintf(d->goal_title, sizeof(d->goal_title), "%s", clip);
+        dec_export_goal(d);
         dec_buf_add(&b, " It is now this session's bound goal; the goals other sessions"
                         " hold stay theirs.");
     }
@@ -1822,6 +1832,462 @@ char *ds4_dec_record_chat_turn(ds4_dec *d, const ds4_dec_chat_turn *t,
     return goal;
 }
 
+/* ---- git ---------------------------------------------------------------- */
+
+#define DEC_SHA_MAX 41
+#define DEC_FILES_MAX 64
+#define DEC_REPORT_LINES 20
+
+/* What goes into a command line. Revisions come from git and from the model, so the
+ * set is what a revision can be spelled with and a shell has no use for. */
+static bool dec_rev_ok(const char *rev) {
+    if (!rev || !rev[0]) return false;
+    for (const char *c = rev; *c; c++) {
+        if (isalnum((unsigned char)*c) || strchr("._/~^@{}-", *c)) continue;
+        if (*c == ' ' && strstr(rev, "--not --remotes")) continue;
+        return false;
+    }
+    return rev[0] != '-';
+}
+
+/* What a git command printed, without its last newline; NULL when it failed. The root
+ * is quoted, so it is refused outright if it could end the quoting. */
+static char *dec_git(const ds4_dec *d, const char *fmt, ...) {
+    if (strchr(d->root, '\'')) return NULL;
+    char args[1024], cmd[PATH_MAX + 1100];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(args, sizeof(args), fmt, ap);
+    va_end(ap);
+    snprintf(cmd, sizeof(cmd), "git -C '%s' %s 2>/dev/null", d->root, args);
+    FILE *p = popen(cmd, "r");
+    if (!p) return NULL;
+    dec_buf b = {0};
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) dec_buf_addn(&b, buf, n);
+    int rc = pclose(p);
+    if (rc != 0) {
+        free(b.p);
+        return NULL;
+    }
+    if (!b.p) return strdup("");
+    while (b.len && (b.p[b.len - 1] == '\n' || b.p[b.len - 1] == '\r')) b.p[--b.len] = '\0';
+    return b.p;
+}
+
+/* The full hash of a commit this repository has. */
+static bool dec_git_resolve(const ds4_dec *d, const char *rev, char out[DEC_SHA_MAX]) {
+    if (!dec_rev_ok(rev)) return false;
+    char *sha = dec_git(d, "rev-parse --verify --quiet '%s^{commit}'", rev);
+    bool ok = sha && strlen(sha) == DEC_SHA_MAX - 1;
+    if (ok) memcpy(out, sha, DEC_SHA_MAX);
+    free(sha);
+    return ok;
+}
+
+static unsigned long dec_hash_text(const char *text) {
+    unsigned long h = 5381;
+    for (const unsigned char *c = (const unsigned char *)text; *c; c++) h = h * 33 + *c;
+    return h;
+}
+
+static char *dec_git_link_one(ds4_dec *d, const char *goal_id, const char *sha,
+                              char *err, size_t err_len) {
+    char *trailer = NULL;
+    const char *goal = goal_id;
+    if (!goal || !goal[0]) {
+        trailer = dec_git(d, "log -1 --format='%%(trailers:key=" DS4_DEC_GOAL_TRAILER
+                             ",valueonly,separator=%%x20)' %s", sha);
+        goal = trailer;
+    }
+    if (!goal || !goal[0]) {
+        free(trailer);
+        dec_set_err(err, err_len, "%.8s has no " DS4_DEC_GOAL_TRAILER " trailer", sha);
+        return NULL;
+    }
+
+    /* The author date and subject outlive a rebase where the hash does not, so a commit
+     * replayed under a new hash finds the node it already has. */
+    char *facts = dec_git(d, "log -1 --format='%%at%%n%%s' %s", sha);
+    char *names = dec_git(d, "show --name-only --format= %s", sha);
+    char *subject = facts ? strchr(facts, '\n') : NULL;
+    if (!subject) {
+        free(trailer);
+        free(facts);
+        free(names);
+        dec_set_err(err, err_len, "cannot read commit %.8s", sha);
+        return NULL;
+    }
+    *subject++ = '\0';
+
+    const char *files[DEC_FILES_MAX];
+    int n_files = 0;
+    for (char *line = names; line && *line && n_files < DEC_FILES_MAX;) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = '\0';
+        if (line[0]) files[n_files++] = line;
+        line = next;
+    }
+
+    /* The server treats a change id as a promise of the same write, so add_node gets
+     * only what a rewrite leaves alone. The hash and the files are what change, and they
+     * go through update_node every time, which is also what repairs a replayed commit. */
+    char change_id[96], title[DS4_DEC_GOAL_TITLE_MAX];
+    snprintf(change_id, sizeof(change_id), "commit-%s-%lx", facts, dec_hash_text(subject));
+    dec_clip_title(title, sizeof(title), subject);
+    dec_args a;
+    dec_args_init(&a);
+    dec_args_str(&a, "node_type", "action");
+    dec_args_str(&a, "title", title);
+    dec_args_str(&a, "status", "completed");
+    dec_args_str(&a, "parent_id", goal);
+    dec_args_str(&a, "change_id", change_id);
+    free(facts);
+    char *payload = dec_tool_ctx(d, "add_node", &a, true, err, err_len);
+    if (!payload) {
+        free(names);
+        free(trailer);
+        return NULL;
+    }
+    bool created = true;
+    dec_json_bool(payload, "created", &created);
+    char *id = dec_json_str(payload, "id");
+    free(payload);
+
+    dec_args meta;
+    dec_args_init(&meta);
+    dec_args_str(&meta, "commit", sha);
+    dec_args_list(&meta, "files", files, n_files);
+    char *meta_json = dec_args_json(&meta);
+    dec_args_init(&a);
+    dec_args_str(&a, "node_id", id);
+    dec_args_raw(&a, "metadata", meta_json);
+    free(meta_json);
+    free(names);
+    char *updated = dec_tool_ctx(d, "update_node", &a, false, err, err_len);
+    free(id);
+    if (!updated) {
+        free(trailer);
+        return NULL;
+    }
+    free(updated);
+    dec_buf b = {0};
+    dec_buf_addf(&b, "%.8s %s under goal %.8s", sha, created ? "linked" : "relinked", goal);
+    free(trailer);
+    return b.p;
+}
+
+char *ds4_dec_git_link(ds4_dec *d, const char *goal_id, const char *rev,
+                       char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    if (!dec_rev_ok(rev)) {
+        dec_set_err(err, err_len, "not a revision: %s", rev ? rev : "");
+        return NULL;
+    }
+    char sha[DEC_SHA_MAX];
+    if (!strstr(rev, "..") && dec_git_resolve(d, rev, sha))
+        return dec_git_link_one(d, goal_id, sha, err, err_len);
+
+    char *list = dec_git(d, "rev-list --reverse --no-merges %s", rev);
+    if (!list) {
+        dec_set_err(err, err_len, "git does not know %s", rev);
+        return NULL;
+    }
+    dec_buf b = {0};
+    for (char *line = list; line && *line;) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = '\0';
+        char *one = dec_git_link_one(d, goal_id, line, err, err_len);
+        if (!one) {
+            free(list);
+            free(b.p);
+            return NULL;
+        }
+        dec_buf_addf(&b, "%s\n", one);
+        free(one);
+        line = next;
+    }
+    free(list);
+    return b.p ? b.p : strdup("nothing in that range");
+}
+
+static bool dec_is_hex(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+}
+
+/* A copy of text with every whole hex word that abbreviates old_sha spelled from
+ * new_sha at the same length, so a seven character mention stays seven characters. */
+static char *dec_swap_hash(const char *text, const char *old_sha, const char *new_sha, bool *changed) {
+    dec_buf b = {0};
+    const char *p = text;
+    while (*p) {
+        if (!dec_is_hex(*p)) {
+            dec_buf_addn(&b, p++, 1);
+            continue;
+        }
+        const char *end = p;
+        while (dec_is_hex(*end)) end++;
+        size_t len = (size_t)(end - p);
+        bool joined = p > text && (isalnum((unsigned char)p[-1]) || p[-1] == '-');
+        if (!joined && !isalnum((unsigned char)*end) && *end != '-' &&
+            len >= 7 && len <= strlen(old_sha) && !strncmp(p, old_sha, len)) {
+            dec_buf_addn(&b, new_sha, len);
+            *changed = true;
+        } else {
+            dec_buf_addn(&b, p, len);
+        }
+        p = end;
+    }
+    return b.p ? b.p : strdup("");
+}
+
+char *ds4_dec_git_rewrite(ds4_dec *d, const char *old_sha, const char *new_sha,
+                          char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    char old_full[DEC_SHA_MAX], new_full[DEC_SHA_MAX];
+    /* The old commit may be gone by the time anyone asks; the hook hands over full
+     * hashes, and a person repairing by hand may only have what the graph printed. */
+    snprintf(old_full, sizeof(old_full), "%s", old_sha ? old_sha : "");
+    for (const char *c = old_full; *c; c++) {
+        if (!dec_is_hex(*c)) {
+            dec_set_err(err, err_len, "not a hash: %s", old_full);
+            return NULL;
+        }
+    }
+    if (strlen(old_full) < 7) {
+        dec_set_err(err, err_len, "%s", "a hash needs at least seven characters");
+        return NULL;
+    }
+    if (!dec_git_resolve(d, new_sha, new_full)) {
+        dec_set_err(err, err_len, "this repository has no commit %s", new_sha ? new_sha : "");
+        return NULL;
+    }
+    dec_args a;
+    dec_args_init(&a);
+    dec_args_bool(&a, "include_details", true);
+    dec_args_int(&a, "max_nodes", 20000);
+    char *payload = dec_tool_ctx(d, "get_graph", &a, true, err, err_len);
+    char *nodes = payload ? dec_json_raw(payload, "nodes") : NULL;
+    free(payload);
+    if (!nodes) {
+        if (err && !err[0]) dec_set_err(err, err_len, "%s", "the graph could not be read");
+        return NULL;
+    }
+    size_t old_len = strlen(old_full);
+    int updated = 0;
+    for (int i = 0;; i++) {
+        const char *elem = dec_json_elem(nodes, i);
+        if (!elem) break;
+        char *id = dec_json_str(elem, "id");
+        char *title = dec_json_str(elem, "title");
+        char *description = dec_json_str(elem, "description");
+        const char *meta = dec_json_member(elem, "metadata");
+        char *commit = meta ? dec_json_str(meta, "commit") : NULL;
+        /* Either may be the abbreviation: the node's field or the hash being replaced. */
+        size_t held = commit ? strlen(commit) : 0;
+        bool field = held >= 7 && !strncmp(commit, old_full, held < old_len ? held : old_len);
+        bool in_title = false, in_description = false;
+        char *new_title = dec_swap_hash(title ? title : "", old_full, new_full, &in_title);
+        char *new_description = dec_swap_hash(description ? description : "", old_full, new_full,
+                                              &in_description);
+        if (field || in_title || in_description) {
+            dec_args_init(&a);
+            dec_args_str(&a, "node_id", id);
+            if (in_title) dec_args_str(&a, "title", new_title);
+            if (in_description) dec_args_str(&a, "description", new_description);
+            if (field) {
+                dec_buf m = {0};
+                dec_buf_add(&m, "{\"commit\":");
+                dec_buf_add_json_str(&m, new_full);
+                dec_buf_add(&m, "}");
+                dec_args_raw(&a, "metadata", m.p);
+                free(m.p);
+            }
+            char *done = dec_tool_ctx(d, "update_node", &a, false, err, err_len);
+            if (done) updated++;
+            free(done);
+        }
+        free(id);
+        free(title);
+        free(description);
+        free(commit);
+        free(new_title);
+        free(new_description);
+    }
+    free(nodes);
+    dec_buf b = {0};
+    dec_buf_addf(&b, "%.8s is now %.8s in %d node%s", old_full, new_full, updated, updated == 1 ? "" : "s");
+    return b.p;
+}
+
+/* The hashes a node claims: its commit field, and hex words written after the word
+ * commit. Bare hex is not enough, because this graph's text is full of node id prefixes
+ * of exactly that shape. */
+typedef struct {
+    char (*v)[DEC_SHA_MAX];
+    int len, cap;
+} dec_hash_set;
+
+static void dec_hash_add(dec_hash_set *s, const char *hash, size_t len) {
+    if (len >= DEC_SHA_MAX) return;
+    if (s->len == s->cap) {
+        int cap = s->cap ? s->cap * 2 : 64;
+        void *grown = realloc(s->v, sizeof(*s->v) * (size_t)cap);
+        if (!grown) return;
+        s->v = grown;
+        s->cap = cap;
+    }
+    memcpy(s->v[s->len], hash, len);
+    s->v[s->len][len] = '\0';
+    s->len++;
+}
+
+/* One hex word at p, of a length a commit is written at, with something in it no plain
+ * word has: a digit and a letter. Returns its length, or 0. */
+static size_t dec_hash_word(const char *p) {
+    size_t len = 0;
+    bool digit = false, letter = false;
+    while (dec_is_hex(p[len])) {
+        if (isdigit((unsigned char)p[len])) digit = true;
+        else letter = true;
+        len++;
+    }
+    bool whole = !isalnum((unsigned char)p[len]) && p[len] != '-';
+    return len >= 7 && len <= 40 && digit && letter && whole ? len : 0;
+}
+
+/* Hashes written as such: "commit X", "Committed as X", "Commits X, Y and Z". The hash
+ * has to come straight after the word, because this graph's text also says things like
+ * "commit discipline for the directory (4931eb9d)", where that is a node id. */
+static void dec_hashes_in_text(dec_hash_set *s, const char *text) {
+    for (const char *p = text; p && *p; p++) {
+        if (strncasecmp(p, "commit", 6) != 0) continue;
+        const char *q = p + 6;
+        if (!strncmp(q, "ted", 3)) q += 3;
+        else if (*q == 's') q++;
+        while (*q == ' ' || *q == ':') q++;
+        if (!strncmp(q, "as ", 3)) q += 3;
+        for (;;) {
+            size_t len = dec_hash_word(q);
+            if (!len) break;
+            dec_hash_add(s, q, len);
+            q += len;
+            if (q[0] == ',' && q[1] == ' ') q += 2;
+            else if (!strncmp(q, " and ", 5)) q += 5;
+            else break;
+        }
+    }
+}
+
+static bool dec_hash_named(const dec_hash_set *s, const char *sha) {
+    for (int i = 0; i < s->len; i++)
+        if (!strncmp(s->v[i], sha, strlen(s->v[i]))) return true;
+    return false;
+}
+
+char *ds4_dec_git_audit(ds4_dec *d, const char *range, int *problems,
+                        char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    if (problems) *problems = 0;
+    const char *span = range && range[0] ? range : NULL;
+    char *upstream = NULL;
+    if (!span) {
+        upstream = dec_git(d, "rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'");
+        span = upstream ? "@{upstream}..HEAD" : "HEAD --not --remotes";
+    }
+    if (!dec_rev_ok(span)) {
+        free(upstream);
+        dec_set_err(err, err_len, "not a range: %s", span);
+        return NULL;
+    }
+    char *commits = dec_git(d, "rev-list --no-merges %s", span);
+    if (!commits) {
+        dec_set_err(err, err_len, "git does not know the range %s", span);
+        free(upstream);
+        return NULL;
+    }
+
+    dec_args a;
+    dec_args_init(&a);
+    dec_args_bool(&a, "include_details", true);
+    dec_args_int(&a, "max_nodes", 20000);
+    char *payload = dec_tool_ctx(d, "get_graph", &a, true, err, err_len);
+    char *nodes = payload ? dec_json_raw(payload, "nodes") : NULL;
+    free(payload);
+    if (!nodes) {
+        free(commits);
+        free(upstream);
+        if (err && !err[0]) dec_set_err(err, err_len, "%s", "the graph could not be read");
+        return NULL;
+    }
+
+    dec_hash_set named = {0};
+    dec_buf report = {0};
+    int stale = 0, unlinked = 0, checked = 0, total = 0;
+    for (int i = 0;; i++) {
+        const char *elem = dec_json_elem(nodes, i);
+        if (!elem) break;
+        total++;
+        dec_hash_set own = {0};
+        const char *meta = dec_json_member(elem, "metadata");
+        char *commit = meta ? dec_json_str(meta, "commit") : NULL;
+        char *title = dec_json_str(elem, "title");
+        char *description = dec_json_str(elem, "description");
+        char *id = dec_json_str(elem, "id");
+        if (commit && commit[0]) dec_hash_add(&own, commit, strlen(commit));
+        dec_hashes_in_text(&own, title);
+        dec_hashes_in_text(&own, description);
+        for (int h = 0; h < own.len; h++) {
+            char sha[DEC_SHA_MAX];
+            dec_hash_add(&named, own.v[h], strlen(own.v[h]));
+            checked++;
+            if (dec_git_resolve(d, own.v[h], sha)) continue;
+            stale++;
+            if (stale <= DEC_REPORT_LINES)
+                dec_buf_addf(&report, "stale: node %.8s names %s, which this repository does not have\n",
+                             id ? id : "?", own.v[h]);
+        }
+        free(own.v);
+        free(commit);
+        free(title);
+        free(description);
+        free(id);
+    }
+    free(nodes);
+
+    int in_range = 0;
+    for (char *line = commits; line && *line;) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = '\0';
+        in_range++;
+        if (!dec_hash_named(&named, line)) {
+            unlinked++;
+            if (unlinked <= DEC_REPORT_LINES) {
+                char *subject = dec_git(d, "log -1 --format=%%s %s", line);
+                dec_buf_addf(&report, "unlinked: %.8s %s\n", line, subject ? subject : "");
+                free(subject);
+            }
+        }
+        line = next;
+    }
+    free(commits);
+    free(named.v);
+    free(upstream);
+
+    if (problems) *problems = stale + unlinked;
+    dec_buf_addf(&report, "%d node%s on %s, %d hash%s named: %d stale. %d commit%s in %s: %d unlinked.\n",
+                 total, total == 1 ? "" : "s", d->branch, checked, checked == 1 ? "" : "es", stale,
+                 in_range, in_range == 1 ? "" : "s", range && range[0] ? range : "what is unpushed", unlinked);
+    return report.p;
+}
+
+static char *dec_op_audit(ds4_dec *d, const ds4_dec_call *c) {
+    char err[512] = {0};
+    char *report = ds4_dec_git_audit(d, dec_arg(c, "range"), NULL, err, sizeof(err));
+    return report ? report : dec_fail(err);
+}
+
 /* ---- the seam the agent uses ------------------------------------------- */
 
 char *ds4_dec_execute(ds4_dec *d, const ds4_dec_call *call, char *err, size_t err_len) {
@@ -1832,7 +2298,7 @@ char *ds4_dec_execute(ds4_dec *d, const ds4_dec_call *call, char *err, size_t er
     }
     if (!call || !call->tool || !call->tool[0]) {
         dec_set_err(err, err_len, "%s",
-                    "deciduous needs op=decide|turn|note|graph|board|goal|status");
+                    "deciduous needs op=decide|turn|note|graph|board|goal|status|audit");
         return NULL;
     }
 
@@ -1904,9 +2370,11 @@ char *ds4_dec_execute(ds4_dec *d, const ds4_dec_call *call, char *err, size_t er
         obs = dec_op_goal(d, dec_arg(call, "prompt"));
     else if (!strcmp(tool, "status"))
         obs = dec_op_status(d, call);
+    else if (!strcmp(tool, "audit"))
+        obs = dec_op_audit(d, call);
     else {
         dec_set_err(err, err_len,
-                    "deciduous has no op \"%s\"; use decide, turn, graph, board, note, goal or status",
+                    "deciduous has no op \"%s\"; use decide, turn, graph, board, note, goal, status or audit",
                     tool);
         return NULL;
     }
@@ -2053,6 +2521,7 @@ ds4_dec *ds4_dec_open(const char *root, const char *label) {
     if (!d) return NULL;
     snprintf(d->label, sizeof(d->label), "%s",
              (label && label[0]) ? label : "ds4-agent");
+    snprintf(d->root, sizeof(d->root), "%s", root);
 
     char resolve_err[512] = {0};
     if (!dec_resolve(d, root, resolve_err, sizeof(resolve_err))) {
@@ -2097,6 +2566,7 @@ void ds4_dec_release_goal(ds4_dec *d) {
     d->goal_id[0] = '\0';
     d->goal_title[0] = '\0';
     d->goal_bound = false;
+    dec_export_goal(d);
     d->goal_change_id[0] = '\0';
     /* The next session has its own news, so the tally the closing note reads
      * from starts over with the goal. */
@@ -2416,7 +2886,7 @@ const char *ds4_dec_prompt_section(const ds4_dec *d) {
         "the workspace for this repository. You never maintain files, and nothing you\n"
         "write here is stored in the repository. One Postgres behind one endpoint; the\n"
         "workspace keeps projects apart.\n"
-        "You do not have the server's tool names. The deciduous tool gives you seven\n"
+        "You do not have the server's tool names. The deciduous tool gives you eight\n"
         "operations over it:\n"
         "- op=decide records a real choice: title, chosen_option, one or more\n"
         "  rejected_option, rationale. The graph stores the chosen option as the\n"
@@ -2432,6 +2902,9 @@ const char *ds4_dec_prompt_section(const ds4_dec *d) {
         "  that are waiting on you; add all=1 to see everything recent.\n"
         "- op=goal and op=status are for the goal node itself: pass prompt to goal when\n"
         "  no goal is bound, and node_id with status to move a node by hand.\n"
+        "- op=audit checks the graph against git: commits no node names, and nodes naming\n"
+        "  commits that are gone; pass range= to look past what is unpushed. What you\n"
+        "  commit is linked to your goal by a git hook, so you do not record hashes.\n"
         "Write while you work, at these moments, not afterwards:\n"
         "- You see more than one way to do it and pick one: op=decide, naming what it beat.\n"
         "- You change code or config, and it works or fails: op=turn with action and\n"

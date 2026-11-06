@@ -8,6 +8,7 @@
 #include "ds4_tp.h"
 #include "ds4_web.h"
 #include "ds4_deciduous.h"
+#include "ds4_hooks.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -93,6 +94,7 @@ typedef struct {
     const char *goal;      /* --goal: the decision-graph goal this session serves */
     const char *dec_label; /* --label: who this session is on the graph */
     bool graph_off;        /* --graph off: stay blind to any decision graph */
+    bool hooks_off;        /* --hooks off: run no .ds4/hooks */
     bool non_interactive;
     bool edit_upto;
 } agent_config;
@@ -205,6 +207,8 @@ typedef struct {
      * note. /new rebuilds the transcript from the system prompt, so it clears
      * this and the graph rules get injected again. */
     bool dec_note_injected;
+    ds4_hooks *hooks;      /* .ds4/hooks, for the life of the session */
+    bool hooks_loaded;
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
@@ -971,6 +975,14 @@ static agent_config parse_options(int argc, char **argv) {
             c.goal = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--label")) {
             c.dec_label = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--hooks")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (!strcmp(mode, "off")) c.hooks_off = true;
+            else if (!strcmp(mode, "on")) c.hooks_off = false;
+            else {
+                fprintf(stderr, "ds4-agent: --hooks wants on or off\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--graph")) {
             const char *mode = need_arg(&i, argc, argv, arg);
             if (!strcmp(mode, "off")) c.graph_off = true;
@@ -1303,11 +1315,11 @@ static const char agent_tools_prompt_after_edit[] =
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
     "    \"name\": \"deciduous\",\n"
-    "    \"description\": \"Record and read this workspace's decision graph on the deciduous server: op decide|turn|note|graph|board|goal|status.\",\n"
+    "    \"description\": \"Record and read this workspace's decision graph on the deciduous server: op decide|turn|note|graph|board|goal|status|audit.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
-    "        \"op\": {\"type\": \"string\", \"enum\": [\"decide\", \"turn\", \"note\", \"graph\", \"board\", \"goal\", \"status\"]},\n"
+    "        \"op\": {\"type\": \"string\", \"enum\": [\"decide\", \"turn\", \"note\", \"graph\", \"board\", \"goal\", \"status\", \"audit\"]},\n"
     "        \"title\": {\"type\": \"string\", \"description\": \"op=decide and op=note: what the record is about\"},\n"
     "        \"chosen_option\": {\"type\": \"string\", \"description\": \"op=decide: the option taken\"},\n"
     "        \"rejected_option\": {\"type\": \"string\", \"description\": \"op=decide: an option closed off; repeat once per option\"},\n"
@@ -1326,7 +1338,8 @@ static const char agent_tools_prompt_after_edit[] =
     "        \"all\": {\"type\": \"string\", \"description\": \"op=board: read every recent message, not only those waiting for this session\"},\n"
     "        \"prompt\": {\"type\": \"string\", \"description\": \"op=goal: the request, verbatim\"},\n"
     "        \"node_id\": {\"type\": \"string\", \"description\": \"op=status: the node to move\"},\n"
-    "        \"status\": {\"type\": \"string\", \"description\": \"op=status: the state to move it to\"}\n"
+    "        \"status\": {\"type\": \"string\", \"description\": \"op=status: the state to move it to\"},\n"
+    "        \"range\": {\"type\": \"string\", \"description\": \"op=audit: git revision range; default what is unpushed\"}\n"
     "      },\n"
     "      \"required\": [\"op\"]\n"
     "    }\n"
@@ -1412,7 +1425,7 @@ static const char agent_glm_tool_schemas[] =
     "{\"name\":\"edit\",\"description\":\"Replace one exact old text match.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},\"required\":[\"path\",\"old\",\"new\"]}}\n"
     "{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\",\"enum\":[\"literal\",\"regex\"]},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"integer\"},\"max_results\":{\"type\":\"integer\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}\n"
     "{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n"
-    "{\"name\":\"deciduous\",\"description\":\"Record and read this workspace's decision graph on the deciduous server: op decide|turn|note|graph|board|goal|status.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"enum\":[\"decide\",\"turn\",\"note\",\"graph\",\"board\",\"goal\",\"status\"]},\"title\":{\"type\":\"string\",\"description\":\"op=decide and op=note: what the record is about\"},\"chosen_option\":{\"type\":\"string\",\"description\":\"op=decide: the option taken\"},\"rejected_option\":{\"type\":\"string\",\"description\":\"op=decide: an option closed off; repeat once per option\"},\"rationale\":{\"type\":\"string\",\"description\":\"op=decide: why the chosen option won\"},\"summary\":{\"type\":\"string\",\"description\":\"op=turn: the step in one line\"},\"observation\":{\"type\":\"string\",\"description\":\"op=turn: what a tool result showed; repeat as needed\"},\"decision\":{\"type\":\"string\",\"description\":\"op=turn: the choice the step settled\"},\"action\":{\"type\":\"string\",\"description\":\"op=turn: what was done\"},\"outcome\":{\"type\":\"string\",\"description\":\"op=turn: how it ended\"},\"description\":{\"type\":\"string\",\"description\":\"op=note: the fact, in full\"},\"why\":{\"type\":\"string\",\"description\":\"op=note: why it matters; op=board: why the message is being sent\"},\"question\":{\"type\":\"string\",\"description\":\"op=graph: what to ask the graph\"},\"subject\":{\"type\":\"string\",\"description\":\"op=board: headline of the message to post\"},\"body\":{\"type\":\"string\",\"description\":\"op=board: the message to post; subject and body together post, neither alone reads\"},\"reply_to\":{\"type\":\"string\",\"description\":\"op=board: message id being answered\"},\"all\":{\"type\":\"string\",\"description\":\"op=board: read every recent message, not only those waiting for this session\"},\"prompt\":{\"type\":\"string\",\"description\":\"op=goal: the request, verbatim\"},\"node_id\":{\"type\":\"string\",\"description\":\"op=status: the node to move\"},\"status\":{\"type\":\"string\",\"description\":\"op=status: the state to move it to\"}},\"required\":[\"op\"]}}\n";
+    "{\"name\":\"deciduous\",\"description\":\"Record and read this workspace's decision graph on the deciduous server: op decide|turn|note|graph|board|goal|status|audit.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"enum\":[\"decide\",\"turn\",\"note\",\"graph\",\"board\",\"goal\",\"status\",\"audit\"]},\"title\":{\"type\":\"string\",\"description\":\"op=decide and op=note: what the record is about\"},\"chosen_option\":{\"type\":\"string\",\"description\":\"op=decide: the option taken\"},\"rejected_option\":{\"type\":\"string\",\"description\":\"op=decide: an option closed off; repeat once per option\"},\"rationale\":{\"type\":\"string\",\"description\":\"op=decide: why the chosen option won\"},\"summary\":{\"type\":\"string\",\"description\":\"op=turn: the step in one line\"},\"observation\":{\"type\":\"string\",\"description\":\"op=turn: what a tool result showed; repeat as needed\"},\"decision\":{\"type\":\"string\",\"description\":\"op=turn: the choice the step settled\"},\"action\":{\"type\":\"string\",\"description\":\"op=turn: what was done\"},\"outcome\":{\"type\":\"string\",\"description\":\"op=turn: how it ended\"},\"description\":{\"type\":\"string\",\"description\":\"op=note: the fact, in full\"},\"why\":{\"type\":\"string\",\"description\":\"op=note: why it matters; op=board: why the message is being sent\"},\"question\":{\"type\":\"string\",\"description\":\"op=graph: what to ask the graph\"},\"subject\":{\"type\":\"string\",\"description\":\"op=board: headline of the message to post\"},\"body\":{\"type\":\"string\",\"description\":\"op=board: the message to post; subject and body together post, neither alone reads\"},\"reply_to\":{\"type\":\"string\",\"description\":\"op=board: message id being answered\"},\"all\":{\"type\":\"string\",\"description\":\"op=board: read every recent message, not only those waiting for this session\"},\"prompt\":{\"type\":\"string\",\"description\":\"op=goal: the request, verbatim\"},\"node_id\":{\"type\":\"string\",\"description\":\"op=status: the node to move\"},\"status\":{\"type\":\"string\",\"description\":\"op=status: the state to move it to\"},\"range\":{\"type\":\"string\",\"description\":\"op=audit: git revision range; default what is unpushed\"}},\"required\":[\"op\"]}}\n";
 
 static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     size_t schemas_len = strlen(agent_glm_tool_schemas);
@@ -1665,6 +1678,25 @@ static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
  * without a reachable server this session is graph-blind, and says so. ds4
  * holds no local copy to fall back to. */
 static bool agent_text_is_goal_worthy(const char *text);
+
+/* The repository's rules, read once as the session starts so nothing done during the
+ * session can lift one. A file that does not parse is said out loud: a session that
+ * quietly lost its rules is the failure this exists to prevent. */
+static void agent_worker_maybe_load_hooks(agent_worker *w, const agent_config *cfg) {
+    char root[PATH_MAX], err[PATH_MAX + 80];
+
+    if (w->hooks_loaded || cfg->hooks_off) return;
+    w->hooks_loaded = true;
+    if (!ds4_dec_find_root(NULL, root, sizeof(root))) return;
+    w->hooks = ds4_hooks_load(root, err, sizeof(err));
+    if (!w->hooks) {
+        if (err[0]) fprintf(stderr, "ds4-agent: hooks not loaded: %s\n", err);
+        return;
+    }
+    ds4_hook_result r = ds4_hooks_run(w->hooks, DS4_HOOK_SESSION_START, "", "", NULL, -1);
+    if (r.output[0]) ds4_chat_append_message(w->engine, &w->transcript, "system", r.output);
+    free(r.output);
+}
 
 /* Without --goal, the opening request is what this session is working for:
  * record it as the goal node, so options and decisions later have something
@@ -9751,6 +9783,46 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     }
 }
 
+/* What a hook's pattern is matched against: the argument that says what the call is. */
+static const char *agent_hook_arg(const agent_tool_call *call) {
+    static const char *const keys[] = {"command", "path", "op", "query", "url"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const char *value = agent_tool_arg_value(call, keys[i]);
+        if (value) return value;
+    }
+    return "";
+}
+
+/* The tool does not run when a hook says no, and the model hears why as a tool error,
+ * which is what it already knows how to recover from. */
+static bool agent_tool_refused_by_hook(agent_worker *w, const agent_tool_call *call,
+                                       agent_tool_observation *obs) {
+    if (!w->hooks || !call->name) return false;
+    ds4_hook_result r = ds4_hooks_run(w->hooks, DS4_HOOK_PRE_TOOL, call->name,
+                                      agent_hook_arg(call), NULL, -1);
+    if (r.blocked) {
+        agent_tool_observation_puts(obs, "Tool error: refused by a hook, the tool did not run: ");
+        agent_tool_observation_puts(obs, r.output[0] ? r.output : "no reason given");
+        agent_tool_observation_puts(obs, "\n");
+    } else if (r.output[0]) {
+        agent_tool_observation_puts(obs, r.output);
+    }
+    bool blocked = r.blocked;
+    free(r.output);
+    return blocked;
+}
+
+static void agent_tool_post_hooks(agent_worker *w, const agent_tool_call *call, const char *res,
+                                  agent_tool_observation *obs) {
+    if (!w->hooks || !call->name) return;
+    const char *seen = strstr(res, "exit_status=");
+    int status = seen ? (int)strtol(seen + 12, NULL, 10) : -1;
+    ds4_hook_result r = ds4_hooks_run(w->hooks, DS4_HOOK_POST_TOOL, call->name,
+                                      agent_hook_arg(call), res, status);
+    if (r.output[0]) agent_tool_observation_puts(obs, r.output);
+    free(r.output);
+}
+
 static agent_tool_observation agent_execute_tool_observation(
         agent_worker *w, const agent_tool_calls *calls) {
     agent_tool_observation obs;
@@ -9761,12 +9833,15 @@ static agent_tool_observation agent_execute_tool_observation(
                  calls->v[i].name ? calls->v[i].name : "unknown");
         agent_tool_observation_puts(&obs, hdr);
         if (calls->v[i].name && !strcmp(calls->v[i].name, "view_image")) {
-            agent_tool_view_image(w, &calls->v[i], &obs);
+            if (!agent_tool_refused_by_hook(w, &calls->v[i], &obs))
+                agent_tool_view_image(w, &calls->v[i], &obs);
             continue;
         }
+        if (agent_tool_refused_by_hook(w, &calls->v[i], &obs)) continue;
         char *res = agent_execute_tool_call(w, &calls->v[i]);
         agent_tool_observation_puts(&obs, res);
         agent_note_graph_moments(w, &calls->v[i], res, &obs);
+        agent_tool_post_hooks(w, &calls->v[i], res, &obs);
         if (res[0] && res[strlen(res) - 1] != '\n')
             agent_tool_observation_puts(&obs, "\n");
         free(res);
@@ -10579,6 +10654,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         return 1;
     }
     agent_worker_maybe_append_datetime_context(w);
+    agent_worker_maybe_load_hooks(w, cfg);
     /* Then the decision graph: its rules shape the first response, and its
      * recovery state is what tells a resumed session where to resume. */
     agent_worker_maybe_open_graph(w, cfg, user_text);
@@ -12999,6 +13075,12 @@ static void agent_worker_free(agent_worker *w) {
     if (closing && closing[0]) fprintf(stderr, "ds4-agent: %s\n", closing);
     free(closing);
     ds4_dec_close(w->dec);
+    if (w->hooks) {
+        ds4_hook_result ended = ds4_hooks_run(w->hooks, DS4_HOOK_SESSION_END, "", "", NULL, -1);
+        free(ended.output);
+        ds4_hooks_free(w->hooks);
+        w->hooks = NULL;
+    }
     w->dec = NULL;
     ds4_web_free(w->web);
     ds4_session_free(w->session);

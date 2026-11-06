@@ -42,11 +42,15 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 - `ds4_agent.c`: the local agent harness: system prompt assembly, per-model tool
   formats and tool dispatch, sessions, compaction, and the deciduous integration.
 - `ds4_deciduous.c`, `ds4_deciduous.h`: the deciduous seam, in full. MCP-over-HTTP
-  client, the seven graph operations the model is offered, the prompt teaching and
+  client, the eight graph operations the model is offered, the git link and audit, the prompt teaching and
   the graph briefing, the recovery note, the compaction digest and the closing
   note. The shared server is the only writer; ds4 stores no graph itself, marks a
   goal completed only through the explicit `/done`, and posts a closing note only
   when the session actually recorded something.
+- `ds4_hooks.c`, `ds4_hooks.h`: the agent's hooks engine, which runs the commands in
+  `.ds4/hooks` at session and tool events. It knows nothing of git or the graph.
+- `ds4_graph.c`: `ds4-graph`, the graph's side of git, for `githooks/` to call. It
+  links no model. Run `./ds4-graph install` once per clone.
 - `ds4_help.c`: the usage text and option descriptions the CLI prints. The parser
   itself is in `ds4_agent.c`; help text and parser must be edited together.
 - `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
@@ -67,6 +71,9 @@ a model, which is the only safe way to test it while a session is running from t
 linked `./ds4-agent` binary. Its deciduous graph tests are not mocked: they write
 through the shared deciduous server into a workspace of their own (`ds4-selftest`)
 and skip themselves, saying why, when that server is not reachable.
+
+`make test-graph-git` runs the git hooks end to end in a throwaway repository: real
+git, real `ds4-graph`, the real deciduous server in `ds4-selftest`.
 
 At every major change where one of the following could be affected, make sure to:
 

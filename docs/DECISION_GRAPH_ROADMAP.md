@@ -12,6 +12,9 @@ model remembering to write while it works. The phases below move deciduous from
 "tool the model may use" to "the state the session is shaped by", without ever
 letting ds4 keep a local copy of the graph.
 
+Commits and tool events are covered by [Git](DECISION_GRAPH.md#git) and
+[Hooks](DECISION_GRAPH.md#hooks), which came after this plan and sit beside it.
+
 ## Ground rules every phase obeys
 
 - The server stays the only writer and the only reader. No local file, cache or

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Installed by ds4-graph install. The decision graph's side of git: see docs/DECISION_GRAPH.md.
+top=$(git rev-parse --show-toplevel)
+if [ ! -x "$top/ds4-graph" ]; then
+  exit 0
+fi
+exec "$top/ds4-graph" hook post-rewrite "$@"

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Installed by ds4-graph install. The decision graph's side of git: see docs/DECISION_GRAPH.md.
+top=$(git rev-parse --show-toplevel)
+if [ ! -x "$top/ds4-graph" ]; then
+  echo "ds4-graph is not built, so this push cannot be checked: make ds4-graph" >&2
+  exit 1
+fi
+exec "$top/ds4-graph" hook pre-push "$@"

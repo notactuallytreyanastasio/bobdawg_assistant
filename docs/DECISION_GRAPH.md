@@ -25,7 +25,7 @@ no SQLite database, no cache, no mirror, and ds4 never runs the `deciduous` CLI:
 - When the server is unreachable, ds4 says so and writes nothing. There is no
   fallback store to quietly fall through to, and nothing to reconcile later.
 
-`ds4_deciduous.c` is the whole seam: the HTTP/JSON-RPC client, the seven
+`ds4_deciduous.c` is the whole seam: the HTTP/JSON-RPC client, the eight
 operations, the teaching and the briefing that go into the prompt, the recovery
 note, the compaction digest, the closing note and the explicit `/done`.
 
@@ -46,7 +46,7 @@ has been written to it yet" rather than an error ds4 invents. A bare URL gets th
 `/mcp` path. `https://` is refused: ds4 has no TLS client, so point at a plain
 `http://` endpoint — a local server, or a local proxy that speaks TLS onward.
 
-## One tool, seven operations
+## One tool, eight operations
 
 The server's twenty-one tools — `add_node`, `add_edge`, `query_nodes`,
 `get_descendants` and the rest — are not shown to the model. ds4 offers one tool,
@@ -62,6 +62,7 @@ itself would spend its budget on bookkeeping:
 | `op=graph question="which option was rejected"` | `ask_graph` — the server searches the graph and returns the nodes carrying the answer |
 | `op=board subject= body= why= reply_to=` | `post_message`; with neither subject nor body, `read_messages` answers what is waiting for this session's label, and `all=1` reads everything recent |
 | `op=status node_id= status=` | `update_node` — and naming a goal node claims it for this session |
+| `op=audit range=` | `get_graph`, compared with git — see [Git](#git) |
 
 A call missing the field its op cannot work without is refused before any request
 goes out, and the refusal names the field. `--graph off` leaves the tool out of
@@ -118,7 +119,7 @@ remember which goal it last held, so `op=goal` with no prompt lists the open one
 
 ## What the model is told
 
-`ds4_dec_prompt_section()` opens the session: the seven operations, the three
+`ds4_dec_prompt_section()` opens the session: the eight operations, the three
 write moments, this workspace and branch the writes land in, and the bound goal.
 A resumed session gets `ds4_dec_recovery_note()` — who holds the goal, or which
 goal is waiting to be claimed. `/new` teaches it again after rebuilding the
@@ -173,6 +174,81 @@ goal is bound or no server answers.
 ```sh
 /done        # only ever by request
 ```
+
+## Git
+
+A hash stops being true the moment history is rewritten, so the link between a commit
+and the graph is not the hash. It is a trailer in the commit message, which goes wherever
+the commit goes:
+
+```
+Deciduous-Goal: 94caec88-c7d7-4f8e-8722-fb747cb6c454
+```
+
+`ds4-graph` is the graph's side of git. It links no model, so a git hook can afford to
+run it, and its logic is the same `ds4_dec_git_*` the agent's `op=audit` calls, so there is
+one answer to whether the graph and git agree. `./ds4-graph install` points git at
+`githooks/`, a setting in this clone's own `.git/config`:
+
+| Hook | What it does |
+| --- | --- |
+| `commit-msg` | Stamps the trailer from `DS4_DEC_GOAL`, which an agent session exports when it binds a goal. A commit with neither is warned about, not refused |
+| `post-commit` | Writes the commit as an action under its goal, with its hash and files. A server that cannot be reached is reported; the commit stands |
+| `post-rewrite` | History changed: every node naming an old hash, in its commit field or in its text, names the new one |
+| `pre-push` | Audits what is being pushed, and refuses a commit no node names, a node naming a commit that is gone, or a push it cannot check |
+
+The push is the gate because that is where work leaves the machine; a commit is local and
+reversible, and a down server should not stop anyone committing. `git push --no-verify` is
+how a person says they mean it. The agent cannot: see [Hooks](#hooks).
+
+```sh
+./ds4-graph audit                 # what is unpushed
+./ds4-graph audit v1.0..HEAD      # any range git takes
+./ds4-graph goal "fix the thing"  # a goal for work done by hand: export it as DS4_DEC_GOAL
+./ds4-graph link GOAL REV         # link a commit, or a range, that went in without one
+./ds4-graph rewrite OLD NEW       # repair a hash by hand
+```
+
+A node claims a hash in its commit field, or in text written as `commit X`, `Committed as
+X` or `Commits X, Y`. Bare hex does not count, because this graph's text is full of node id
+prefixes of the same shape. Linking can repeat: the change id comes from the author date
+and subject, which a rebase leaves alone, so a replayed commit finds its node and updates
+the hash. Rewording a commit changes the subject and so makes a second node; `post-rewrite`
+still moves the first one's hash. The audit reads the current branch's nodes only.
+
+Git hooks are this clone's and are not cloned, so every checkout runs `./ds4-graph install`
+once, and without it nothing here is enforced.
+
+## Hooks
+
+`ds4-agent` runs the commands in `.ds4/hooks` at fixed points in a session, so a rule can be
+kept by the harness instead of by the model remembering it. `ds4_hooks.c` is the engine and
+knows nothing of git or the graph; those are only the first things using it.
+
+```
+# <event>  <tool>  <pattern>      <command>
+pre_tool   bash    *--no-verify*  echo "Refused: fix what the hooks report."; exit 2
+post_tool  bash    *git?commit*   ./ds4-graph audit 2>&1 | tail -n 12; exit 0
+```
+
+The events are `session_start`, `pre_tool`, `post_tool` and `session_end`. `tool` is a tool
+name or `*`, and `pattern` is a glob over the call's main argument: the bash command, the
+path, the op of a deciduous call. Fields split on spaces, so `?` stands for one in a
+pattern. A command runs under `/bin/sh` at the repository root, with `DS4_HOOK_EVENT`,
+`DS4_HOOK_TOOL`, `DS4_HOOK_ARG` and, after a tool, `DS4_HOOK_RESULT` and `DS4_HOOK_EXIT`.
+
+| The hook | What happens |
+| --- | --- |
+| Exits 0 | The tool goes ahead, and what the hook printed is shown to the model |
+| Exits 2 from `pre_tool` | The tool does not run, and what the hook printed is the tool error the model sees |
+| Anything else, or runs past 30 seconds | A broken hook: the model is told, and the tool goes ahead |
+
+What `session_start` prints goes into the transcript as a system message. The file is read
+once as a session starts, so an edit made during a session cannot lift a rule on that
+session, and a file that does not parse is reported rather than ignored. `--hooks off` runs
+none. A glob over a command is a tripwire, not a sandbox: a model that wanted to could spell
+`--no-verify` so the pattern misses it. It stops the honest mistake, and the repository's
+server-side rules, if any, are what stop anything else.
 
 ## The chat page
 

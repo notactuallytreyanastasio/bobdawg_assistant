@@ -16,8 +16,8 @@
  * parallel sessions and other machines see the same graph.  Nothing here
  * shells out to the deciduous CLI, and nothing here opens SQLite.
  *
- * The server's twenty-one tools are not shown to the model.  ds4 offers seven
- * operations over them - decide, turn, note, graph, board, goal and status -
+ * The server's twenty-one tools are not shown to the model.  ds4 offers eight
+ * operations over them - decide, turn, note, graph, board, goal, status and audit -
  * because a model left to place every edge itself would spend its budget on
  * bookkeeping instead of on the work. */
 
@@ -34,7 +34,7 @@ typedef struct {
 } ds4_dec_arg;
 
 typedef struct {
-    const char *tool;  /* decide | turn | note | graph | board | goal | status */
+    const char *tool;  /* decide | turn | note | graph | board | goal | status | audit */
     const ds4_dec_arg *args;
     int argc;
 } ds4_dec_call;
@@ -153,6 +153,34 @@ void ds4_dec_use_branch(ds4_dec *d, const char *branch);
  * goal's id, malloc'd; NULL with err set when the record did not land. */
 char *ds4_dec_record_chat_turn(ds4_dec *d, const ds4_dec_chat_turn *turn,
                                char *err, size_t err_len);
+
+/* ---- git ---------------------------------------------------------------
+ *
+ * The link between a commit and the graph is a trailer in the commit message, because
+ * a hash stops being true the moment history is rewritten and a trailer goes with the
+ * commit.  An agent session exports its goal as DS4_DEC_GOAL, so anything it commits
+ * can be stamped by the commit-msg hook.  Everything below reads git and the server;
+ * none of it keeps a map of its own. */
+#define DS4_DEC_GOAL_TRAILER "Deciduous-Goal"
+
+/* Write a commit into the graph as an action under its goal, naming its hash and the
+ * files it touched.  goal_id overrides the commit's trailer; rev may be a range, which
+ * links each commit in it.  Safe to repeat: a rebase that replays a commit updates the
+ * node it already has.  Returns what happened, malloc'd; NULL with err set. */
+char *ds4_dec_git_link(ds4_dec *d, const char *goal_id, const char *rev,
+                       char *err, size_t err_len);
+
+/* History changed: every node naming old_sha, in its commit field or in its text, names
+ * new_sha from now on.  Returns what happened, malloc'd; NULL with err set. */
+char *ds4_dec_git_rewrite(ds4_dec *d, const char *old_sha, const char *new_sha,
+                          char *err, size_t err_len);
+
+/* Do the graph and git agree?  Reports nodes naming commits this repository does not
+ * have, and commits in range no node names.  range is anything git rev-list takes; NULL
+ * means what has not been pushed.  problems receives the count.  Returns the report,
+ * malloc'd; NULL with err set when it could not be worked out. */
+char *ds4_dec_git_audit(ds4_dec *d, const char *range, int *problems,
+                        char *err, size_t err_len);
 
 /* Authoritative graph state for context compaction: the reasoning survives
  * compaction exactly because it lives outside the context window, so it is

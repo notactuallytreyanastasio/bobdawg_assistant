@@ -1,6 +1,7 @@
 #define DS4_AGENT_TEST
 #define DS4_AGENT_TEST_NO_MAIN
 #include "../ds4_agent.c"
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/resource.h>
@@ -1060,6 +1061,247 @@ static void test_deciduous_seam_failures(void) {
     unsetenv("DECIDUOUS_BRANCH");
 }
 
+/* A hooks file in a directory of its own, loaded the way a session loads it. */
+static ds4_hooks *hooks_from(const char *dir, const char *text) {
+    char path[PATH_MAX];
+    char err[PATH_MAX + 80];
+    snprintf(path, sizeof(path), "%s/.ds4", dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/.ds4/hooks", dir);
+    FILE *f = fopen(path, "w");
+    AGENT_TEST_ASSERT(f != NULL);
+    fputs(text, f);
+    fclose(f);
+    return ds4_hooks_load(dir, err, sizeof(err));
+}
+
+static void test_hooks_engine(void) {
+    char dir[] = "/tmp/ds4-hooks-XXXXXX", cmd[128], err[PATH_MAX + 80];
+    ds4_hooks *h;
+    ds4_hook_result r;
+
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    AGENT_TEST_ASSERT(ds4_hooks_load(dir, err, sizeof(err)) == NULL);
+    AGENT_TEST_ASSERT(err[0] == '\0'); /* no file is not a failure */
+
+    /* Nothing happens without hooks, and that has to be safe to ask. */
+    r = ds4_hooks_run(NULL, DS4_HOOK_PRE_TOOL, "bash", "ls", NULL, -1);
+    AGENT_TEST_ASSERT(!r.blocked && r.output && !r.output[0]);
+    free(r.output);
+
+    /* A rule that does not parse is said, never quietly dropped. */
+    AGENT_TEST_ASSERT(hooks_from(dir, "pre_tool bash\n") == NULL);
+    {
+        char complain[PATH_MAX + 80];
+        AGENT_TEST_ASSERT(ds4_hooks_load(dir, complain, sizeof(complain)) == NULL);
+        AGENT_TEST_ASSERT(strstr(complain, ":1:") != NULL);
+    }
+    AGENT_TEST_ASSERT(hooks_from(dir, "before_tool bash * true\n") == NULL);
+
+    h = hooks_from(dir,
+                   "# a comment, and a blank line\n\n"
+                   "pre_tool  bash  *--no-verify*   echo refused here; exit 2\n"
+                   "pre_tool  bash  ls*             echo looking at $DS4_HOOK_ARG in $(basename $PWD)\n"
+                   "pre_tool  read  *               echo not for read; exit 2\n"
+                   "pre_tool  bash  broken*         exit 7\n"
+                   "post_tool bash  *               echo after $DS4_HOOK_EXIT: $DS4_HOOK_RESULT\n"
+                   "post_tool bash  refuse*         exit 2\n"
+                   "session_start * *               echo welcome\n");
+    AGENT_TEST_ASSERT(h != NULL);
+    AGENT_TEST_ASSERT(ds4_hooks_count(h) == 7);
+
+    r = ds4_hooks_run(h, DS4_HOOK_PRE_TOOL, "bash", "git commit --no-verify -m x", NULL, -1);
+    AGENT_TEST_ASSERT(r.blocked && strstr(r.output, "refused here") != NULL);
+    free(r.output);
+
+    /* Exit 0 passes what it printed along; a hook runs at the root it was loaded for. */
+    r = ds4_hooks_run(h, DS4_HOOK_PRE_TOOL, "bash", "ls -la", NULL, -1);
+    AGENT_TEST_ASSERT(!r.blocked && strstr(r.output, "looking at ls -la") != NULL);
+    AGENT_TEST_ASSERT(strstr(r.output, strrchr(dir, '/') + 1) != NULL);
+    free(r.output);
+
+    /* A rule for one tool leaves the others alone, and an unmatched call is silent. */
+    r = ds4_hooks_run(h, DS4_HOOK_PRE_TOOL, "bash", "make", NULL, -1);
+    AGENT_TEST_ASSERT(!r.blocked && !r.output[0]);
+    free(r.output);
+    r = ds4_hooks_run(h, DS4_HOOK_PRE_TOOL, "read", "a.c", NULL, -1);
+    AGENT_TEST_ASSERT(r.blocked);
+    free(r.output);
+
+    /* A broken hook is reported and does not stop the work. */
+    r = ds4_hooks_run(h, DS4_HOOK_PRE_TOOL, "bash", "broken thing", NULL, -1);
+    AGENT_TEST_ASSERT(!r.blocked && strstr(r.output, "hook failed") != NULL);
+    free(r.output);
+
+    /* The tool has already run, so exit 2 after it can refuse nothing. */
+    r = ds4_hooks_run(h, DS4_HOOK_POST_TOOL, "bash", "refuse later", "it worked", 0);
+    AGENT_TEST_ASSERT(!r.blocked);
+    AGENT_TEST_ASSERT(strstr(r.output, "after 0: it worked") != NULL);
+    free(r.output);
+
+    r = ds4_hooks_run(h, DS4_HOOK_SESSION_START, "", "", NULL, -1);
+    AGENT_TEST_ASSERT(strstr(r.output, "welcome") != NULL);
+    free(r.output);
+    ds4_hooks_free(h);
+
+    /* The rules this repository ships have to parse and mean what they say. */
+    {
+        char complaint[PATH_MAX + 80];
+        ds4_hooks *shipped = ds4_hooks_load(".", complaint, sizeof(complaint));
+        AGENT_TEST_ASSERT(shipped != NULL);
+        r = ds4_hooks_run(shipped, DS4_HOOK_PRE_TOOL, "bash", "git commit --no-verify -m x", NULL, -1);
+        AGENT_TEST_ASSERT(r.blocked);
+        free(r.output);
+        r = ds4_hooks_run(shipped, DS4_HOOK_PRE_TOOL, "bash", "git push --no-verify fork main", NULL, -1);
+        AGENT_TEST_ASSERT(r.blocked);
+        free(r.output);
+        r = ds4_hooks_run(shipped, DS4_HOOK_PRE_TOOL, "bash", "git commit -m x", NULL, -1);
+        AGENT_TEST_ASSERT(!r.blocked);
+        free(r.output);
+        r = ds4_hooks_run(shipped, DS4_HOOK_POST_TOOL, "bash", "git commit -m x", "done", 0);
+        AGENT_TEST_ASSERT(strstr(r.output, "hook failed") == NULL);
+        AGENT_TEST_ASSERT(r.output[0] != '\0');
+        free(r.output);
+        ds4_hooks_free(shipped);
+    }
+
+    /* The agent's own loop: a refused tool does not run, and the model is told. */
+    {
+        agent_worker w = {0};
+        agent_tool_calls calls = {0};
+        agent_tool_call call = {0};
+        char target[PATH_MAX + 16];
+        agent_tool_arg arg = {.name = (char *)"command", .value = target};
+        snprintf(target, sizeof(target), "touch %s/ran --no-verify", dir);
+        w.hooks = hooks_from(dir, "pre_tool bash *--no-verify* echo not that; exit 2\n");
+        AGENT_TEST_ASSERT(w.hooks != NULL);
+        call.name = (char *)"bash";
+        call.args = &arg;
+        call.argc = 1;
+        calls.v = &call;
+        calls.len = 1;
+        agent_tool_observation obs = agent_execute_tool_observation(&w, &calls);
+        AGENT_TEST_ASSERT(strstr(obs.parts[0].text, "refused by a hook") != NULL);
+        AGENT_TEST_ASSERT(strstr(obs.parts[0].text, "not that") != NULL);
+        snprintf(target, sizeof(target), "%s/ran", dir);
+        AGENT_TEST_ASSERT(access(target, F_OK) != 0);
+        agent_tool_observation_free(&obs);
+        ds4_hooks_free(w.hooks);
+    }
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    AGENT_TEST_ASSERT(system(cmd) == 0);
+}
+
+/* The graph's side of git, in a throwaway repository against the real server: what the
+ * hooks rely on is what git and the server really do, so neither is faked here. */
+static void test_deciduous_git(void) {
+    char dir[] = "/tmp/ds4-git-XXXXXX", cmd[PATH_MAX], err[512], old_sha[64];
+    int problems = -1;
+    char *goal_out, *out;
+
+    /* A branch per run: the last run's repository is gone, so its hashes really are
+     * stale, and they would be found. */
+    char branch[64];
+    snprintf(branch, sizeof(branch), "git-selftest-%d-%ld", (int)getpid(), (long)time(NULL));
+    setenv("DECIDUOUS_WORKSPACE", "ds4-selftest", 1);
+    setenv("DECIDUOUS_BRANCH", branch, 1);
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+#define GIT(...) do { snprintf(cmd, sizeof(cmd), __VA_ARGS__); \
+        AGENT_TEST_ASSERT(system(cmd) == 0); } while (0)
+    GIT("cd %s && git init -q . && git config user.email t@t && git config user.name t", dir);
+    GIT("cd %s && echo one > a && git add a && git commit -q -m 'first change %d'", dir, (int)getpid());
+
+    ds4_dec *d = ds4_dec_open(dir, "tester");
+    if (!d) {
+        fprintf(stderr, "ds4-agent tests: deciduous server not reachable; git graph tests skipped\n");
+        unsetenv("DECIDUOUS_BRANCH");
+        return;
+    }
+    goal_out = ds4_dec_bind_goal(d, "keep the graph and git in step");
+    free(goal_out);
+    AGENT_TEST_ASSERT(getenv("DS4_DEC_GOAL") && !strcmp(getenv("DS4_DEC_GOAL"), ds4_dec_goal_id(d)));
+
+    /* A commit no node names is what the audit exists to find. */
+    out = ds4_dec_git_audit(d, "HEAD", &problems, err, sizeof(err));
+    AGENT_TEST_ASSERT(out && strstr(out, "unlinked:") != NULL);
+    AGENT_TEST_ASSERT(problems >= 1);
+    free(out);
+
+    /* A commit with no trailer and no goal given has nowhere to go. */
+    AGENT_TEST_ASSERT(ds4_dec_git_link(d, NULL, "HEAD", err, sizeof(err)) == NULL);
+    AGENT_TEST_ASSERT(strstr(err, "trailer") != NULL);
+
+    /* Revisions reach a shell, so only what a revision can be gets that far. */
+    AGENT_TEST_ASSERT(ds4_dec_git_link(d, "x", "HEAD;touch /tmp/ds4-pwned", err, sizeof(err)) == NULL);
+    AGENT_TEST_ASSERT(strstr(err, "not a revision") != NULL);
+    AGENT_TEST_ASSERT(ds4_dec_git_audit(d, "$(id)", &problems, err, sizeof(err)) == NULL);
+
+    out = ds4_dec_git_link(d, ds4_dec_goal_id(d), "HEAD", err, sizeof(err));
+    AGENT_TEST_ASSERT(out && strstr(out, "linked") != NULL);
+    free(out);
+    out = ds4_dec_git_audit(d, "HEAD", &problems, err, sizeof(err));
+    AGENT_TEST_ASSERT(out && strstr(out, "0 unlinked") != NULL);
+    free(out);
+
+    /* Rewriting history is what stales a hash. The old one is then reported as gone,
+     * and repairing it moves the node to the new one. */
+    FILE *p;
+    snprintf(cmd, sizeof(cmd), "git -C %s rev-parse HEAD", dir);
+    p = popen(cmd, "r");
+    AGENT_TEST_ASSERT(p && fgets(old_sha, sizeof(old_sha), p));
+    pclose(p);
+    old_sha[strcspn(old_sha, "\n")] = '\0';
+    GIT("cd %s && echo two >> a && git add a && git commit -q --amend --no-edit", dir);
+    GIT("cd %s && git reflog expire --expire=now --all && git gc -q --prune=now", dir);
+    out = ds4_dec_git_audit(d, "HEAD", &problems, err, sizeof(err));
+    AGENT_TEST_ASSERT(out && strstr(out, "stale:") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, old_sha) != NULL);
+    free(out);
+
+    out = ds4_dec_git_rewrite(d, old_sha, "HEAD", err, sizeof(err));
+    AGENT_TEST_ASSERT(out && strstr(out, "in 1 node") != NULL);
+    free(out);
+    out = ds4_dec_git_audit(d, "HEAD", &problems, err, sizeof(err));
+    AGENT_TEST_ASSERT(out && problems == 0);
+    free(out);
+
+    /* A hash is only claimed after the word commit: bare hex in this graph's text is
+     * mostly node id prefixes, and calling those stale would make the audit noise. */
+    {
+        const ds4_dec_arg gone[] = {{"title", "a claim about history"},
+                                    {"description", "Commits abc1234, def5678. See a1b2c3d4, and "
+                                                    "commit discipline for the directory (4931eb9d)."}};
+        ds4_dec_call note = {.tool = "note", .args = gone, .argc = 2};
+        out = ds4_dec_execute(d, &note, err, sizeof(err));
+        AGENT_TEST_ASSERT(out != NULL);
+        free(out);
+        out = ds4_dec_git_audit(d, "HEAD", &problems, err, sizeof(err));
+        AGENT_TEST_ASSERT(out && strstr(out, "names abc1234") != NULL);
+        AGENT_TEST_ASSERT(strstr(out, "names def5678") != NULL);
+        AGENT_TEST_ASSERT(strstr(out, "a1b2c3d4") == NULL);
+        AGENT_TEST_ASSERT(strstr(out, "4931eb9d") == NULL);
+        free(out);
+
+        /* A mention in text moves too, at the length it was written. */
+        out = ds4_dec_git_rewrite(d, "abc1234", "HEAD", err, sizeof(err));
+        AGENT_TEST_ASSERT(out && strstr(out, "in 1 node") != NULL);
+        free(out);
+        out = ds4_dec_git_audit(d, "HEAD", &problems, err, sizeof(err));
+        AGENT_TEST_ASSERT(out && strstr(out, "abc1234") == NULL);
+        AGENT_TEST_ASSERT(strstr(out, "names def5678") != NULL);
+        free(out);
+        out = ds4_dec_git_rewrite(d, "def5678", "HEAD", err, sizeof(err));
+        free(out);
+    }
+#undef GIT
+    ds4_dec_close(d);
+    unsetenv("DS4_DEC_GOAL");
+    unsetenv("DECIDUOUS_WORKSPACE");
+    unsetenv("DECIDUOUS_BRANCH");
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    AGENT_TEST_ASSERT(system(cmd) == 0);
+}
+
 static void test_deciduous_graph(void) {
     char dir[] = "/tmp/ds4-dec-XXXXXX";
     char saved[PATH_MAX], root[PATH_MAX], *res;
@@ -1733,6 +1975,8 @@ int main(int argc, char **argv) {
     test_unicode_output_and_footer();
     test_footer_only_updates();
     test_tool_contracts();
+    test_hooks_engine();
+    test_deciduous_git();
     test_deciduous_seam_failures();
     test_deciduous_graph();
     if (agent_test_failures) {
