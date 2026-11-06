@@ -1664,13 +1664,36 @@ static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
  * The graph lives on the deciduous server, so "opening" it is a handshake:
  * without a reachable server this session is graph-blind, and says so. ds4
  * holds no local copy to fall back to. */
-static void agent_worker_maybe_open_graph(agent_worker *w, const agent_config *cfg) {
+static bool agent_text_is_goal_worthy(const char *text);
+
+/* Without --goal, the opening request is what this session is working for:
+ * record it as the goal node, so options and decisions later have something
+ * honest to hang under and a future session can recover the intent.  True when
+ * this call bound one.  A goal that would not bind is said out loud, every time
+ * it fails, because the session is writing nothing while it stays that way. */
+static bool agent_worker_bind_request(agent_worker *w, const char *text) {
+    char *obs;
+    bool bound;
+
+    if (!ds4_dec_active(w->dec) || ds4_dec_goal_bound(w->dec) ||
+        !agent_text_is_goal_worthy(text)) return false;
+    obs = ds4_dec_bind_goal(w->dec, text);
+    bound = ds4_dec_goal_bound(w->dec);
+    if (!bound && obs && obs[0]) fprintf(stderr, "ds4-agent: %s\n", obs);
+    free(obs);
+    return bound;
+}
+
+static void agent_worker_maybe_open_graph(agent_worker *w, const agent_config *cfg,
+                                          const char *user_text) {
     char root[PATH_MAX];
     char *goal_obs, *msg, *brief;
     const char *section, *note;
 
     if (cfg->graph_off) return;
-    if (w->dec && w->dec_note_injected) return;
+    /* A goal bound now is a goal the model has to hear about before it answers,
+     * so this falls through to the system message when one is. */
+    if (w->dec && w->dec_note_injected && !agent_worker_bind_request(w, user_text)) return;
 
     if (!w->dec) {
         if (!ds4_dec_find_root(NULL, root, sizeof(root))) {
@@ -1694,6 +1717,7 @@ static void agent_worker_maybe_open_graph(agent_worker *w, const agent_config *c
             free(goal_obs);
         }
     }
+    agent_worker_bind_request(w, user_text);
 
     /* Rules, the recovery briefing and what the graph already holds travel
      * together, as one system message: a resumed session gets the same graph it
@@ -9635,10 +9659,9 @@ static char *agent_execute_graph_call(agent_worker *w, const agent_tool_call *ca
     return out;
 }
 
-/* The server's rules say an agent writes at three moments and nowhere else, and
- * say plainly that reading, searching and planning must not be logged. So the
- * harness records nothing on its own; it only reminds the model - once per
- * session at each moment - when a tool result looks like one of those moments. */
+/* The server's rules say when an agent writes, and say plainly that reading,
+ * searching and planning must not be logged. So the harness records nothing on
+ * its own; it only reminds the model when work has gone unrecorded. */
 static void agent_note_graph_moments(agent_worker *w, const agent_tool_call *call,
                                      const char *observation,
                                      agent_tool_observation *obs) {
@@ -10367,11 +10390,9 @@ static bool agent_text_is_goal_worthy(const char *text) {
 static bool agent_worker_append_user(agent_worker *w, const char *text,
                                      char *err, size_t err_len) {
     ds4_tokens message = {0}, sys = {0};
-    /* Without --goal, the opening request is what this session is working for:
-     * record it as the goal node, so options and decisions later have something
-     * honest to hang under and a future session can recover the intent. */
-    if (w->dec && !ds4_dec_goal_bound(w->dec) && agent_text_is_goal_worthy(text))
-        ds4_dec_bind_goal(w->dec, text);
+    /* A turn binds its goal before the system message goes in. This one is for a
+     * message queued mid-turn, which the model hears about on its next turn. */
+    if (w->dec && agent_worker_bind_request(w, text)) w->dec_note_injected = false;
     ds4_chat_append_message(w->engine, &message, "user", text);
     agent_worker_build_system_tokens(w, &sys);
     int ctx = agent_worker_effective_ctx_size(w);
@@ -10560,7 +10581,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_worker_maybe_append_datetime_context(w);
     /* Then the decision graph: its rules shape the first response, and its
      * recovery state is what tells a resumed session where to resume. */
-    agent_worker_maybe_open_graph(w, cfg);
+    agent_worker_maybe_open_graph(w, cfg, user_text);
     agent_worker_append_hints_context(w);
     agent_trace_text(w, "user", user_text ? user_text : "",
                      user_text ? strlen(user_text) : 0);
@@ -13563,13 +13584,24 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         const char *note = ds4_dec_recovery_note(worker.dec);
                         if (note && note[0]) printf("%s\n", note);
                         else printf("no goal is bound; /goal <text> binds one\n");
-                    } else if (!ds4_dec_bind_goal(worker.dec, arg)) {
-                        printf("could not bind that goal (see the message above)\n");
                     } else {
-                        const char *note = ds4_dec_recovery_note(worker.dec);
-                        printf("%s\n", note ? note : "");
-                        /* Tell the model about the swap on its next turn. */
-                        worker.dec_note_injected = false;
+                        /* A new goal replaces the one held: the others hear what
+                         * came of that one first, as they do at /new. */
+                        char *closing = ds4_dec_close_session(worker.dec);
+                        char *obs;
+                        if (closing && closing[0]) fprintf(stderr, "ds4-agent: %s\n", closing);
+                        free(closing);
+                        ds4_dec_release_goal(worker.dec);
+                        obs = ds4_dec_bind_goal(worker.dec, arg);
+                        if (!ds4_dec_goal_bound(worker.dec)) {
+                            printf("could not bind that goal: %s\n", obs ? obs : "no reason given");
+                        } else {
+                            const char *note = ds4_dec_recovery_note(worker.dec);
+                            printf("%s\n", note ? note : "");
+                            /* Tell the model about the swap on its next turn. */
+                            worker.dec_note_injected = false;
+                        }
+                        free(obs);
                     }
                 } else if (!strcmp(cmd, "/done")) {
                     /* Explicit only.  ds4 never concludes a goal is finished: a

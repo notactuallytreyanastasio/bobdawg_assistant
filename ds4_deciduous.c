@@ -42,7 +42,11 @@ struct ds4_dec {
     char goal_id[DEC_ID_MAX];
     char goal_title[DS4_DEC_GOAL_TITLE_MAX];
     char goal_change_id[DEC_ID_MAX];
-    char last_note[240];
+    char goal_change_title[DS4_DEC_GOAL_TITLE_MAX]; /* what that change id was minted for */
+    /* A goal this session let go of: offered in the recovery note for claiming,
+     * and otherwise nothing. goal_id empty means no goal is held. */
+    char offered_goal_id[DEC_ID_MAX];
+    char offered_goal_title[DS4_DEC_GOAL_TITLE_MAX];
     /* What this session recorded, so the closing note on the board can say so
      * without re-reading the graph, and the decision titles it can name. */
     int wrote_decisions, wrote_turns, wrote_notes;
@@ -52,9 +56,19 @@ struct ds4_dec {
     unsigned rpc_id;
     bool active;
     bool goal_bound;  /* this session holds the goal it names */
-    bool nudged_choice; /* the fork-in-the-road reminder, once per session */
-    bool nudged_step;   /* the step-closed-off reminder, once per session */
+    bool nudged_choice; /* the first fork-in-the-road reminder has been given */
+    bool nudged_step;   /* the step reminder, once until something is recorded */
+    int edits_since_record; /* edits since the last decision or step */
 };
+
+/* Edits with nothing recorded before the fork-in-the-road reminder comes back. */
+#define DEC_NUDGE_EDITS 8
+
+/* Tool calls run on the agent's loop, so a server closing mid-write must end in
+ * an error here and not in SIGPIPE ending the whole session. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 static char g_open_error[512];
 
@@ -426,6 +440,10 @@ static int dec_tcp_connect(const char *host, int port, char *err, size_t err_len
         struct timeval tv = {(DEC_TIMEOUT_MS / 1000), (DEC_TIMEOUT_MS % 1000) * 1000};
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#ifdef SO_NOSIGPIPE
+        int on = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#endif
         if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
         close(fd);
         fd = -1;
@@ -437,7 +455,7 @@ static int dec_tcp_connect(const char *host, int port, char *err, size_t err_len
 
 static bool dec_write_all(int fd, const char *buf, size_t len) {
     while (len) {
-        ssize_t n = write(fd, buf, len);
+        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return false;
         buf += n;
@@ -546,13 +564,14 @@ static bool dec_http_post(const char *url, const char *token, const char *sessio
     /* Send with Connection: close, so the reply ends at the peer closing. */
     dec_buf raw = {0};
     size_t header_end = 0;
+    bool peer_closed = false;
     while (raw.len < DEC_BODY_MAX) {
         char buf[8192];
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
         if (poll(&pfd, 1, DEC_TIMEOUT_MS) <= 0) break;
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0) { if (errno == EINTR) continue; break; }
-        if (n == 0) break;
+        if (n == 0) { peer_closed = true; break; }
         if (!dec_buf_addn(&raw, buf, (size_t)n)) break;
         if (!header_end) {
             char *hdr_end = NULL;
@@ -599,6 +618,14 @@ static bool dec_http_post(const char *url, const char *token, const char *sessio
         want = strtol(declared, NULL, 10);
 
     size_t have = raw.len - header_end;
+    /* The reply ends at the peer closing or at the length it declared. Anything
+     * short of that is a timeout or the size cap, and reading it as an answer
+     * would tell the model a write landed that nobody can vouch for. */
+    if (want >= 0 ? (size_t)want > have : !peer_closed) {
+        dec_set_err(err, err_len, "the reply from %s was cut short", host);
+        free(raw.p);
+        return false;
+    }
     if (want >= 0 && (size_t)want < have) have = (size_t)want;
 
     char *text = NULL;
@@ -789,10 +816,36 @@ bool ds4_dec_find_root(const char *start, char *out, size_t cap) {
     return out[0] != '\0';
 }
 
-/* The branch this checkout is on, from .git/HEAD, without running git. */
+/* This checkout's git directory. In a worktree .git is a file naming it. */
+static void dec_git_dir(const char *root, char *out, size_t cap) {
+    char dotgit[PATH_MAX], text[PATH_MAX];
+    snprintf(dotgit, sizeof(dotgit), "%s/.git", root);
+    snprintf(out, cap, "%s", dotgit);
+    if (!dec_read_file_small(dotgit, text, sizeof(text), NULL)) return;
+    if (strncmp(text, "gitdir: ", 8) != 0) return;
+    char *p = text + 8;
+    p[strcspn(p, "\r\n")] = '\0';
+    if (p[0] == '/') snprintf(out, cap, "%s", p);
+    else snprintf(out, cap, "%s/%s", root, p);
+}
+
+/* The repository's own directory name, for a checkout that is a worktree of it:
+ * the graph belongs to the repository, whatever the worktree is called. */
+static bool dec_worktree_repo(const char *root, char *out, size_t cap) {
+    char dir[PATH_MAX];
+    dec_git_dir(root, dir, sizeof(dir));
+    char *mark = strstr(dir, "/.git/worktrees/");
+    if (!mark) return false;
+    *mark = '\0';
+    snprintf(out, cap, "%s", dec_basename(dir));
+    return out[0] != '\0';
+}
+
+/* The branch this checkout is on, from its HEAD, without running git. */
 static bool dec_git_branch(const char *root, char *out, size_t cap) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/.git/HEAD", root);
+    char dir[PATH_MAX], path[PATH_MAX + 8];
+    dec_git_dir(root, dir, sizeof(dir));
+    snprintf(path, sizeof(path), "%s/HEAD", dir);
     char text[256];
     if (!dec_read_file_small(path, text, sizeof(text), NULL)) return false;
     if (strncmp(text, "ref: refs/heads/", 16) != 0) return false;
@@ -816,7 +869,7 @@ static bool dec_path_home(char *out, size_t cap, const char *relative) {
 }
 
 static bool dec_resolve(ds4_dec *d, const char *root, char *err, size_t err_len) {
-    char home[PATH_MAX], url[DEC_URL_MAX], token[DEC_TOKEN_MAX];
+    char home[PATH_MAX], url[DEC_URL_MAX], token[DEC_TOKEN_MAX] = {0};
     char scratch[DEC_URL_MAX];
     bool have_url = false;
 
@@ -880,7 +933,7 @@ static bool dec_resolve(ds4_dec *d, const char *root, char *err, size_t err_len)
                     "token as the first line of ~/.config/deciduous/credentials.", d->url);
         return false;
     }
-    if (!d->workspace[0]) {
+    if (!d->workspace[0] && !dec_worktree_repo(root, d->workspace, sizeof(d->workspace))) {
         snprintf(d->workspace, sizeof(d->workspace), "%s", dec_basename(root));
     }
     if (!d->branch[0]) {
@@ -957,8 +1010,10 @@ static char *dec_args_json(dec_args *a) {
 /* One JSON-RPC exchange.  The session id from the handshake rides along on
  * every later request; the server hands a fresh one back whenever it wants a
  * new session. */
-static bool dec_rpc(ds4_dec *d, const char *method, const char *params, bool notify,
-                    char **result_out, char *err, size_t err_len) {
+static bool dec_handshake(ds4_dec *d, char *err, size_t err_len);
+
+static bool dec_rpc_once(ds4_dec *d, const char *method, const char *params, bool notify,
+                         char **result_out, int *status_out, char *err, size_t err_len) {
     dec_buf body = {0};
     dec_buf_add(&body, "{\"jsonrpc\":\"2.0\",");
     if (!notify) dec_buf_addf(&body, "\"id\":%u,", ++d->rpc_id);
@@ -974,6 +1029,7 @@ static bool dec_rpc(ds4_dec *d, const char *method, const char *params, bool not
     bool ok = dec_http_post(d->url, d->token, d->session, d->workspace, body.p,
                             &resp, &status, session, err, err_len);
     free(body.p);
+    if (status_out) *status_out = status;
     if (session[0] && !d->session[0])
         snprintf(d->session, sizeof(d->session), "%s", session);
     if (!ok) {
@@ -989,14 +1045,38 @@ static bool dec_rpc(ds4_dec *d, const char *method, const char *params, bool not
         free(resp);
         return false;
     }
-    if (!dec_json_member(resp, "result")) {
-        if (result_out) *result_out = NULL;
+    if (notify) {
         free(resp);
         return true;
     }
-    if (result_out) *result_out = dec_json_raw(resp, "result");
+    /* A request is answered with a result or an error. A reply with neither, or
+     * one that does not parse, is not a quiet success. */
+    char *result = dec_json_member(resp, "result") ? dec_json_raw(resp, "result") : NULL;
     free(resp);
+    if (!result) {
+        dec_set_err(err, err_len, "the server's reply could not be read");
+        return false;
+    }
+    if (result_out) *result_out = result;
+    else free(result);
     return true;
+}
+
+/* A restarted server has forgotten the session and says so with a 404. The call
+ * never ran, so shaking hands and sending it again cannot write anything twice,
+ * and a session that outlives a restart keeps its record. */
+static bool dec_rpc(ds4_dec *d, const char *method, const char *params, bool notify,
+                    char **result_out, char *err, size_t err_len) {
+    int status = 0;
+    if (dec_rpc_once(d, method, params, notify, result_out, &status, err, err_len)) return true;
+    if (status != 404 || !d->session[0] || !strcmp(method, "initialize")) return false;
+    char again[512] = {0};
+    if (!dec_handshake(d, again, sizeof(again))) {
+        dec_set_err(err, err_len, "the server forgot this session and would not start "
+                                  "another: %s", again);
+        return false;
+    }
+    return dec_rpc_once(d, method, params, notify, result_out, NULL, err, err_len);
 }
 
 /* Call one MCP tool.  The server answers with content[0].text holding the
@@ -1028,6 +1108,10 @@ static char *dec_tool(ds4_dec *d, const char *name, const char *args_json,
     }
     if (result) dec_json_bool(result, "isError", &refused);
     free(result);
+    if (!payload && !refused) {
+        dec_set_err(err, err_len, "the server's answer held no text to read");
+        return NULL;
+    }
 
     if (refused) {
         dec_set_err(err, err_len, "%s", payload && payload[0] ? payload : "the tool refused the call");
@@ -1051,6 +1135,13 @@ static char *dec_tool_ctx(ds4_dec *d, const char *name, dec_args *a, bool with_b
 
 /* ---- rendering the answers into observations --------------------------- */
 
+/* Where a cut at n lands on a character boundary: titles here carry em dashes,
+ * and half of one is invalid UTF-8 in a request the server has to parse. */
+static size_t dec_utf8_floor(const char *text, size_t n) {
+    while (n > 0 && ((unsigned char)text[n] & 0xC0) == 0x80) n--;
+    return n;
+}
+
 static void dec_clip(char *out, size_t cap, const char *text) {
     if (!out || !cap) return;
     out[0] = '\0';
@@ -1058,6 +1149,7 @@ static void dec_clip(char *out, size_t cap, const char *text) {
     size_t i = 0;
     for (; text[i] && i < cap - 1; i++)
         out[i] = text[i] == '\n' ? ' ' : text[i];
+    i = dec_utf8_floor(text, i);
     out[i] = '\0';
 }
 
@@ -1099,22 +1191,23 @@ static char *dec_render_nodes(const char *array, int cap_lines) {
     return b.p;
 }
 
-static char *dec_render_messages(const char *array) {
+/* The messages from `first` on: the board reads oldest first, so the end of an
+ * array is where the news is. */
+static char *dec_render_messages(const char *array, int first) {
     dec_buf b = {0};
-    for (int i = 0;; i++) {
+    for (int i = first;; i++) {
         const char *elem = dec_json_elem(array, i);
         if (!elem) break;
-        long id = 0;
+        long id = 0, reply = 0;
         char *author = dec_json_str(elem, "author");
         char *subject = dec_json_str(elem, "subject");
         char *body = dec_json_str(elem, "body");
-        char *reply = dec_json_str(elem, "reply_to");
         char clip_body[240], clip_subject[160];
         dec_clip(clip_subject, sizeof(clip_subject), subject ? subject : "(no subject)");
         dec_clip(clip_body, sizeof(clip_body), body ? body : "");
         dec_json_number(elem, "id", &id);
-        if (reply && reply[0])
-            dec_buf_addf(&b, "- #%ld %s: %s (reply to %s)\n", id,
+        if (dec_json_number(elem, "reply_to", &reply) && reply > 0)
+            dec_buf_addf(&b, "- #%ld %s: %s (reply to #%ld)\n", id,
                          author ? author : "?", clip_subject, reply);
         else
             dec_buf_addf(&b, "- #%ld %s: %s\n", id, author ? author : "?", clip_subject);
@@ -1123,7 +1216,6 @@ static char *dec_render_messages(const char *array) {
         free(author);
         free(subject);
         free(body);
-        free(reply);
     }
     if (!b.p) return strdup("");
     return b.p;
@@ -1161,7 +1253,7 @@ static void dec_clip_title(char *out, size_t cap, const char *text) {
     if (cut > cap - 4) {
         cut = cap - 4;
         while (cut > 0 && flat[cut - 1] != ' ') cut--;
-        if (!cut) cut = cap - 4;
+        if (!cut) cut = dec_utf8_floor(flat, cap - 4);
         flat[cut] = '\0';
         snprintf(out, cap, "%s...", flat);
         return;
@@ -1196,6 +1288,7 @@ static char *dec_op_note(ds4_dec *d, const ds4_dec_call *c) {
     dec_args_str(&a, "node_type", "observation");
     dec_args_str(&a, "title", title);
     dec_args_str(&a, "description", text && text[0] ? text : title);
+    dec_args_str(&a, "status", "active");
     if (d->goal_id[0]) {
         dec_args_str(&a, "parent_id", d->goal_id);
         dec_args_str(&a, "edge_type", "enables");
@@ -1267,7 +1360,12 @@ static char *dec_op_goal(ds4_dec *d, const char *text) {
     char err[512] = {0};
     char title[DS4_DEC_GOAL_TITLE_MAX];
     dec_clip_title(title, sizeof(title), text);
-    if (!d->goal_change_id[0]) dec_uuid(d->goal_change_id);
+    /* The id makes a retry of this request safe. A different request is a
+     * different node, which the server would refuse under the same id. */
+    if (!d->goal_change_id[0] || strcmp(d->goal_change_title, title) != 0) {
+        dec_uuid(d->goal_change_id);
+        snprintf(d->goal_change_title, sizeof(d->goal_change_title), "%s", title);
+    }
 
     dec_args a;
     dec_args_init(&a);
@@ -1280,23 +1378,28 @@ static char *dec_op_goal(ds4_dec *d, const char *text) {
     if (!payload) return dec_fail(err);
 
     char *id = dec_json_str(payload, "id");
-    char *created_msg = dec_json_str(payload, "message");
+    bool created = true;
+    dec_json_bool(payload, "created", &created);
     free(payload);
     if (!id || !id[0]) {
         free(id);
-        free(created_msg);
         return dec_fail("the server did not name the goal it made");
     }
     snprintf(d->goal_id, sizeof(d->goal_id), "%s", id);
     snprintf(d->goal_title, sizeof(d->goal_title), "%s", title);
     d->goal_bound = true;
-    bool reused = created_msg && strstr(created_msg, "already exists") != NULL;
+    d->offered_goal_id[0] = '\0';
     dec_buf b = {0};
     dec_buf_addf(&b, "Goal recorded on the server%s\nid %s, held by this session\n",
-                 reused ? " (a goal with this change id already existed)" : "", id);
+                 created ? "" : " (a goal with this change id already existed)", id);
     free(id);
-    free(created_msg);
     return b.p ? b.p : strdup("");
+}
+
+/* The work so far is on the record, so the reminders can start counting again. */
+static void dec_work_recorded(ds4_dec *d) {
+    d->edits_since_record = 0;
+    d->nudged_step = false;
 }
 
 /* The titles this session decided, kept for the closing note on the board.
@@ -1339,6 +1442,7 @@ static char *dec_op_decide(ds4_dec *d, const ds4_dec_call *c) {
     char *message = dec_json_str(payload, "message");
     free(payload);
     d->wrote_decisions++;
+    dec_work_recorded(d);
     dec_remember_decision(d, title);
     dec_buf b = {0};
     dec_buf_addf(&b, "%s%s%s\n", message ? message : "Decision logged",
@@ -1373,6 +1477,7 @@ static char *dec_op_turn(ds4_dec *d, const ds4_dec_call *c) {
     char *message = dec_json_str(payload, "message");
     free(payload);
     d->wrote_turns++;
+    dec_work_recorded(d);
     {
         char clip[sizeof(d->last_turn)];
         dec_clip(clip, sizeof(clip), summary);
@@ -1414,13 +1519,62 @@ static char *dec_op_graph(ds4_dec *d, const ds4_dec_call *c) {
     long count = 0;
     dec_json_number(payload, "result_count", &count);
     free(payload);
-    char *lines = results ? dec_render_nodes(results, 10) : strdup("");
+    /* Unreadable is not empty: "nothing in the graph" sends the model off to
+     * decide again what may already be decided. */
+    if (!results) return dec_fail("the graph's answer could not be read");
+    char *lines = dec_render_nodes(results, 10);
     free(results);
     dec_buf b = {0};
     if (!lines || !lines[0]) dec_buf_addf(&b, "Nothing in the graph about \"%s\".", question);
     else dec_buf_addf(&b, "%ld node(s) about \"%s\":\n%s", count, question, lines);
     free(lines);
     return b.p ? b.p : strdup("");
+}
+
+#define DEC_BOARD_SHOWN 20
+#define DEC_BOARD_PAGE 200
+/* Ids are shared with every workspace, so this is how far back from the newest
+ * message to look for enough of this workspace's own. */
+#define DEC_BOARD_LOOKBACK 200
+
+static char *dec_board_page(ds4_dec *d, long since, char *err, size_t err_len) {
+    dec_args a;
+    dec_args_init(&a);
+    dec_args_int(&a, "limit", DEC_BOARD_PAGE);
+    if (since > 0) dec_args_int(&a, "since_id", since);
+    return dec_tool_ctx(d, "read_messages", &a, true, err, err_len);
+}
+
+/* The most recent messages, as a JSON array. read_messages answers oldest first
+ * and a limit keeps the start of that, so the newest id has to be found by paging
+ * forward before the end of the board can be asked for. Caller frees. */
+static char *dec_board_recent(ds4_dec *d, char *err, size_t err_len) {
+    long since = 0;
+    for (int page = 0; page < 64; page++) {
+        char *payload = dec_board_page(d, since, err, err_len);
+        if (!payload) return NULL;
+        bool truncated = false;
+        long latest = 0;
+        dec_json_bool(payload, "truncated", &truncated);
+        bool numbered = dec_json_number(payload, "latest_id", &latest) && latest > since;
+        if (numbered) since = latest;
+        if (!truncated) {
+            if (page == 0) {
+                char *messages = dec_json_raw(payload, "messages");
+                free(payload);
+                return messages;
+            }
+            free(payload);
+            break;
+        }
+        free(payload);
+    }
+    long from = since > DEC_BOARD_LOOKBACK ? since - DEC_BOARD_LOOKBACK : 0;
+    char *payload = dec_board_page(d, from, err, err_len);
+    if (!payload) return NULL;
+    char *messages = dec_json_raw(payload, "messages");
+    free(payload);
+    return messages;
 }
 
 /* The board is the channel between the agents sharing this workspace. Posting
@@ -1434,6 +1588,15 @@ static char *dec_op_board(ds4_dec *d, const ds4_dec_call *c) {
     char err[512] = {0};
 
     if ((subject && subject[0]) && (body && body[0])) {
+        /* The model's tools speak strings and the server's message ids are
+         * numbers, so the conversion happens here, and a word gets named back. */
+        const char *reply_to = dec_arg(c, "reply_to");
+        long reply = 0;
+        if (reply_to && reply_to[0]) {
+            char *end = NULL;
+            reply = strtol(reply_to[0] == '#' ? reply_to + 1 : reply_to, &end, 10);
+            if (!end || *end || reply <= 0) return strdup("reply_to needs a message number.");
+        }
         char *text = NULL;
         if (why && why[0]) {
             text = malloc(strlen(body) + strlen(why) + 8);
@@ -1444,7 +1607,7 @@ static char *dec_op_board(ds4_dec *d, const ds4_dec_call *c) {
         dec_args_str(&a, "author", who);
         dec_args_str(&a, "subject", subject);
         dec_args_str(&a, "body", text && text[0] ? text : body);
-        dec_args_str(&a, "reply_to", dec_arg(c, "reply_to"));
+        if (reply > 0) dec_args_int(&a, "reply_to", reply);
         char *payload = dec_tool_ctx(d, "post_message", &a, true, err, sizeof(err));
         free(text);
         if (!payload) return dec_fail(err);
@@ -1462,15 +1625,25 @@ static char *dec_op_board(ds4_dec *d, const ds4_dec_call *c) {
      * for this agent by name, which is what an agent should look at first; all=1
      * widens it to everything recent. */
     bool all = dec_arg(c, "all") != NULL;
-    dec_args a;
-    dec_args_init(&a);
-    if (!all) dec_args_str(&a, "unanswered_for", who);
-    dec_args_int(&a, "limit", 20);
-    char *payload = dec_tool_ctx(d, "read_messages", &a, true, err, sizeof(err));
-    if (!payload) return dec_fail(err);
-    char *messages = dec_json_raw(payload, "messages");
-    free(payload);
-    char *lines = messages ? dec_render_messages(messages) : strdup("");
+    char *messages = NULL;
+    int first = 0;
+    if (all) {
+        messages = dec_board_recent(d, err, sizeof(err));
+        if (!messages) return dec_fail(err[0] ? err : "the board could not be read");
+        int count = 0;
+        while (dec_json_elem(messages, count)) count++;
+        if (count > DEC_BOARD_SHOWN) first = count - DEC_BOARD_SHOWN;
+    } else {
+        dec_args a;
+        dec_args_init(&a);
+        dec_args_str(&a, "unanswered_for", who);
+        dec_args_int(&a, "limit", DEC_BOARD_SHOWN);
+        char *payload = dec_tool_ctx(d, "read_messages", &a, true, err, sizeof(err));
+        if (!payload) return dec_fail(err);
+        messages = dec_json_raw(payload, "messages");
+        free(payload);
+    }
+    char *lines = messages ? dec_render_messages(messages, first) : strdup("");
     free(messages);
     dec_buf b = {0};
     if (!lines[0]) {
@@ -1526,9 +1699,11 @@ static char *dec_op_status(ds4_dec *d, const ds4_dec_call *c) {
 
     /* A goal node that already exists gets claimed, not duplicated: this is what
      * a resumed session, or a second agent, does when it finds the goal the first
-     * one wrote. The id is compared against the goals the server lists. */
-    if (!d->goal_bound && node_id && dec_goal_is_one(d, node_id)) {
+     * one wrote. The id is compared against the goals the server lists. Only
+     * status=active picks a goal up: closing one is not taking it on. */
+    if (!d->goal_bound && !strcmp(status, "active") && dec_goal_is_one(d, node_id)) {
         d->goal_bound = true;
+        d->offered_goal_id[0] = '\0';
         snprintf(d->goal_id, sizeof(d->goal_id), "%s", node_id);
         snprintf(d->goal_title, sizeof(d->goal_title), "%s", clip);
         dec_buf_add(&b, " It is now this session's bound goal; the goals other sessions"
@@ -1603,11 +1778,6 @@ char *ds4_dec_execute(ds4_dec *d, const ds4_dec_call *call, char *err, size_t er
         return NULL;
     }
 
-    const char *primary = dec_arg(call, "title");
-    if (!primary) primary = dec_arg(call, "summary");
-    if (!primary) primary = dec_arg(call, "question");
-    if (!primary) primary = dec_arg(call, "subject");
-
     char *obs = NULL;
     if (!strcmp(tool, "decide"))
         obs = dec_op_decide(d, call);
@@ -1629,19 +1799,15 @@ char *ds4_dec_execute(ds4_dec *d, const ds4_dec_call *call, char *err, size_t er
                     tool);
         return NULL;
     }
-
-    /* Remember what the model asked for. Compaction keeps the tool block but
-     * drops the answer, and this line is what survives on its own. */
-    const char *shown = primary && primary[0] ? primary : tool;
-    snprintf(d->last_note, sizeof(d->last_note), "%s %s (deciduous workspace %s)",
-             tool, shown, d->workspace);
     return obs;
 }
 
 /* What the agent appends to an ordinary tool result. The server's own
- * instructions tell agents to write at three moments and nowhere else, so this
- * never records anything by itself; it reminds the model twice per session, at
- * the two moments where an agent's work actually changes the graph. */
+ * instructions tell agents when to write and nowhere else, so this never records
+ * anything by itself. It reminds the model where work has gone unrecorded: the
+ * first edit, a command that worked after an edit, and every DEC_NUDGE_EDITS
+ * edits after that with nothing written. A command with no edit behind it is
+ * only looking around, however cleanly it exited. */
 char *ds4_dec_note_result(ds4_dec *d, const char *tool, const char *arg,
                           const char *observation, int exit_status) {
     (void)arg;
@@ -1653,16 +1819,17 @@ char *ds4_dec_note_result(ds4_dec *d, const char *tool, const char *arg,
     if (!writes_code && !step_worked) return NULL;
 
     if (writes_code) {
-        if (d->nudged_choice) return NULL;
+        d->edits_since_record++;
+        if (d->nudged_choice && d->edits_since_record % DEC_NUDGE_EDITS != 0) return NULL;
         d->nudged_choice = true;
         return strdup("deciduous: that edit settled something. If it was a fork in the road, "
                       "say what and why with op=decide (chosen_option, rejected_option, rationale). "
                       "Do not record reading, searching or planning.");
     }
-    if (d->nudged_step) return NULL;
+    if (d->nudged_step || !d->edits_since_record) return NULL;
     d->nudged_step = true;
-    return strdup("deciduous: the step worked. If it closed off a possibility for this goal, "
-                  "capture it with op=turn (summary, outcome).");
+    return strdup("deciduous: that worked after a change. Record the step with op=turn: "
+                  "summary, action, and an outcome with the number or the error.");
 }
 
 char *ds4_dec_compaction_digest(ds4_dec *d) {
@@ -1695,7 +1862,7 @@ char *ds4_dec_compaction_digest(ds4_dec *d) {
 
 const char *ds4_dec_recovery_note(const ds4_dec *d) {
     if (!d || !d->active) return NULL;
-    static char note[600];
+    static char note[1024];
 
     /* A resumed session has no transcript to learn the rules from, but it gets
      * them from the prompt section; this note only says where it stands. */
@@ -1703,13 +1870,14 @@ const char *ds4_dec_recovery_note(const ds4_dec *d) {
         snprintf(note, sizeof(note),
                  "deciduous: workspace %s branch %s; this session holds the goal (%s: %s).",
                  d->workspace, d->branch, d->goal_id, d->goal_title);
-    else if (d->goal_id[0])
+    else if (d->offered_goal_id[0])
         snprintf(note, sizeof(note),
                  "deciduous: workspace %s branch %s. A goal (%s: %s) is on the server and this "
                  "session has not claimed it. Claim that one rather than writing a duplicate "
                  "beside it: op=status with node_id=%s and status=active. If that work is "
                  "finished and this is a new request, write your own goal instead.",
-                 d->workspace, d->branch, d->goal_id, d->goal_title, d->goal_id);
+                 d->workspace, d->branch, d->offered_goal_id, d->offered_goal_title,
+                 d->offered_goal_id);
     else
         snprintf(note, sizeof(note),
                  "deciduous: workspace %s branch %s, server %s. No goal is bound for this "
@@ -1740,6 +1908,29 @@ bool ds4_dec_active(const ds4_dec *d) {
 }
 
 /* ---- the session ------------------------------------------------------ */
+
+/* The handshake is also the rules transfer: the server answers with the text it
+ * expects agents to follow, and the session id that follows. */
+static bool dec_handshake(ds4_dec *d, char *err, size_t err_len) {
+    char *result = NULL;
+    d->session[0] = '\0';
+    if (!dec_rpc_once(d, "initialize", "{\"protocolVersion\":\"2025-03-26\","
+                                        "\"clientInfo\":{\"name\":\"ds4-agent\","
+                                        "\"version\":\"1\"},"
+                                        "\"capabilities\":{\"tools\":{}}}",
+                      false, &result, NULL, err, err_len))
+        return false;
+    char *instr = dec_json_str(result, "instructions");
+    if (instr) {
+        snprintf(d->instructions, sizeof(d->instructions), "%s", instr);
+        free(instr);
+    }
+    free(result);
+    char note_err[512] = {0};
+    dec_rpc_once(d, "notifications/initialized", NULL, true, NULL, NULL, note_err, sizeof(note_err));
+    return true;
+}
+
 ds4_dec *ds4_dec_open(const char *root, const char *label) {
     g_open_error[0] = '\0';
     if (!root || !root[0]) {
@@ -1760,32 +1951,14 @@ ds4_dec *ds4_dec_open(const char *root, const char *label) {
         return NULL;
     }
 
-    /* The handshake is also the rules transfer: the server answers with the
-     * text it expects agents to follow, and the session id that follows. */
     char err[512] = {0};
-    char *result = NULL;
-    if (!dec_rpc(d, "initialize", "{\"protocolVersion\":\"2025-03-26\","
-                                   "\"clientInfo\":{\"name\":\"ds4-agent\","
-                                   "\"version\":\"1\"},"
-                                   "\"capabilities\":{\"tools\":{}}}",
-                 false, &result, err, sizeof(err))) {
+    if (!dec_handshake(d, err, sizeof(err))) {
         snprintf(g_open_error, sizeof(g_open_error),
                  "the deciduous server at %s did not complete the handshake: %s",
                  d->url, err);
-        free(result);
         free(d);
         return NULL;
     }
-    if (result) {
-        char *instr = dec_json_str(result, "instructions");
-        if (instr) {
-            snprintf(d->instructions, sizeof(d->instructions), "%s", instr);
-            free(instr);
-        }
-        free(result);
-    }
-    char note_err[512] = {0};
-    dec_rpc(d, "notifications/initialized", NULL, true, NULL, note_err, sizeof(note_err));
 
     d->active = true;
     return d;
@@ -1802,9 +1975,16 @@ char *ds4_dec_bind_goal(ds4_dec *d, const char *prompt) {
 
 void ds4_dec_release_goal(ds4_dec *d) {
     if (!d) return;
-    /* The goal node stays named on purpose: a new session in the same workspace
+    /* The goal stays on offer on purpose: a new session in the same workspace
      * should be able to claim the goal that is already there instead of writing a
-     * second one beside it. Its change id is not ours, so it goes. */
+     * second one beside it. It stops being this session's goal all the same, and
+     * its change id is not ours, so that goes too. */
+    if (d->goal_id[0]) {
+        snprintf(d->offered_goal_id, sizeof(d->offered_goal_id), "%s", d->goal_id);
+        snprintf(d->offered_goal_title, sizeof(d->offered_goal_title), "%s", d->goal_title);
+    }
+    d->goal_id[0] = '\0';
+    d->goal_title[0] = '\0';
     d->goal_bound = false;
     d->goal_change_id[0] = '\0';
     /* The next session has its own news, so the tally the closing note reads
@@ -1812,6 +1992,51 @@ void ds4_dec_release_goal(ds4_dec *d) {
     d->wrote_decisions = d->wrote_turns = d->wrote_notes = 0;
     d->decision_title_count = 0;
     d->last_turn[0] = '\0';
+    d->edits_since_record = 0;
+    d->nudged_choice = d->nudged_step = false;
+}
+
+/* What other work already decided about this goal's subject. The goal's own
+ * subtree is empty when it is new, which is exactly when a model is most likely
+ * to decide again what an earlier goal settled. Nothing is said when the question
+ * finds nothing or cannot be asked: the rest of the briefing stands on its own. */
+static void dec_brief_related(ds4_dec *d, dec_buf *b, const char *own_decisions) {
+    char err[512] = {0};
+    dec_args a;
+    dec_args_init(&a);
+    dec_args_str(&a, "question", d->goal_title);
+    dec_args_str(&a, "scope", "decisions");
+    dec_args_bool(&a, "include_context", false);
+    if (strcmp(d->workspace, "*") != 0) dec_args_str(&a, "workspace", d->workspace);
+    char *args = dec_args_json(&a);
+    char *payload = dec_tool(d, "ask_graph", args, err, sizeof(err));
+    free(args);
+    char *results = payload ? dec_json_raw(payload, "results") : NULL;
+    free(payload);
+    if (!results) return;
+
+    dec_buf found = {0};
+    int shown = 0;
+    for (int i = 0; shown < 3; i++) {
+        const char *elem = dec_json_elem(results, i);
+        if (!elem) break;
+        char *type = dec_json_str(elem, "node_type");
+        char *title = dec_json_str(elem, "title");
+        if (type && title && title[0] && !strcmp(type, "decision")) {
+            char clip[120];
+            dec_clip(clip, sizeof(clip), title);
+            if (!own_decisions || !strstr(own_decisions, clip)) {
+                dec_buf_addf(&found, "%s%s", shown ? "; " : "", clip);
+                shown++;
+            }
+        }
+        free(type);
+        free(title);
+    }
+    free(results);
+    if (found.p)
+        dec_buf_addf(b, "Decided in earlier work on this subject: %s\n", found.p);
+    free(found.p);
 }
 
 /* What the graph already holds about the bound goal, plus what the other agents
@@ -1892,10 +2117,11 @@ char *ds4_dec_briefing(ds4_dec *d) {
         dec_buf_addf(&b, "Recorded under it (%d): %s%s\n", other,
                      t_other.p ? t_other.p : "", other > 8 ? "; and more" : "");
     if (options)
-        dec_buf_addf(&b, "%d rejected alternatives on the record under those decisions.\n",
-                     options);
+        dec_buf_addf(&b, "%d %s weighed under those decisions.\n", options,
+                     dec_plural(options, "option", "options"));
     if (!anything)
         dec_buf_addf(&b, "Nothing is recorded under it yet.\n");
+    dec_brief_related(d, &b, t_dec.p);
     free(t_dec.p);
     free(t_obs.p);
     free(t_other.p);
@@ -1918,17 +2144,16 @@ char *ds4_dec_briefing(ds4_dec *d) {
             if (!elem) break;
             char *author = dec_json_str(elem, "author");
             char *subject = dec_json_str(elem, "subject");
-            char *id = dec_json_str(elem, "id");
+            long id = 0;
+            dec_json_number(elem, "id", &id);
             if (subject && subject[0]) {
                 char clip[120];
                 dec_clip(clip, sizeof(clip), subject);
-                dec_buf_addf(&waiting, "- #%s from %s: %s\n",
-                             id && id[0] ? id : "?",
+                dec_buf_addf(&waiting, "- #%ld from %s: %s\n", id,
                              author && author[0] ? author : "?", clip);
             }
             free(author);
             free(subject);
-            free(id);
             if (i >= 4) break;
         }
         free(msgs);
@@ -1943,6 +2168,16 @@ char *ds4_dec_briefing(ds4_dec *d) {
     return b.p;
 }
 
+/* The server reads @word in a message as an address, and the closing note quotes
+ * titles written about other things: a decision about @types/node should not
+ * page a label called types. The note addresses nobody. */
+static void dec_unmention(char *text) {
+    char *to = text;
+    for (const char *from = text; *from; from++)
+        if (*from != '@') *to++ = *from;
+    *to = '\0';
+}
+
 /* The session's news for the other agents sharing this workspace, posted where
  * they will read it. Only when this session recorded reasoning: a message
  * saying nothing happened is noise the others have to read past. Built from
@@ -1953,8 +2188,8 @@ char *ds4_dec_close_session(ds4_dec *d) {
     if (!d->wrote_decisions && !d->wrote_turns && !d->wrote_notes) return NULL;
 
     const char *who = d->label[0] ? d->label : "ds4-agent";
-    char clip_goal[96];
-    dec_clip(clip_goal, sizeof(clip_goal), d->goal_title);
+    char clip_goal[120];
+    dec_clip_title(clip_goal, sizeof(clip_goal), d->goal_title);
     char subject[200];
     if (clip_goal[0])
         snprintf(subject, sizeof(subject), "%s: %d %s, %d %s, %d %s",
@@ -1986,6 +2221,9 @@ char *ds4_dec_close_session(ds4_dec *d) {
     dec_buf_addf(&body, "\n\nThe graph holds the reasoning: workspace %s, branch %s.",
                  d->workspace, d->branch);
 
+    dec_unmention(subject);
+    if (body.p) dec_unmention(body.p);
+
     char err[512] = {0};
     dec_args a;
     dec_args_init(&a);
@@ -2006,7 +2244,7 @@ char *ds4_dec_close_session(ds4_dec *d) {
     d->wrote_decisions = d->wrote_turns = d->wrote_notes = 0;
     d->decision_title_count = 0;
     d->last_turn[0] = '\0';
-    char clip_subject[180];
+    char clip_subject[200];
     dec_clip(clip_subject, sizeof(clip_subject), subject);
     dec_buf out = {0};
     dec_buf_addf(&out, "closing note posted to the board: %s", clip_subject);
@@ -2072,8 +2310,8 @@ const char *ds4_dec_prompt_section(const ds4_dec *d) {
         "- op=decide records a real choice: title, chosen_option, one or more\n"
         "  rejected_option, rationale. The graph stores the chosen option as the\n"
         "  possibility that survived and each rejected option as the road closed off.\n"
-        "- op=turn records a step that closed off a possibility: summary, and as many\n"
-        "  observation, decision, action and outcome lines as you supply.\n"
+        "- op=turn records one step of the work: summary, and as many observation,\n"
+        "  decision, action and outcome lines as you supply.\n"
         "- op=note logs a durable fact you discovered: title, and why it matters.\n"
         "- op=graph is how you read. Ask it a question before writing anything: the\n"
         "  graph already holds what was learned about this problem, and repeating a\n"
@@ -2083,15 +2321,19 @@ const char *ds4_dec_prompt_section(const ds4_dec *d) {
         "  that are waiting on you; add all=1 to see everything recent.\n"
         "- op=goal and op=status are for the goal node itself: pass prompt to goal when\n"
         "  no goal is bound, and node_id with status to move a node by hand.\n"
-        "Record at three moments, and nowhere else: when a tool result contradicts an\n"
-        "assumption; when you choose between viable approaches; when the attempt tells\n"
-        "you the approach cannot work at all. Do not log your own reading, searching or\n"
-        "planning, and do not narrate the step you are in the middle of: the graph is\n"
-        "memory for the agent that comes after you, including you after compaction.\n"
+        "Write while you work, at these moments, not afterwards:\n"
+        "- You see more than one way to do it and pick one: op=decide, naming what it beat.\n"
+        "- You change code or config, and it works or fails: op=turn with action and\n"
+        "  outcome, the outcome carrying the number or the error.\n"
+        "- You learn a fact that changes the plan: op=note.\n"
+        "- An earlier choice turns out wrong: op=decide, saying in the title which choice\n"
+        "  it replaces, rather than logging the same choice a second time.\n"
+        "Do not log your own reading, searching or planning: the graph is memory for the\n"
+        "agent that comes after you, including you after compaction.\n"
         "Write failures are reported and never hidden; a missing record is a real loss,\n"
         "so say when one happened rather than working around it.\n";
 
-    static char shown[4096];
+    static char shown[6144];
     if (!d || !d->active) return text;
     char goal[DS4_DEC_GOAL_TITLE_MAX + 96] = {0};
     if (d->goal_id[0])

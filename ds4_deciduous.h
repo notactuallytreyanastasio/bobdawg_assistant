@@ -22,7 +22,7 @@
  * bookkeeping instead of on the work. */
 
 /* Goal titles are kept short; the full request travels in the goal's prompt. */
-#define DS4_DEC_GOAL_TITLE_MAX 100
+#define DS4_DEC_GOAL_TITLE_MAX 200
 
 typedef struct ds4_dec ds4_dec;
 
@@ -81,7 +81,8 @@ char *ds4_dec_briefing(ds4_dec *d);
  * change_id, so a retried bind returns the node the first attempt made instead
  * of a second goal.  Pass no prompt to read instead: which goal this session
  * holds, and which goals the workspace still has open.  Returns a malloc'd
- * observation. */
+ * observation, which on failure says why: ds4_dec_goal_bound() is what tells the
+ * two apart, because a refusal is text too. */
 char *ds4_dec_bind_goal(ds4_dec *d, const char *prompt);
 
 /* Whether a goal is already bound; lets the harness auto-bind the opening
@@ -93,8 +94,10 @@ bool ds4_dec_goal_bound(const ds4_dec *d);
 const char *ds4_dec_goal_id(const ds4_dec *d);
 
 /* Release the binding for a fresh session (/new): the next goal-worthy request
- * starts a new line of work.  The goal node itself is left as the server has
- * it, because a session that ended is not proof that the work finished. */
+ * starts a new line of work, and nothing written after this files under the old
+ * goal.  The goal is still offered in the recovery note, so a session that is
+ * continuing the work can claim it.  The goal node itself is left as the server
+ * has it, because a session that ended is not proof that the work finished. */
 void ds4_dec_release_goal(ds4_dec *d);
 
 /* The session's news for the other agents sharing this workspace, posted to the
@@ -121,7 +124,9 @@ char *ds4_dec_execute(ds4_dec *d, const ds4_dec_call *call, char *err, size_t er
  * model, `exit_status` the command's status (-1 when it is not a status).
  * Nothing is recorded here: the server's rules say plainly that reading,
  * searching and planning must not be logged, so this only ever returns a
- * reminder at the moments a write belongs - once per session each. */
+ * reminder at the moments a write belongs.  It follows the work: the step
+ * reminder waits for an edit to have happened, and each one comes back only
+ * after more work has gone unrecorded. */
 char *ds4_dec_note_result(ds4_dec *d, const char *tool, const char *arg,
                           const char *observation, int exit_status);
 

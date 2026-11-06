@@ -1,7 +1,8 @@
 # Making the graph load-bearing
 
-> Status: in progress. Phase 1 and the session-close half of Phase 2 have landed
-> (briefing, closing note, `/done`); Phase 3 and onwards are still the plan.
+> Status: in progress. Phase 1, the session-close half of Phase 2 and the first half
+> of Phase 8 have landed (briefing, closing note, `/done`, re-handshake after a server
+> restart). The rest is still the plan.
 
 Today the decision graph is *available* to ds4 and it is already the only writer
 of the reasoning record — [DECISION_GRAPH.md](DECISION_GRAPH.md). What it is not
@@ -43,8 +44,9 @@ works, extended from the goal node to the reasoning under it.
 `ds4_dec_recovery_note()` at worker start; reuse in `ds4_dec_compaction_digest()`;
 a `--graph brief=off` escape if it turns out to cost too many tokens.
 
-How it landed: two server calls, `get_descendants` under the goal (depth 4, sixty
-nodes) and one `read_messages` for what is waiting on this session's label. It
+How it landed: three server calls, `get_descendants` under the goal (depth 4, sixty
+nodes), `ask_graph` with the goal's title for decisions from earlier work, and one
+`read_messages` for what is waiting on this session's label. It
 goes into the system prompt appended to the teaching block — a goal-less session
 gets no briefing, and a failed read says the reason instead of listing nothing.
 It is built when a worker starts or resets, so `/goal` mid-session does not
@@ -122,13 +124,17 @@ activity check and renders them as a report, so the graph stays a maintained
 asset rather than quietly rotting. `/graph board` reads the board on demand. All
 three are reads; none of them writes.
 
-## Phase 8 — when the server goes away mid-session
+## Phase 8 — when the server goes away mid-session *(partly landed)*
 
 There is no local fallback by design, so the answer is to come back rather than
 to buffer: if no session is open, ds4 re-attempts the handshake at a safe point
 and tells the model the graph is back before its next write. A session that
 cannot reach the server keeps working, but the gap it leaves is named, and the
 recovered session says what was not recorded while it was dark.
+
+How it landed: a restarted server answers `404` for a session it has forgotten, so
+`dec_rpc()` shakes hands again and sends the refused call once more. Still open:
+telling the model what went unrecorded while the server was actually down.
 
 ## Decided
 
@@ -163,8 +169,11 @@ inventing a vocabulary of its own:
 
 Phases 1 and 2 landed first, which was the point of the document: the graph gets
 read before the work starts, and the session leaves a line behind when it did
-something. Next is 3, because the duplicate goals are now visible in the test
-workspace — the same title appears once per launch — and 4, which is cheap and
-makes the record correct. Then 5, then 6, the riskiest because it shapes what gets
-recorded at all. 7 and 8 last; they are polish and failure modes rather than
-capability.
+something. The live graph then reordered the rest. `consolidation_report` finds eight
+decisions written twice with the same title and no revisit between them, while no
+goal in the `ds4` workspace is a duplicate, so 5 comes next: a digest scoped to the
+goal should stop a compacted session re-recording what it already decided (that it
+is the cause is an inference, not a proof). Then 4, because sessions still close with
+decisions and no steps. 7 is nearly free now that `consolidation_report` exists. 6
+stays late, as the riskiest because it shapes what gets recorded at all, and 3 moves
+to last, with nothing in the graph asking for it.

@@ -69,25 +69,26 @@ the session entirely.
 
 ## When the graph gets written
 
-The server's own instructions — fetched during the handshake and injected
-verbatim — say there are three moments, and nowhere else:
+The server's own instructions are fetched during the handshake. They name tools
+the model does not have, so ds4 teaches the same moments in terms of its own ops:
 
 - **The user asks for something.** The request becomes a goal, with their message
-  verbatim in `prompt`.
-- **There is more than one way to do it.** Options; then a decision whose title
-  names what it beat.
-- **Code or config changed, and it worked or failed.** An action and an outcome
-  with the number or the error, or a turn that captures the step at once.
+  verbatim in `prompt`. The harness does this one.
+- **There is more than one way to do it.** `op=decide`, naming what it beat.
+- **Code or config changed, and it worked or failed.** `op=turn` with an action and
+  an outcome carrying the number or the error.
 
-Observations go in when a fact changes the plan; a revisit when an earlier choice
-turns out wrong. Reading, searching and planning are not recorded, so the graph
+`op=note` goes in when a fact changes the plan, and an `op=decide` that says what it
+replaces when an earlier choice turns out wrong. Reading, searching and planning are not recorded, so the graph
 stays a record of commitments rather than a transcript.
 
-ds4 never writes on its own. After a settled edit it reminds the model of the
-fork-in-the-road moment, and after a command that worked it reminds it of the
-step — once per session each, appended to the tool result. A reminder that is
-ignored is not repeated, because a harness that nags writes noise instead of
-decisions.
+ds4 never writes on its own. It reminds the model where work has gone unrecorded,
+appended to the tool result: the fork-in-the-road moment at the first edit, and the
+step when a command works after an edit. A command with no edit behind it is only
+looking around, however cleanly it exited. The step reminder comes back once
+something has been recorded and more work follows; the fork reminder comes back
+every eight edits with nothing written. Recording a decision or a step resets the
+count, so a session keeping its record hears nothing.
 
 ## The goal
 
@@ -102,14 +103,18 @@ not `/new` — binds itself as the goal when `--goal` was not supplied. `/goal`
 shows the bound goal, `/goal <text>` binds a new one, and a second `op=goal` in
 the same session answers that the session already holds one instead of quietly
 writing a second goal beside it. `/new` releases the goal, so new work does not
-inherit yesterday's goal silently.
+inherit yesterday's goal silently: nothing written after `/new` files under the old
+goal, and the next request that carries intent becomes a goal of its own. A goal
+bound on the opening turn is in the system message before the model answers. `/goal
+<text>` while a goal is held posts the closing note for it first, as `/new` does.
 
 That release is what makes a goal *shareable*. A goal is a node, not a session
-secret: a fresh session in the same workspace finds the request already written,
-and the recovery note tells it to claim the node rather than duplicate it —
-`op=status node_id=<id> status=active`. The claim is confirmed against the goal
-nodes the server lists, so `op=status` on some other kind of node stays a plain
-status change.
+secret: after `/new` the recovery note offers the released goal, and says to claim
+the node rather than duplicate it — `op=status node_id=<id> status=active`. Any
+session can claim a goal it finds with `op=goal` or `op=graph` the same way. The
+claim is confirmed against the goal nodes the server lists, and only `status=active`
+claims: closing a goal is not taking it on. A process that starts fresh does not
+remember which goal it last held, so `op=goal` with no prompt lists the open ones.
 
 ## What the model is told
 
@@ -120,14 +125,16 @@ goal is waiting to be claimed. `/new` teaches it again after rebuilding the
 transcript.
 
 Compaction summarises the conversation but does not summarise the graph:
-`ds4_dec_compaction_digest()` replaces the summary with the goal this session
-holds and the decisions the branch remembers, because the graph already holds the
-reasoning in its final form.
+`ds4_dec_compaction_digest()` adds the goal this session holds and the decisions the
+branch remembers to the summary, because the graph already holds the reasoning in its
+final form.
 
 Once a goal is bound, ds4 also adds a briefing block to the system prompt — the
-goal, the decision and observation titles filed under it, how many rejected
-alternatives the server holds against it, and what the board has waiting for this
-session's label. The model meets the graph before it writes to it, and the
+goal, the decision and observation titles filed under it, how many options were
+weighed, up to three decisions from earlier work on the same subject found by asking
+`ask_graph` the goal's title, and what the board has waiting for this session's
+label. A new goal has nothing under it, which is when a model is likeliest to decide
+again what earlier work settled. The model meets the graph before it writes to it, and the
 briefing sends a fuzzy question to `op=graph` instead of to the model's memory:
 
 ```
@@ -145,7 +152,7 @@ what `op=board` looks for in `@`-mentions.
 
 ## When the session ends
 
-Leaving, or `/new`, posts one closing note to the board — but only when this
+Leaving, `/new` or a new `/goal` posts one closing note to the board — but only when this
 session actually recorded something. The note counts what it wrote, names the
 decisions, and points at the workspace and branch that hold them:
 
@@ -155,7 +162,8 @@ make deciduous a core concept of the ds4 harness: 1 decision, 1 step, 1 note
 
 A session that only read stays quiet; a session that wrote posts once, so
 restarting does not stack up identical notes. The headline names the goal, because
-"session over" tells the next person nothing.
+"session over" tells the next person nothing. The server reads `@word` in a message
+as an address, so the note drops the `@` from the titles it quotes.
 
 `/done` is separate and always explicit: it marks the bound goal `completed` on
 the server. ds4 never marks a goal done on its own — not when the last patch
@@ -172,6 +180,11 @@ goal is bound or no server answers.
   add` and the rest of the CLI are a different client of the same server; ds4
   does not call them, and does not duplicate their argument shapes locally.
 - Board messages arrive at conversation boundaries, not mid-generation.
+- A restarted server forgets the session and answers `404`. ds4 shakes hands again
+  and sends the call once more, which is safe because the refused call never ran.
+  While the server is actually down, writes fail and say so.
+- A reply that stops short of its declared length, closes before its JSON ends, or
+  holds no result is a failure, never a quiet success.
 - The reminders cover `edit`, `write` and successful `bash`. `read` is not a
   decision, and web search or MCP side effects are not recorded.
 - A goal released by `/new` is left as it was written. `/done` marks the bound

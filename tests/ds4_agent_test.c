@@ -1,7 +1,10 @@
 #define DS4_AGENT_TEST
 #define DS4_AGENT_TEST_NO_MAIN
 #include "../ds4_agent.c"
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/xattr.h>
 #endif
@@ -721,6 +724,289 @@ static char *graph_call(agent_worker *w, const char *op, const graph_kv *kv) {
     return out;
 }
 
+/* A deciduous server that misbehaves on request, because the failures that
+ * matter here cannot be asked of the real one: a reply cut off halfway, or a
+ * session that outlived a restart.  It serves one connection at a time on a
+ * thread and keeps the last tool call it saw, so a test can read what ds4 really
+ * put on the wire. */
+typedef enum {
+    FAKE_OK,
+    FAKE_TRUNCATE_DECLARED,   /* promises more bytes than it sends */
+    FAKE_TRUNCATE_JSON,       /* closes cleanly in the middle of the JSON */
+    FAKE_STALE_ONCE,          /* refuses the current session, once */
+} fake_mode;
+
+typedef struct {
+    int listen_fd;
+    int port;
+    volatile fake_mode mode;
+    volatile int initializes;
+    volatile int tool_calls;
+    char last_body[8192];
+    pthread_t thread;
+} fake_mcp;
+
+static void fake_reply(int fd, const char *head, const char *body) {
+    char out[2048];
+    int n = snprintf(out, sizeof(out),
+                     "HTTP/1.1 %s\r\nContent-Type: application/json\r\n"
+                     "Connection: close\r\nContent-Length: %zu\r\n\r\n%s",
+                     head, strlen(body), body);
+    if (write(fd, out, (size_t)n) < 0) return;
+}
+
+static void *fake_mcp_main(void *arg) {
+    fake_mcp *f = arg;
+    for (;;) {
+        char req[16384];
+        size_t got = 0;
+        int fd = accept(f->listen_fd, NULL, NULL);
+        if (fd < 0) return NULL;
+        for (;;) {
+            ssize_t n = read(fd, req + got, sizeof(req) - 1 - got);
+            if (n <= 0) break;
+            got += (size_t)n;
+            req[got] = '\0';
+            char *end = strstr(req, "\r\n\r\n");
+            char *len = strcasestr(req, "content-length:");
+            if (end && len && got >= (size_t)(end + 4 - req) + (size_t)atol(len + 15)) break;
+        }
+        req[got] = '\0';
+        char *body = strstr(req, "\r\n\r\n");
+        body = body ? body + 4 : req;
+        if (strstr(body, "\"initialize\"")) {
+            char head[96];
+            f->initializes++;
+            snprintf(head, sizeof(head), "200 OK\r\nMcp-Session-Id: fake-%d", f->initializes);
+            fake_reply(fd, head, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":"
+                                 "{\"instructions\":\"the fake rules\"}}");
+        } else if (strstr(body, "notifications/initialized")) {
+            fake_reply(fd, "202 Accepted", "");
+        } else {
+            f->tool_calls++;
+            snprintf(f->last_body, sizeof(f->last_body), "%s", body);
+            if (f->mode == FAKE_STALE_ONCE) {
+                f->mode = FAKE_OK;
+                fake_reply(fd, "404 Not Found",
+                           "{\"error\":{\"code\":-32001,\"message\":\"Session not found\"},"
+                           "\"id\":1,\"jsonrpc\":\"2.0\"}");
+            } else if (f->mode == FAKE_TRUNCATE_DECLARED) {
+                const char *cut = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                  "Content-Length: 500\r\n\r\n{\"jsonrpc\":\"2.0\",\"res";
+                if (write(fd, cut, strlen(cut)) < 0) { /* the test sees the gap */ }
+            } else if (f->mode == FAKE_TRUNCATE_JSON) {
+                fake_reply(fd, "200 OK", "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"ty");
+            } else {
+                fake_reply(fd, "200 OK",
+                           "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\","
+                           "\"text\":\"{\\\"id\\\":\\\"11111111-aaaa\\\",\\\"results\\\":[],"
+                           "\\\"nodes\\\":[],\\\"messages\\\":[],\\\"created\\\":true}\"}]}}");
+            }
+        }
+        close(fd);
+    }
+}
+
+static bool fake_mcp_start(fake_mcp *f) {
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof(addr);
+    char url[64];
+
+    memset(f, 0, sizeof(*f));
+    f->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (f->listen_fd < 0) return false;
+    if (bind(f->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) return false;
+    if (listen(f->listen_fd, 8) != 0) return false;
+    if (getsockname(f->listen_fd, (struct sockaddr *)&addr, &len) != 0) return false;
+    f->port = ntohs(addr.sin_port);
+    if (pthread_create(&f->thread, NULL, fake_mcp_main, f) != 0) return false;
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/mcp", f->port);
+    setenv("DECIDUOUS_MCP_URL", url, 1);
+    setenv("DECIDUOUS_MCP_TOKEN", "fake-token", 1);
+    return true;
+}
+
+static void fake_mcp_stop(fake_mcp *f) {
+    shutdown(f->listen_fd, SHUT_RDWR);
+    close(f->listen_fd);
+    pthread_join(f->thread, NULL);
+    unsetenv("DECIDUOUS_MCP_URL");
+    unsetenv("DECIDUOUS_MCP_TOKEN");
+}
+
+static char *fake_call(ds4_dec *d, const char *tool, const ds4_dec_arg *args, int argc,
+                       char *err, size_t err_len) {
+    ds4_dec_call call = {.tool = tool, .args = args, .argc = argc};
+    return ds4_dec_execute(d, &call, err, err_len);
+}
+
+static void test_deciduous_seam_failures(void) {
+    fake_mcp f;
+    ds4_dec *d;
+    char err[512], *out;
+    const ds4_dec_arg note[] = {{"title", "a fact"}, {"description", "it holds"}};
+    const ds4_dec_arg decide[] = {{"title", "a choice"}, {"chosen_option", "this one"}};
+    const ds4_dec_arg ask[] = {{"question", "what was decided"}};
+
+    setenv("DECIDUOUS_WORKSPACE", "ds4-selftest", 1);
+    setenv("DECIDUOUS_BRANCH", "main", 1);
+    AGENT_TEST_ASSERT(fake_mcp_start(&f));
+    d = ds4_dec_open("/tmp", "tester");
+    AGENT_TEST_ASSERT(d != NULL);
+    out = ds4_dec_bind_goal(d, "keep a session alive across a restart");
+    free(out);
+    AGENT_TEST_ASSERT(ds4_dec_goal_bound(d));
+
+    /* A restarted server forgets the session.  That is not a failed write: the
+     * write never ran, so ds4 shakes hands again and sends it once more. */
+    f.mode = FAKE_STALE_ONCE;
+    int calls = f.tool_calls;
+    out = fake_call(d, "note", note, 2, err, sizeof(err));
+    AGENT_TEST_ASSERT(out && strstr(out, "Observation recorded") != NULL);
+    free(out);
+    AGENT_TEST_ASSERT(f.initializes == 2);
+    AGENT_TEST_ASSERT(f.tool_calls == calls + 2);
+
+    /* An observation is live knowledge, not something waiting to happen. */
+    AGENT_TEST_ASSERT(strstr(f.last_body, "\"status\":\"active\"") != NULL);
+
+    /* A reply that stops short is not a success, whichever way it stopped: the
+     * model must not be told a decision was logged when nobody can say so. */
+    f.mode = FAKE_TRUNCATE_DECLARED;
+    out = fake_call(d, "decide", decide, 2, err, sizeof(err));
+    AGENT_TEST_ASSERT(out == NULL || strstr(out, "did not record") != NULL);
+    AGENT_TEST_ASSERT(out == NULL || strstr(out, "logged") == NULL);
+    free(out);
+    f.mode = FAKE_TRUNCATE_JSON;
+    out = fake_call(d, "decide", decide, 2, err, sizeof(err));
+    AGENT_TEST_ASSERT(out == NULL || strstr(out, "did not record") != NULL);
+    free(out);
+
+    /* And an unreadable answer is not an empty graph. */
+    out = fake_call(d, "graph", ask, 1, err, sizeof(err));
+    AGENT_TEST_ASSERT(out == NULL || strstr(out, "Nothing in the graph") == NULL);
+    free(out);
+    f.mode = FAKE_OK;
+
+    /* The opening request becomes the goal, but only when it carries intent, and
+     * a bind that fails says so and leaves the session without a goal. */
+    {
+        agent_worker turn = {0};
+        ds4_dec *fresh = ds4_dec_open("/tmp", "tester");
+        AGENT_TEST_ASSERT(fresh != NULL);
+        turn.dec = fresh;
+        AGENT_TEST_ASSERT(!agent_worker_bind_request(&turn, "hi"));
+        AGENT_TEST_ASSERT(!agent_worker_bind_request(&turn, "/new"));
+        f.mode = FAKE_TRUNCATE_JSON;
+        AGENT_TEST_ASSERT(!agent_worker_bind_request(&turn, "make the seam real, not just wired"));
+        AGENT_TEST_ASSERT(!ds4_dec_goal_bound(fresh));
+        f.mode = FAKE_OK;
+        AGENT_TEST_ASSERT(agent_worker_bind_request(&turn, "make the seam real, not just wired"));
+        AGENT_TEST_ASSERT(ds4_dec_goal_bound(fresh));
+        AGENT_TEST_ASSERT(!agent_worker_bind_request(&turn, "and this is a second request"));
+        ds4_dec_close(fresh);
+    }
+
+    /* A reply is a message number on the wire, whatever the model typed. */
+    {
+        const ds4_dec_arg reply[] = {{"subject", "s"}, {"body", "b"}, {"reply_to", "42"}};
+        const ds4_dec_arg bad[] = {{"subject", "s"}, {"body", "b"}, {"reply_to", "soon"}};
+        out = fake_call(d, "board", reply, 3, err, sizeof(err));
+        free(out);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "\"reply_to\":42") != NULL);
+        calls = f.tool_calls;
+        out = fake_call(d, "board", bad, 3, err, sizeof(err));
+        AGENT_TEST_ASSERT(out && strstr(out, "reply_to") != NULL);
+        free(out);
+        AGENT_TEST_ASSERT(f.tool_calls == calls);
+    }
+
+    /* The closing note quotes decision titles, and the server reads @word as an
+     * address: a title about @types/node must not page a label that is not there.
+     * A title cut for the note is cut on a character, never inside one. */
+    {
+        char title[160];
+        memset(title, 'x', 126);
+        memcpy(title + 126, "\xe2\x80\x94 tail", 9);
+        title[135] = '\0';
+        const ds4_dec_arg pkg[] = {{"title", "zero deps but @types/node"}, {"chosen_option", "dev only"}};
+        const ds4_dec_arg wide[] = {{"title", title}, {"chosen_option", "dev only"}};
+        out = fake_call(d, "decide", pkg, 2, err, sizeof(err));
+        free(out);
+        out = fake_call(d, "decide", wide, 2, err, sizeof(err));
+        free(out);
+        out = ds4_dec_close_session(d);
+        AGENT_TEST_ASSERT(out != NULL);
+        free(out);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "post_message") != NULL);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "types/node") != NULL);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "@types") == NULL);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "xxx") != NULL);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "\xe2") == NULL);
+    }
+    ds4_dec_close(d);
+
+    /* A worktree's .git is a file: the branch is the worktree's, and the workspace
+     * is still the repository's name, because the graph belongs to the repository. */
+    {
+        char dir[] = "/tmp/ds4-dec-wt-XXXXXX", cmd[512], repo[PATH_MAX], tree[PATH_MAX];
+        const char *section;
+        AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+        snprintf(repo, sizeof(repo), "%s/myrepo", dir);
+        snprintf(tree, sizeof(tree), "%s/elsewhere", dir);
+        snprintf(cmd, sizeof(cmd),
+                 "git init -q %s && git -C %s -c user.email=t@t -c user.name=t commit -q "
+                 "--allow-empty -m x && git -C %s worktree add -q -b side %s", repo, repo, repo, tree);
+        AGENT_TEST_ASSERT(system(cmd) == 0);
+        unsetenv("DECIDUOUS_WORKSPACE");
+        unsetenv("DECIDUOUS_BRANCH");
+        d = ds4_dec_open(tree, "tester");
+        AGENT_TEST_ASSERT(d != NULL);
+        section = ds4_dec_prompt_section(d);
+        AGENT_TEST_ASSERT(strstr(section, "Workspace \"myrepo\", branch \"side\"") != NULL);
+        ds4_dec_close(d);
+        snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+        AGENT_TEST_ASSERT(system(cmd) == 0);
+    }
+
+    /* The session is told the moments the server asks for, action and outcome
+     * among them, because a teaching that leaves them out gets a graph without. */
+    {
+        const char *section;
+        setenv("DECIDUOUS_WORKSPACE", "ds4-selftest", 1);
+        setenv("DECIDUOUS_BRANCH", "main", 1);
+        d = ds4_dec_open("/tmp", "tester");
+        AGENT_TEST_ASSERT(d != NULL);
+        section = ds4_dec_prompt_section(d);
+        AGENT_TEST_ASSERT(strstr(section, "works or fails") != NULL);
+        AGENT_TEST_ASSERT(strstr(section, "action and outcome") != NULL);
+        AGENT_TEST_ASSERT(strstr(section, "do not narrate") == NULL);
+
+        /* A reminder waits for work to remind about: an ls that exits 0 is not a
+         * step, and a long run of edits with nothing recorded earns another word. */
+        out = ds4_dec_bind_goal(d, "reminders follow the work");
+        free(out);
+        AGENT_TEST_ASSERT(ds4_dec_note_result(d, "bash", "ls", "exit_status=0\n", 0) == NULL);
+        out = ds4_dec_note_result(d, "edit", "a.c", "Edited\n", -1);
+        AGENT_TEST_ASSERT(out != NULL);
+        free(out);
+        out = ds4_dec_note_result(d, "bash", "make", "exit_status=0\n", 0);
+        AGENT_TEST_ASSERT(out != NULL && strstr(out, "op=turn") != NULL);
+        free(out);
+        int nudges = 0;
+        for (int i = 0; i < 8; i++) {
+            out = ds4_dec_note_result(d, "edit", "a.c", "Edited\n", -1);
+            if (out) nudges++;
+            free(out);
+        }
+        AGENT_TEST_ASSERT(nudges == 1);
+        ds4_dec_close(d);
+    }
+    fake_mcp_stop(&f);
+    unsetenv("DECIDUOUS_WORKSPACE");
+    unsetenv("DECIDUOUS_BRANCH");
+}
+
 static void test_deciduous_graph(void) {
     char dir[] = "/tmp/ds4-dec-XXXXXX";
     char saved[PATH_MAX], root[PATH_MAX], *res;
@@ -904,12 +1190,22 @@ static void test_deciduous_graph(void) {
 
     /* A new session in the same workspace should claim the goal that exists rather
      * than write a duplicate beside it: release names it, and op=status claims it. */
+    char held_goal[64];
+    snprintf(held_goal, sizeof(held_goal), "%s", goal_id);
+    goal_id = held_goal;
     ds4_dec_release_goal(w.dec);
     AGENT_TEST_ASSERT(!ds4_dec_goal_bound(w.dec));
+    AGENT_TEST_ASSERT(ds4_dec_goal_id(w.dec) == NULL);
     {
         const char *released = ds4_dec_recovery_note(w.dec);
         AGENT_TEST_ASSERT(released && strstr(released, "has not claimed it") != NULL);
         AGENT_TEST_ASSERT(strstr(released, goal_id) != NULL);
+
+        /* Released means released: after /new nothing files under the old goal. */
+        res = graph_call(&w, "note", (const graph_kv[]){
+            {"title", "must not land under the old goal"}, {"description", "x"}, {NULL, NULL}});
+        AGENT_TEST_ASSERT(strstr(res, "no goal is bound") != NULL);
+        free(res);
 
         agent_worker second = {0};
         char *claim;
@@ -923,6 +1219,20 @@ static void test_deciduous_graph(void) {
         AGENT_TEST_ASSERT(strstr(claim, "is now this session's bound goal") != NULL);
         AGENT_TEST_ASSERT(ds4_dec_goal_bound(second.dec));
         free(claim);
+
+        /* Moving a goal to a finished state is not picking it up. */
+        {
+            ds4_dec *third = ds4_dec_open(root, "third");
+            AGENT_TEST_ASSERT(third != NULL);
+            agent_worker holder = {0};
+            holder.dec = third;
+            claim = graph_call(&holder, "status", (const graph_kv[]){
+                {"node_id", goal_id}, {"status", "pending"}, {NULL, NULL}});
+            AGENT_TEST_ASSERT(strstr(claim, "bound goal") == NULL);
+            AGENT_TEST_ASSERT(!ds4_dec_goal_bound(third));
+            free(claim);
+            ds4_dec_close(third);
+        }
 
         /* Finishing a goal belongs to the operator alone: ds4 never decides a goal
          * is done, and a handle that holds no goal has nothing to finish. */
@@ -952,6 +1262,41 @@ static void test_deciduous_graph(void) {
         AGENT_TEST_ASSERT(strstr(closing, "(now completed)") != NULL);
         free(closing);
         ds4_dec_close(second.dec);
+    }
+
+    /* A released session takes the next request as a goal of its own, and the
+     * goal it let go of stops being offered. */
+    {
+        char *fresh = ds4_dec_bind_goal(w.dec, "how ds4 reaches the graph after /new");
+        AGENT_TEST_ASSERT(fresh && strstr(fresh, "Goal recorded") != NULL);
+        free(fresh);
+        AGENT_TEST_ASSERT(ds4_dec_goal_bound(w.dec));
+        AGENT_TEST_ASSERT(strcmp(ds4_dec_goal_id(w.dec), held_goal) != 0);
+        note = ds4_dec_recovery_note(w.dec);
+        AGENT_TEST_ASSERT(note && strstr(note, "holds the goal") != NULL);
+
+        /* A new goal has nothing under it, which is when a model is likeliest to
+         * decide again what earlier work settled: the briefing goes and looks. */
+        brief = ds4_dec_briefing(w.dec);
+        AGENT_TEST_ASSERT(brief && strstr(brief, "Decided in earlier work") != NULL);
+        AGENT_TEST_ASSERT(strstr(brief, "how ds4 reaches the graph") != NULL);
+        free(brief);
+
+        /* Message numbers go out as numbers and come back as numbers. */
+        res = graph_call(&w, "board", (const graph_kv[]){
+            {"subject", "numbered"}, {"body", "first"}, {NULL, NULL}});
+        const char *posted = strstr(res, "message #");
+        AGENT_TEST_ASSERT(posted != NULL);
+        char number[32];
+        snprintf(number, sizeof(number), "%ld", posted ? strtol(posted + 9, NULL, 10) : 0);
+        free(res);
+        res = graph_call(&w, "board", (const graph_kv[]){
+            {"subject", "answered"}, {"body", "second"}, {"reply_to", number}, {NULL, NULL}});
+        AGENT_TEST_ASSERT(strstr(res, "Posted to the board") != NULL);
+        free(res);
+        res = graph_call(&w, "board", (const graph_kv[]){{"all", "1"}, {NULL, NULL}});
+        AGENT_TEST_ASSERT(strstr(res, "(reply to #") != NULL);
+        free(res);
     }
 
     /* The op is what selects the server tool, so a bad one is named back. */
@@ -1335,6 +1680,7 @@ int main(int argc, char **argv) {
     test_unicode_output_and_footer();
     test_footer_only_updates();
     test_tool_contracts();
+    test_deciduous_seam_failures();
     test_deciduous_graph();
     if (agent_test_failures) {
         fprintf(stderr, "ds4-agent tests: %d failure(s)\n",
