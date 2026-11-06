@@ -1075,6 +1075,14 @@ static ds4_hooks *hooks_from(const char *dir, const char *text) {
     return ds4_hooks_load(dir, err, sizeof(err));
 }
 
+static void test_put_file(const char *path, const char *data, size_t len) {
+    FILE *fp = fopen(path, "wb");
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    AGENT_TEST_ASSERT(fwrite(data, 1, len, fp) == len);
+    fclose(fp);
+}
+
 static void test_permissions(void) {
     /* What must not slip through as reading. */
     static const char *const asks[] = {
@@ -1154,6 +1162,105 @@ static void test_permissions_refuse_a_tool(void) {
     agent_tool_observation_free(&obs);
     agent_tool_call_free(&call);
     ds4_permit_free(w.permit);
+}
+
+static void test_prompt_input(void) {
+    char dir[] = "/tmp/ds4-input-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    char path[PATH_MAX], sub[PATH_MAX], home[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.git", dir);
+    AGENT_TEST_ASSERT(mkdir(path, 0700) == 0);
+    snprintf(sub, sizeof(sub), "%s/src", dir);
+    AGENT_TEST_ASSERT(mkdir(sub, 0700) == 0);
+    snprintf(home, sizeof(home), "%s/home", dir);
+    AGENT_TEST_ASSERT(mkdir(home, 0700) == 0);
+    snprintf(path, sizeof(path), "%s/.ds4", home);
+    AGENT_TEST_ASSERT(mkdir(path, 0700) == 0);
+
+    AGENT_TEST_ASSERT(ds4_input_instructions(sub, NULL) == NULL);
+
+    /* Mine, then the root's, then the nearest. AGENT.md wins over CLAUDE.md in a directory. */
+    snprintf(path, sizeof(path), "%s/.ds4/AGENT.md", home);
+    test_put_file(path, "MINE", 4);
+    snprintf(path, sizeof(path), "%s/AGENT.md", dir);
+    test_put_file(path, "ROOT", 4);
+    snprintf(path, sizeof(path), "%s/CLAUDE.md", dir);
+    test_put_file(path, "SHADOWED", 8);
+    snprintf(path, sizeof(path), "%s/CLAUDE.md", sub);
+    test_put_file(path, "NEAR", 4);
+    char *found = ds4_input_instructions(sub, home);
+    AGENT_TEST_ASSERT(found != NULL);
+    if (found) {
+        const char *mine = strstr(found, "MINE"), *root = strstr(found, "ROOT"), *near = strstr(found, "NEAR");
+        AGENT_TEST_ASSERT(mine && root && near && mine < root && root < near);
+        AGENT_TEST_ASSERT(!strstr(found, "SHADOWED"));
+    }
+    free(found);
+
+    /* A huge file is cut, and says so. */
+    size_t big = DS4_INPUT_INSTRUCTION_BYTES * 2;
+    char *fill = xmalloc(big);
+    memset(fill, 'x', big);
+    snprintf(path, sizeof(path), "%s/AGENT.md", dir);
+    test_put_file(path, fill, big);
+    free(fill);
+    found = ds4_input_instructions(dir, NULL);
+    AGENT_TEST_ASSERT(found && strstr(found, "cut off here") &&
+                      strlen(found) < DS4_INPUT_INSTRUCTION_BYTES + 512);
+    free(found);
+
+    /* Mentions: only a word naming a real file. */
+    snprintf(path, sizeof(path), "%s/note.txt", dir);
+    test_put_file(path, "the-contents", 12);
+    char prompt[PATH_MAX + 64];
+    snprintf(prompt, sizeof(prompt), "fix @%s, please", path);
+    char *expanded = ds4_input_expand_mentions(prompt);
+    AGENT_TEST_ASSERT(expanded && !strncmp(expanded, prompt, strlen(prompt)) && strstr(expanded, "the-contents"));
+    free(expanded);
+    AGENT_TEST_ASSERT(ds4_input_expand_mentions("mail me@example.com about @nothing/here") == NULL);
+    AGENT_TEST_ASSERT(ds4_input_expand_mentions("no mention") == NULL);
+    snprintf(prompt, sizeof(prompt), "@%s", dir);
+    AGENT_TEST_ASSERT(ds4_input_expand_mentions(prompt) == NULL);
+
+    /* Commands. */
+    snprintf(path, sizeof(path), "%s/.ds4", dir);
+    AGENT_TEST_ASSERT(mkdir(path, 0700) == 0);
+    snprintf(path, sizeof(path), "%s/.ds4/commands", dir);
+    AGENT_TEST_ASSERT(mkdir(path, 0700) == 0);
+    snprintf(path, sizeof(path), "%s/.ds4/commands/ship.md", dir);
+    test_put_file(path, "Ship $ARGUMENTS now, $ARGUMENTS!", 32);
+    snprintf(path, sizeof(path), "%s/.ds4/commands/plain.md", dir);
+    test_put_file(path, "Do it", 5);
+    snprintf(path, sizeof(path), "%s/.ds4/commands/review.md", dir);
+    test_put_file(path, "Our review", 10);
+
+    char *c = ds4_input_command_prompt("/ship v2", sub, home);
+    AGENT_TEST_ASSERT(c && !strcmp(c, "Ship v2 now, v2!"));
+    free(c);
+    c = ds4_input_command_prompt("/plain carefully", sub, home);
+    AGENT_TEST_ASSERT(c && !strcmp(c, "Do it\n\ncarefully"));
+    free(c);
+    c = ds4_input_command_prompt("/review", sub, home);
+    AGENT_TEST_ASSERT(c && !strcmp(c, "Our review"));
+    free(c);
+    c = ds4_input_command_prompt("/init", sub, home);
+    AGENT_TEST_ASSERT(c && strstr(c, "AGENT.md") && !strstr(c, "$ARGUMENTS"));
+    free(c);
+    AGENT_TEST_ASSERT(ds4_input_command_prompt("/nothing", sub, home) == NULL);
+    AGENT_TEST_ASSERT(ds4_input_command_prompt("/../../etc/passwd", sub, home) == NULL);
+    AGENT_TEST_ASSERT(ds4_input_command_prompt("not a command", sub, home) == NULL);
+    char *list = ds4_input_command_list(sub, home);
+    AGENT_TEST_ASSERT(strstr(list, "/ship") && strstr(list, "/init"));
+    free(list);
+
+    /* The shell. */
+    char *ran = ds4_input_run_shell("echo out; echo err >&2; exit 3");
+    AGENT_TEST_ASSERT(strstr(ran, "out") && strstr(ran, "err") && strstr(ran, "[exit 3]"));
+    free(ran);
+
+    char command[PATH_MAX + 16];
+    snprintf(command, sizeof(command), "rm -rf %s", dir);
+    AGENT_TEST_ASSERT(system(command) == 0);
 }
 
 /* In a child with a real terminal, because the point is what a terminal shares. */
@@ -2087,6 +2194,7 @@ int main(int argc, char **argv) {
     test_hooks_engine();
     test_permissions();
     test_permissions_refuse_a_tool();
+    test_prompt_input();
     test_output_descriptions();
     test_deciduous_git();
     test_deciduous_seam_failures();

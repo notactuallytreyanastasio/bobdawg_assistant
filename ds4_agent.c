@@ -12,6 +12,7 @@
 #include <mach-o/dyld.h>
 #endif
 #include "ds4_hooks.h"
+#include "ds4_input.h"
 #include "ds4_permit.h"
 #include "linenoise.h"
 
@@ -99,6 +100,7 @@ typedef struct {
     const char *dec_label; /* --label: who this session is on the graph */
     bool graph_off;        /* --graph off: stay blind to any decision graph */
     bool hooks_off;        /* --hooks off: run no .ds4/hooks */
+    bool instructions_off; /* --instructions off: read no AGENT.md */
     bool permissions_set;  /* --permissions was given */
     ds4_permit_mode permissions;
     bool non_interactive;
@@ -197,6 +199,7 @@ typedef struct {
     char tool_approval_answer;   /* y, n or a */
     char tool_approval_message[512];
     ds4_permit *permit;
+    char *next_note;  /* said to the model ahead of the next prompt; owned */
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -663,6 +666,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
+           !strcmp(cmd, "/commands") ||
            agent_slash_command_with_args(cmd, "/permissions") ||
            agent_slash_command_with_args(cmd, "/power") ||
            agent_slash_command_with_args(cmd, "/think") ||
@@ -996,6 +1000,13 @@ static agent_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.permissions_set = true;
+        } else if (!strcmp(arg, "--instructions")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (strcmp(mode, "on") != 0 && strcmp(mode, "off") != 0) {
+                fprintf(stderr, "ds4-agent: --instructions takes on or off\n");
+                exit(2);
+            }
+            c.instructions_off = !strcmp(mode, "off");
         } else if (!strcmp(arg, "--hooks")) {
             const char *mode = need_arg(&i, argc, argv, arg);
             if (!strcmp(mode, "off")) c.hooks_off = true;
@@ -5451,6 +5462,32 @@ static void worker_answer_tool_approval(agent_worker *w, char answer) {
     w->tool_approval_answered = true;
     pthread_cond_broadcast(&w->cond);
     pthread_mutex_unlock(&w->mu);
+}
+
+static void agent_note_for_model(agent_worker *w, const char *note) {
+    size_t had = w->next_note ? strlen(w->next_note) : 0;
+    char *joined = xmalloc(had + strlen(note) + 2);
+    memcpy(joined, w->next_note ? w->next_note : "", had);
+    strcpy(joined + had, note);
+    strcat(joined, "\n");
+    free(w->next_note);
+    w->next_note = joined;
+}
+
+/* What the model gets for what was typed: anything the person did since its last turn,
+ * then the words, then the files they mentioned. */
+static char *agent_prepare_prompt(agent_worker *w, const char *text) {
+    if (w->cfg->gen.raw_prompt) return xstrdup(text);
+    char *mentions = ds4_input_expand_mentions(text);
+    const char *body = mentions ? mentions : text;
+    size_t had = w->next_note ? strlen(w->next_note) : 0;
+    char *out = xmalloc(had + strlen(body) + 2);
+    if (had) sprintf(out, "%s\n%s", w->next_note, body);
+    else strcpy(out, body);
+    free(mentions);
+    free(w->next_note);
+    w->next_note = NULL;
+    return out;
 }
 
 static void agent_web_log(void *privdata, const char *message) {
@@ -11677,7 +11714,7 @@ static bool worker_submit(agent_worker *w, const char *text) {
     bool ok = w->initialized && w->status.state == AGENT_WORKER_IDLE &&
               !w->cmd_text && !w->think_requested;
     if (ok) {
-        w->cmd_text = xstrdup(text);
+        w->cmd_text = agent_prepare_prompt(w, text);
         /* A submitted turn is no longer idle, even if the worker thread has
          * not yet reached its real prefill accounting.  Non-interactive mode
          * depends on this to avoid exiting in the small handoff window between
@@ -13171,6 +13208,7 @@ static void agent_worker_free(agent_worker *w) {
     free(w->cache_dir);
     free(w->sysprompt_path);
     ds4_permit_free(w->permit);
+    free(w->next_note);
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
@@ -13399,6 +13437,27 @@ static void agent_start_beside_binary(agent_config *cfg) {
 }
 #endif
 
+static char *agent_command_prompt(const char *line) {
+    char here[PATH_MAX];
+    return ds4_input_command_prompt(line, getcwd(here, sizeof(here)) ? here : ".", getenv("HOME"));
+}
+
+/* The instructions go in as system text, after --chdir and before the session's prefix
+ * is built. An empty -sys asks for no extra text at all, so it gets none. */
+static void agent_load_instructions(agent_config *cfg) {
+    const char *system = cfg->gen.system;
+    if (cfg->instructions_off || cfg->gen.raw_prompt || !system || !system[0]) return;
+    char here[PATH_MAX];
+    if (!getcwd(here, sizeof(here))) return;
+    char *found = ds4_input_instructions(here, getenv("HOME"));
+    if (!found) return;
+    char *joined = xmalloc(strlen(system) + strlen(found) + 1);
+    strcpy(joined, system);
+    strcat(joined, found);
+    cfg->gen.system = joined;  /* lives as long as the process */
+    free(found);
+}
+
 static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
@@ -13595,6 +13654,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     bool show_welcome_after_restart = false;
     bool force_status_redraw_after_restart = false;
     char *restore_line = NULL;
+    char *custom = NULL;
     while (running) {
         /* If a bash child process changed the terminal mode (e.g., from raw
          * to cooked), restore raw mode so linenoise continues to work. */
@@ -13940,6 +14000,18 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             }
                         }
                     }
+                } else if (cmd[0] == '/' && !agent_slash_command_known(cmd) &&
+                           (custom = agent_command_prompt(cmd)) != NULL) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else if (worker_submit(&worker, custom)) {
+                        linenoiseHistoryAdd(cmd);
+                        agent_echo_user_prompt(cmd);
+                    } else {
+                        restore_line = xstrdup(cmd);
+                    }
+                    free(custom);
+                    custom = NULL;
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
                     ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
                     (void)ignored;
@@ -13957,6 +14029,12 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("permissions: %s\n",
                                ds4_permit_mode_name(ds4_permit_mode_of(worker.permit)));
                     }
+                } else if (!strcmp(cmd, "/commands")) {
+                    char here[PATH_MAX];
+                    char *listed = ds4_input_command_list(getcwd(here, sizeof(here)) ? here : ".",
+                                                          getenv("HOME"));
+                    printf("%s", listed);
+                    free(listed);
                 } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
                     /* Stop the editor so raw mode and non-blocking stdin are
                      * disabled before we prompt the user.  Then restore the
@@ -14057,6 +14135,19 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     if (!agent_worker_show_history(&worker, history_turns,
                                                    err, sizeof(err)))
                         printf("history failed: %s\n", err);
+                } else if (cmd[0] == '!' && cmd[1]) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        linenoiseHistoryAdd(cmd);
+                        char *ran = ds4_input_run_shell(cmd + 1);
+                        printf("%s", ran);
+                        char *note = xmalloc(strlen(cmd) + strlen(ran) + 48);
+                        sprintf(note, "[The user ran %s and it printed:\n%s]", cmd + 1, ran);
+                        agent_note_for_model(&worker, note);
+                        free(note);
+                        free(ran);
+                    }
                 } else if (busy) {
                     agent_prompt_queue_push(&queue, cmd);
                 } else {
@@ -14216,6 +14307,7 @@ int main(int argc, char **argv) {
         ds4_tp_free(tp_leader);
         return 1;
     }
+    agent_load_instructions(&cfg);
 
     struct sigaction old_int;
     struct sigaction sa;
