@@ -123,3 +123,24 @@ exec claude "$@"
 Give the wrapper a different name from `claude`. Agent clients can send large
 initial prompts, so the first prefill may take time. Disk caching helps reuse
 compatible prefixes on later sessions.
+
+## LM Studio
+
+LM Studio's chat UI needs an endpoint plugin to talk to a server that is not
+LM Studio, because its own server serves models rather than consuming them, and
+LM Link only bridges LM Studio instances over a dedicated network of its own.
+Install the Hub plugin `lmstudio/openai-compat-endpoint`, or the fork
+`local/universal-openai-endpoint` for free-form model IDs, and select it as the
+generation source:
+
+| Setting | Value |
+| --- | --- |
+| Base URL | `http://127.0.0.1:8000/v1` |
+| API key | `dsv4-local`; the server ignores credentials |
+| Model ID | an ID reported by `GET /v1/models` |
+
+The loaded engine decides the IDs. A Flash Next GGUF reports
+`qwen3.8-flash-next`, `qwen3.8-flash-next-chat` for answers without reasoning
+content, and `qwen3.8-flash-next-reasoner` to force reasoning. For a server
+shared over a tailnet, use the base URL `serve-tailnet.sh` prints instead of
+localhost; see [tailnet serving](TAILNET.md).

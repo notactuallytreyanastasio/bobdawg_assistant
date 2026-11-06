@@ -9,8 +9,10 @@
 ```
 
 The default address is `http://127.0.0.1:8000`. Use `--host 0.0.0.0` to listen
-on other interfaces. Restrict access to trusted clients; for an Internet-facing
-deployment, put authentication and TLS in front of the server.
+on other interfaces, or `./serve-tailnet.sh` to bind only the Tailscale address
+so tailnet clients connect without opening the LAN; see
+[tailnet serving](TAILNET.md). Restrict access to trusted clients; for an
+Internet-facing deployment, put authentication and TLS in front of the server.
 
 `--cors` enables browser cross-origin headers. It does not change the listening
 address or provide access control.
