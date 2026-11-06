@@ -1,0 +1,1 @@
+Rename the function get_usr to fetch_user everywhere in this repository, including every caller and the README. Nothing else should change.

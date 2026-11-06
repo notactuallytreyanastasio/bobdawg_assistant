@@ -1,0 +1,1 @@
+Write test_money.py for money.py, using plain asserts so that python3 test_money.py exits non-zero on a failure. Cover rounding, negative amounts and parse errors. Do not change money.py.

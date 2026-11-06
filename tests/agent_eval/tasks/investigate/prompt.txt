@@ -1,0 +1,1 @@
+What is the effective retry limit when this service runs with MODE=prod? Trace it through the code, then write only the number to ANSWER.txt.

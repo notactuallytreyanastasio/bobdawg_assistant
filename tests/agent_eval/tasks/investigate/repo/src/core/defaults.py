@@ -1,0 +1,2 @@
+RETRIES = 3
+PROD_FACTOR = 4

@@ -1,0 +1,1 @@
+Create a branch called fix-typo, correct the spelling mistake in notes.md there, and commit it. Leave main as it is.
