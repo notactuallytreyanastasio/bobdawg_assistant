@@ -8,6 +8,9 @@
 #include "ds4_tp.h"
 #include "ds4_web.h"
 #include "ds4_deciduous.h"
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include "ds4_hooks.h"
 #include "linenoise.h"
 
@@ -13247,6 +13250,55 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
  * stdin protocol: announce readiness on stderr, collect bytes until stdin has
  * been quiet for 200 ms, submit that buffer as one prompt, and keep reading so
  * later input can be queued while the model is still working. */
+/* A terminal's stdin, stdout and stderr are usually one open file description, and
+ * O_NONBLOCK belongs to the description. The editor needs it on stdin, which left
+ * stdout non-blocking too, so a terminal that stopped reading for a moment (Ctrl-S, a
+ * slow link) cost it the output it missed. Each gets a description of its own here. */
+static void agent_own_output_descriptions(void) {
+    static const int outputs[] = {STDOUT_FILENO, STDERR_FILENO};
+    for (size_t i = 0; i < sizeof(outputs) / sizeof(outputs[0]); i++) {
+        const char *name = isatty(outputs[i]) ? ttyname(outputs[i]) : NULL;
+        int fd = name ? open(name, O_WRONLY | O_NOCTTY | O_CLOEXEC) : -1;
+        if (fd < 0) continue;
+        dup2(fd, outputs[i]);
+        close(fd);
+    }
+}
+
+#ifdef __APPLE__
+/* The Metal sources are read from ./metal when the engine opens, which tied the agent
+ * to being started from the repository. When they are not here but are beside the
+ * binary, the engine opens there, and --chdir, which happens after it, brings the
+ * session back. Paths given on the command line still mean what they meant. */
+static const char *agent_absolute_from(const char *path, const char *cwd) {
+    if (!path || path[0] == '/') return path;
+    size_t n = strlen(cwd) + strlen(path) + 2;
+    char *full = xmalloc(n);  /* lives as long as the process */
+    snprintf(full, n, "%s/%s", cwd, path);
+    return full;
+}
+
+static void agent_start_beside_binary(agent_config *cfg) {
+    static const char probe[] = "metal/flash_attn.metal";
+    char exe[PATH_MAX], real[PATH_MAX], cwd[PATH_MAX];
+    uint32_t size = sizeof(exe);
+    if (access(probe, R_OK) == 0 || _NSGetExecutablePath(exe, &size) != 0) return;
+    if (!realpath(exe, real) || !getcwd(cwd, sizeof(cwd))) return;
+    char *slash = strrchr(real, '/');
+    if (!slash) return;
+    *slash = '\0';
+    char beside[PATH_MAX + sizeof(probe) + 1];
+    snprintf(beside, sizeof(beside), "%s/%s", real, probe);
+    if (access(beside, R_OK) != 0) return;
+
+    /* The default model is found beside the binary too. */
+    bool named_model = strcmp(cfg->engine.model_path, "ds4flash.gguf") != 0 || access("ds4flash.gguf", R_OK) == 0;
+    if (named_model) cfg->engine.model_path = agent_absolute_from(cfg->engine.model_path, cwd);
+    cfg->chdir_path = cfg->chdir_path ? agent_absolute_from(cfg->chdir_path, cwd) : xstrdup(cwd);
+    if (chdir(real) != 0) fprintf(stderr, "ds4-agent: cannot start from %s: %s\n", real, strerror(errno));
+}
+#endif
+
 static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
@@ -13948,6 +14000,10 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+#ifdef __APPLE__
+    agent_start_beside_binary(&cfg);
+#endif
+    if (!cfg.non_interactive) agent_own_output_descriptions();
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {

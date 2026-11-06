@@ -1075,6 +1075,34 @@ static ds4_hooks *hooks_from(const char *dir, const char *text) {
     return ds4_hooks_load(dir, err, sizeof(err));
 }
 
+/* In a child with a real terminal, because the point is what a terminal shares. */
+static void test_output_descriptions(void) {
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    AGENT_TEST_ASSERT(master >= 0);
+    if (master < 0) return;
+    AGENT_TEST_ASSERT(grantpt(master) == 0 && unlockpt(master) == 0);
+    char *name = ptsname(master);
+    pid_t pid = fork();
+    AGENT_TEST_ASSERT(pid >= 0);
+    if (pid == 0) {
+        int tty = open(name, O_RDWR);
+        if (tty < 0) _exit(9);
+        dup2(tty, STDIN_FILENO);
+        dup2(tty, STDOUT_FILENO);
+        dup2(tty, STDERR_FILENO);
+        fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) | O_NONBLOCK);
+        if (!(fcntl(STDOUT_FILENO, F_GETFL, 0) & O_NONBLOCK)) _exit(1);  /* the premise */
+        fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) & ~O_NONBLOCK);
+        agent_own_output_descriptions();
+        fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) | O_NONBLOCK);
+        _exit(fcntl(STDOUT_FILENO, F_GETFL, 0) & O_NONBLOCK ? 2 : 0);
+    }
+    int status = 1;
+    waitpid(pid, &status, 0);
+    close(master);
+    AGENT_TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 static void test_hooks_engine(void) {
     char dir[] = "/tmp/ds4-hooks-XXXXXX", cmd[128], err[PATH_MAX + 80];
     ds4_hooks *h;
@@ -1976,6 +2004,7 @@ int main(int argc, char **argv) {
     test_footer_only_updates();
     test_tool_contracts();
     test_hooks_engine();
+    test_output_descriptions();
     test_deciduous_git();
     test_deciduous_seam_failures();
     test_deciduous_graph();
