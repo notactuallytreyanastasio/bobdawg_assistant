@@ -139,3 +139,4 @@ __pycache__/
 # deciduous: the local decision-graph database stays on the machine that wrote it.
 # graph.json is the shared copy; commit it deliberately once the graph is worth sharing.
 /.deciduous/deciduous.db
+/BOBBY.md
