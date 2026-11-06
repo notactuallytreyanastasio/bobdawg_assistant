@@ -24,9 +24,9 @@ function props(overrides: Partial<SidebarProps> = {}): SidebarProps {
 }
 
 describe('Sidebar', () => {
-  it('says where chats live while there are none', () => {
+  it('says so while there are no chats', () => {
     render(<Sidebar {...props({ chats: [] })} />);
-    expect(screen.getByText('Your chats stay in this browser.')).toBeTruthy();
+    expect(screen.getByText('Nothing here yet.')).toBeTruthy();
   });
 
   it('marks the open chat and opens another', async () => {

@@ -130,6 +130,30 @@ char *ds4_dec_execute(ds4_dec *d, const ds4_dec_call *call, char *err, size_t er
 char *ds4_dec_note_result(ds4_dec *d, const char *tool, const char *arg,
                           const char *observation, int exit_status);
 
+/* One finished exchange on the chat page.  The chat page has no tools, so the
+ * model cannot write for itself the way an agent does; ds4-server writes this on
+ * the conversation's behalf.  ending is "", "stopped", "length" or "failed", and
+ * answer holds the failure's wording for the last. */
+typedef struct {
+    const char *chat_id;        /* the page's id for this conversation */
+    const char *first_question; /* what the conversation opened with */
+    const char *question;
+    const char *answer;
+    const char *ending;
+    const char *model;
+} ds4_dec_chat_turn;
+
+/* Write everything from here on to this branch instead of the checkout's. */
+void ds4_dec_use_branch(ds4_dec *d, const char *branch);
+
+/* Record one exchange: the conversation is a goal and each exchange a step under
+ * it, as a session and its turns are.  This touches no session goal, and the
+ * goal's change id comes from chat_id, so the caller keeps no state: every turn of
+ * a conversation finds the same goal, whichever handle writes it.  Returns the
+ * goal's id, malloc'd; NULL with err set when the record did not land. */
+char *ds4_dec_record_chat_turn(ds4_dec *d, const ds4_dec_chat_turn *turn,
+                               char *err, size_t err_len);
+
 /* Authoritative graph state for context compaction: the reasoning survives
  * compaction exactly because it lives outside the context window, so it is
  * re-read from the server rather than summarised from the transcript. */

@@ -174,6 +174,44 @@ goal is bound or no server answers.
 /done        # only ever by request
 ```
 
+## The chat page
+
+The chat page has no tools, so its model cannot write for itself the way an agent
+does. `ds4-server` writes on the conversation's behalf instead, which is the one place
+ds4 records something the model did not author: the operator asked for every
+conversation to be tracked. It uses the same seam, `ds4_dec_record_chat_turn()`:
+
+| On the page | In the graph |
+| --- | --- |
+| A conversation | A goal, its opening question verbatim in `prompt` |
+| A finished exchange | A step under that goal: the question as the action, the answer as the outcome |
+| A stop, a length cut-off, a failure | The same step, with the outcome saying so, and `success: false` for a failure |
+
+The page posts each finished turn to `POST /chat/record` and the server writes two
+calls: `add_node` for the goal and `capture_conversation_turn` for the step. The goal's
+`change_id` is `chat-<id>` from the page's own chat id, so the same goal comes back on
+every turn and the server keeps nothing between them. Thinking is not recorded, and an
+answer past 32 KiB is cut.
+
+Conversations go to this repository's workspace, on a `chat` branch. They are in the
+same tree as the agent's work and `ask_graph` can reach them, but `op=goal` lists a few
+goals per branch, and a day of chatting on `main` would push the agent's goals off it.
+The label is `ds4-chat`.
+
+The token stays on the server, because the page is served with no authentication. For
+the same reason `/chat/record` refuses anything but `application/json`: a form on some
+other website can post text at this port, but a JSON content type makes the browser ask
+first, and the answer is no. Anyone who can reach the port can still write here, the
+same way they can use the API, so Tailscale ACLs remain the access control. On a shared
+tailnet that means **other people's chats are recorded too**. `--chat-graph off` stops
+it; the page then says nothing about the graph.
+
+This is only the write side. The chat model is not taught the graph and is not
+briefed from it, so a conversation does not yet benefit from what the graph holds.
+There is no closing note on the board either, because a browser tab has no reliable
+end, and conversation goals stay `active`. Requests to `/v1` from anything else, LM
+Studio included, are not recorded: they carry no conversation identity.
+
 ## Limits
 
 - ds4 speaks the server's API and nothing else. `deciduous commands`, `deciduous

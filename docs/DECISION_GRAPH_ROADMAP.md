@@ -22,7 +22,7 @@ letting ds4 keep a local copy of the graph.
   politeness one.
 - Nothing gets recorded that the model did not author, except the boundary
   message describing the session, which is built from nodes the session already
-  wrote.
+  wrote, and the chat page's turns, because a chat model has no tools to write with.
 - Every phase is verifiable without a model: a test in `ds4_agent_test` that
   writes and reads through the real server in workspace `ds4-selftest`, skipping
   itself when the server is down.

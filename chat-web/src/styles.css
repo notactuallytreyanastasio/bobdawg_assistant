@@ -137,6 +137,19 @@ button:disabled {
   background: var(--danger);
 }
 
+.graph {
+  margin-left: 6px;
+  padding-left: 12px;
+  color: var(--dim);
+  font-size: 12.5px;
+  white-space: nowrap;
+  border-left: 1px solid var(--line);
+}
+
+.graph.lost {
+  color: var(--danger);
+}
+
 /* The chats */
 
 .sidebar {

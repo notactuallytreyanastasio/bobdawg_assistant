@@ -7,6 +7,7 @@
 #include "ds4_tp.h"
 #include "rax.h"
 #include "ds4_ui.h"
+#include "ds4_deciduous.h"
 
 /* OpenAI/Anthropic compatible local server.
  *
@@ -10199,6 +10200,9 @@ struct server {
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     const char *ui_dir;   /* built chat page directory, served at /chat */
+    bool chat_graph_off;  /* --chat-graph off: the page's turns are not recorded */
+    pthread_mutex_t chat_graph_mu; /* one graph handle, shared by client threads */
+    ds4_dec *chat_graph;  /* opened by the first turn, and again until one opens */
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -15050,6 +15054,7 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    bool json_body;  /* the request said Content-Type: application/json */
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -15084,6 +15089,22 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static bool content_type_is_json(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len >= 13 && strncasecmp(line, "Content-Type:", 13) == 0) {
+            const char *v = line + 13;
+            while (v < line + len && isspace((unsigned char)*v)) v++;
+            return (size_t)(line + len - v) >= 16 && strncasecmp(v, "application/json", 16) == 0;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -15111,6 +15132,7 @@ static bool read_http_request(int fd, http_request *r) {
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
 
+    r->json_body = content_type_is_json(b.ptr, (size_t)hend);
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
@@ -15367,6 +15389,135 @@ static bool http_page_response(int fd, server *s, const http_request *hr) {
     return true;
 }
 
+/* One exchange from the chat page, as it arrives at /chat/record. */
+typedef struct {
+    char *chat;
+    char *first;
+    char *question;
+    char *answer;
+    char *ending;
+    char *model;
+} chat_record;
+
+static void chat_record_free(chat_record *r) {
+    free(r->chat);
+    free(r->first);
+    free(r->question);
+    free(r->answer);
+    free(r->ending);
+    free(r->model);
+    memset(r, 0, sizeof(*r));
+}
+
+/* The id becomes part of a change id on a shared server, so it is held to what the
+ * page generates and no more. */
+static bool chat_id_is_usable(const char *id) {
+    size_t n = id ? strlen(id) : 0;
+    if (n == 0 || n > 64) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)id[i]) && id[i] != '-' && id[i] != '_') return false;
+    return true;
+}
+
+static bool chat_record_parse(const char *body, chat_record *r) {
+    const char *p = body;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        json_ws(&p);
+        char **into = !strcmp(key, "chat") ? &r->chat
+                    : !strcmp(key, "first") ? &r->first
+                    : !strcmp(key, "question") ? &r->question
+                    : !strcmp(key, "answer") ? &r->answer
+                    : !strcmp(key, "ending") ? &r->ending
+                    : !strcmp(key, "model") ? &r->model : NULL;
+        free(key);
+        bool ok = into ? json_string_replace(&p, into) : json_skip_value(&p);
+        if (!ok) return false;
+        json_ws(&p);
+        if (*p == ',') {
+            p++;
+            json_ws(&p);
+        }
+    }
+    if (*p != '}') return false;
+    return chat_id_is_usable(r->chat) && r->question && r->question[0];
+}
+
+/* The page's turns reach the decision graph through here, because the token that
+ * writes to it must not reach a page served with no authentication. Conversations
+ * go to the repository's own workspace on a branch of their own: the agent's goals
+ * stay readable, and this client's thread is the only thing that waits on the
+ * write, so a slow graph cannot slow an answer.
+ *
+ * Asking for application/json is what keeps other websites out. A form on any page
+ * a tailnet user has open can post text at this port, but a JSON content type makes
+ * the browser ask first, and the answer to that is no. */
+#define DS4_CHAT_RECORD_PATH DS4_UI_URL_PREFIX "/record"
+#define DS4_CHAT_GRAPH_BRANCH "chat"
+
+static bool http_chat_record(int fd, server *s, const http_request *hr) {
+    if (!s->ui_dir || strcmp(hr->method, "POST") != 0 || strcmp(hr->path, DS4_CHAT_RECORD_PATH) != 0)
+        return false;
+    if (s->chat_graph_off) {
+        http_error(fd, s->enable_cors, 404, "this server does not record chats");
+        return true;
+    }
+    if (!hr->json_body) {
+        http_error(fd, s->enable_cors, 415, "a chat turn is sent as application/json");
+        return true;
+    }
+    chat_record r = {0};
+    if (!chat_record_parse(hr->body ? hr->body : "", &r)) {
+        chat_record_free(&r);
+        http_error(fd, s->enable_cors, 400, "a chat turn needs chat and question");
+        return true;
+    }
+
+    char err[512] = {0};
+    char *goal = NULL;
+    pthread_mutex_lock(&s->chat_graph_mu);
+    if (!s->chat_graph) {
+        char root[PATH_MAX];
+        if (ds4_dec_find_root(NULL, root, sizeof(root))) s->chat_graph = ds4_dec_open(root, "ds4-chat");
+        if (s->chat_graph) ds4_dec_use_branch(s->chat_graph, DS4_CHAT_GRAPH_BRANCH);
+        else snprintf(err, sizeof(err), "%s", ds4_dec_open_error() ? ds4_dec_open_error()
+                                                                   : "no graph to write to");
+    }
+    if (s->chat_graph) {
+        ds4_dec_chat_turn turn = {.chat_id = r.chat, .first_question = r.first,
+                                  .question = r.question, .answer = r.answer,
+                                  .ending = r.ending, .model = r.model};
+        goal = ds4_dec_record_chat_turn(s->chat_graph, &turn, err, sizeof(err));
+    }
+    pthread_mutex_unlock(&s->chat_graph_mu);
+    chat_record_free(&r);
+
+    if (!goal) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: chat turn not recorded: %s", err);
+        http_error(fd, s->enable_cors, 503, err[0] ? err : "the turn was not recorded");
+        return true;
+    }
+    buf b = {0};
+    buf_puts(&b, "{\"recorded\":true,\"goal\":");
+    json_escape(&b, goal);
+    buf_puts(&b, "}");
+    free(goal);
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return true;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -15404,7 +15555,7 @@ static void *client_main(void *arg) {
     /* The built chat page answers from this origin when --ui-dir names it, so
      * the page asks relative /v1 paths and needs no server address baked into
      * its bundle and no cross-origin headers on the API. */
-    if (http_page_response(fd, s, &hr)) {
+    if (http_page_response(fd, s, &hr) || http_chat_record(fd, s, &hr)) {
         http_request_free(&hr);
         goto done;
     }
@@ -15533,6 +15684,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     const char *ui_dir;   /* --ui-dir: built chat page directory */
+    bool chat_graph_off;  /* --chat-graph off */
     int batched_sessions;
     int mixed_prefill_quantum;
 } server_config;
@@ -15774,6 +15926,13 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--ui-dir")) {
             c.ui_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--chat-graph")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (strcmp(mode, "on") != 0 && strcmp(mode, "off") != 0) {
+                fprintf(stderr, "ds4-server: --chat-graph takes on or off\n");
+                exit(2);
+            }
+            c.chat_graph_off = !strcmp(mode, "off");
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -16058,6 +16217,8 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     s.ui_dir = cfg.ui_dir;
+    s.chat_graph_off = cfg.chat_graph_off;
+    pthread_mutex_init(&s.chat_graph_mu, NULL);
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -17336,6 +17497,75 @@ static char *page_reply(server *s, const char *method, const char *path, bool *s
  * authentication, so these checks cover the reply a browser gets, and what the
  * handler must never answer with: a file from outside the built directory, or
  * a request that belongs to the API. */
+static char *chat_record_reply(server *s, bool json, const char *body) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+    http_request hr = {0};
+    snprintf(hr.method, sizeof(hr.method), "POST");
+    snprintf(hr.path, sizeof(hr.path), "%s", DS4_CHAT_RECORD_PATH);
+    hr.body = (char *)body;
+    hr.json_body = json;
+    bool served = http_chat_record(sv[0], s, &hr);
+    shutdown(sv[0], SHUT_WR);
+    char *out = served ? read_socket_text(sv[1]) : NULL;
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+/* The turn itself is written by the seam and tested with it; what is checked here
+ * is who gets that far. */
+static void test_chat_record_route(void) {
+    server s = {0};
+    const char *turn = "{\"chat\":\"abc-1\",\"question\":\"why\",\"answer\":\"because\"}";
+    char *out;
+
+    pthread_mutex_init(&s.chat_graph_mu, NULL);
+    out = chat_record_reply(&s, true, turn);
+    TEST_ASSERT(out == NULL); /* no page, no endpoint */
+
+    s.ui_dir = "/tmp";
+    s.chat_graph_off = true;
+    out = chat_record_reply(&s, true, turn);
+    TEST_ASSERT(out && strstr(out, " 404 ") != NULL);
+    free(out);
+    s.chat_graph_off = false;
+
+    /* A form on another website can reach this port; it cannot say JSON unasked. */
+    out = chat_record_reply(&s, false, turn);
+    TEST_ASSERT(out && strstr(out, " 415 ") != NULL);
+    free(out);
+
+    out = chat_record_reply(&s, true, "{\"chat\":\"abc-1\"}");
+    TEST_ASSERT(out && strstr(out, " 400 ") != NULL);
+    free(out);
+    out = chat_record_reply(&s, true, "{\"chat\":\"../../etc\",\"question\":\"why\"}");
+    TEST_ASSERT(out && strstr(out, " 400 ") != NULL);
+    free(out);
+    out = chat_record_reply(&s, true, "not json");
+    TEST_ASSERT(out && strstr(out, " 400 ") != NULL);
+    free(out);
+
+    /* A graph that is not there is a refusal the page can show, and the next turn
+     * tries again. */
+    setenv("DECIDUOUS_MCP_URL", "http://127.0.0.1:9/mcp", 1);
+    setenv("DECIDUOUS_MCP_TOKEN", "t", 1);
+    out = chat_record_reply(&s, true, turn);
+    TEST_ASSERT(out && strstr(out, " 503 ") != NULL);
+    TEST_ASSERT(s.chat_graph == NULL);
+    free(out);
+    unsetenv("DECIDUOUS_MCP_URL");
+    unsetenv("DECIDUOUS_MCP_TOKEN");
+
+    chat_record r = {0};
+    TEST_ASSERT(chat_record_parse("{\"chat\":\"a_1\",\"first\":\"f\",\"question\":\"q\","
+                                  "\"answer\":\"line\\none\",\"ending\":\"length\","
+                                  "\"model\":\"m\",\"extra\":[1,{\"x\":2}]}", &r));
+    TEST_ASSERT(!strcmp(r.answer, "line\none") && !strcmp(r.ending, "length"));
+    chat_record_free(&r);
+    pthread_mutex_destroy(&s.chat_graph_mu);
+}
+
 static void test_chat_page_serving(void) {
     char dir[] = "/tmp/ds4-page-XXXXXX";
     TEST_ASSERT(mkdtemp(dir) != NULL);
@@ -23306,6 +23536,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
     test_chat_page_serving();
+    test_chat_record_route();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();

@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { useChat } from '../../src/hooks/useChat';
 import type { FetchLike } from '../../src/api/chatClient';
 import { emptyConversation } from '../../src/chat/conversation';
+import type { Conversation } from '../../src/chat/conversation';
 import { userMessage } from '../../src/chat/message';
 
 const encoder = new TextEncoder();
@@ -203,6 +204,47 @@ describe('useChat', () => {
     expect(view.result.current.conversation.messages[1]?.text).toBe('partial ');
     expect(view.result.current.conversation.messages[1]?.ending).toBe('stopped');
     expect(view.result.current.conversation.error).toBeNull();
+  });
+
+  it('reports each finished turn once, with the failure if there was one', async () => {
+    const seen: { last: string | undefined; failure: string | null }[] = [];
+    const onTurn = (conversation: Conversation, failure: string | null): void => {
+      seen.push({ last: conversation.messages.at(-1)?.text, failure });
+    };
+    let refuse = false;
+    const fetchImpl: FetchLike = async () =>
+      refuse
+        ? new Response(JSON.stringify({ error: { message: 'busy' } }), { status: 503 })
+        : sseResponse([contentChunk('done'), 'data: [DONE]\n\n']);
+    const view = renderHook(() => useChat({ model: 'm', origin: '', fetchImpl, onTurn }));
+
+    await act(async () => view.result.current.send('first'));
+    await waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0]).toEqual({ last: 'done', failure: null });
+
+    refuse = true;
+    await act(async () => view.result.current.send('second'));
+    await waitFor(() => expect(seen).toHaveLength(2));
+    expect(seen[1]?.failure).toBe('busy');
+  });
+
+  it('does not report a turn another chat replaced', async () => {
+    const onTurn = vi.fn();
+    let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        stream = c;
+      },
+    });
+    const view = renderHook(() =>
+      useChat({ model: 'm', origin: '', fetchImpl: async () => new Response(body), onTurn }),
+    );
+    await act(async () => view.result.current.send('first'));
+    act(() => view.result.current.load([userMessage('u1', 'other chat')]));
+    stream?.close();
+    await waitFor(() => expect(view.result.current.conversation.streaming).toBe(false));
+    await act(async () => undefined);
+    expect(onTurn).not.toBeCalled();
   });
 
   it('asks again on retry, sending the question and not the old answer', async () => {

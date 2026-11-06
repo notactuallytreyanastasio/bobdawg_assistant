@@ -7,6 +7,9 @@ import { platformFetch } from './api/chatClient';
 import type { FetchLike } from './api/chatClient';
 import { fetchModels } from './api/models';
 import type { ModelInfo } from './api/models';
+import { recordTurn, turnRecordOf } from './api/recordTurn';
+import type { RecordResult } from './api/recordTurn';
+import type { Conversation } from './chat/conversation';
 import { contextPercent } from './chat/format';
 import { loadThinking, platformStore, saveThinking } from './chat/storage';
 import type { StoreLike } from './chat/storage';
@@ -40,12 +43,23 @@ export function App({ origin = apiOrigin(), fetchImpl, store = platformStore(), 
   const [activeId, setActiveId] = useState(() => library.initial?.id ?? newChatId());
   const [drawer, setDrawer] = useState(false);
   const [thinking, setThinking] = useState(() => loadThinking(store));
+  const [graph, setGraph] = useState<RecordResult | null>(null);
+
+  // Every finished turn goes to the decision graph by way of the server. The answer is on
+  // the page either way, so all that comes back is whether to say it did not land.
+  function record(conversation: Conversation, failure: string | null): void {
+    const turn = turnRecordOf(activeId, model?.name ?? '', conversation.messages, failure);
+    if (turn === null) return;
+    void recordTurn({ origin, fetchImpl: send, turn }).then(setGraph);
+  }
+
   const chat = useChat({
     model: model?.id ?? '',
     origin,
     fetchImpl: send,
     thinking,
     initialMessages: library.initial?.messages ?? [],
+    onTurn: record,
   });
   const { messages, streaming } = chat.conversation;
 
@@ -141,6 +155,16 @@ export function App({ origin = apiOrigin(), fetchImpl, store = platformStore(), 
             <span className={ready ? 'dot up' : unreachable ? 'dot down' : 'dot'} aria-hidden="true" />
             {model?.name ?? 'ds4-server'}
           </p>
+          {graph === 'recorded' ? (
+            <span className="graph" title="Each finished turn is written to the deciduous decision graph">
+              In the decision graph
+            </span>
+          ) : null}
+          {graph === 'missed' ? (
+            <span className="graph lost" title="The answer is fine; the graph has no record of it">
+              Last turn not recorded
+            </span>
+          ) : null}
         </header>
 
         {messages.length === 0 && !streaming ? (

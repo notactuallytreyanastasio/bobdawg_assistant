@@ -77,6 +77,13 @@ the directory is refused, and a path outside the prefix belongs to the API. The
 build is the page's own `npm run build`, which writes the asset URLs it asks for
 under the same prefix.
 
+Each finished turn on the page is written to the decision graph through `POST
+/chat/record`, which needs `application/json` and exists only with `--ui-dir`. The
+conversation is a goal and each exchange a step, on the `chat` branch of this
+repository's workspace; a server with no deciduous configured answers `503` and the page
+says the turn was not recorded. `--chat-graph off` turns it off. See
+[the chat page in the decision graph docs](DECISION_GRAPH.md#the-chat-page).
+
 `--ui-dir` says where the build lives; it does not build it, and a directory with
 no build in it is reported at startup rather than fatal - the API serves anyway.
 `./serve-tailnet.sh` builds the page when its output is missing or older than the

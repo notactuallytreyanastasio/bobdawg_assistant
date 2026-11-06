@@ -351,6 +351,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--ui-dir DIR", "Serve the built chat page from DIR at /chat.");
+    opt(fp, c, "--chat-graph on|off", "Record the page's chats in the decision graph. Default: on");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");

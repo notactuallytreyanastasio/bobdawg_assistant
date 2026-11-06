@@ -18,6 +18,9 @@ export type ChatConfig = {
   readonly thinking?: boolean;
   readonly initialMessages?: readonly ChatMessage[];
   readonly now?: () => number;
+  // A turn is over, however it ended: the transcript as it stands, and the failure if that
+  // is what happened. A turn the reader replaced with another chat does not count.
+  readonly onTurn?: (conversation: Conversation, failure: string | null) => void;
 };
 
 type Ids = {
@@ -85,8 +88,11 @@ export function useChat(config: ChatConfig): Chat {
       // A stopped stream resolved quietly, which is still the end of the turn.
       const ending = outcome.stopped ? 'stopped' : outcome.finish === 'length' ? 'length' : null;
       apply(myTurn, { type: 'end', ending, stats: clock.finish(outcome.usage) });
+      if (myTurn === turn.current) config.onTurn?.(transcript.current, null);
     } catch (reason) {
-      apply(myTurn, { type: 'fail', text: describeFailure(reason) });
+      const failure = describeFailure(reason);
+      apply(myTurn, { type: 'fail', text: failure });
+      if (myTurn === turn.current) config.onTurn?.(transcript.current, failure);
     }
   }
 

@@ -61,6 +61,10 @@ struct ds4_dec {
     int edits_since_record; /* edits since the last decision or step */
 };
 
+/* A chat answer is kept whole up to here; the server takes far more, but a graph
+ * node is a record of the exchange, not an archive of a very long one. */
+#define DEC_CHAT_TEXT_MAX (32 * 1024)
+
 /* Edits with nothing recorded before the fork-in-the-road reminder comes back. */
 #define DEC_NUDGE_EDITS 8
 
@@ -974,6 +978,12 @@ static void dec_args_int(dec_args *a, const char *key, long val) {
     dec_buf_addf(&a->b, "%ld", val);
 }
 
+/* A value that is already JSON. */
+static void dec_args_raw(dec_args *a, const char *key, const char *json) {
+    dec_args_sep(a, key);
+    dec_buf_add(&a->b, json);
+}
+
 static void dec_args_bool(dec_args *a, const char *key, bool val) {
     dec_args_sep(a, key);
     dec_buf_add(&a->b, val ? "true" : "false");
@@ -1711,6 +1721,107 @@ static char *dec_op_status(ds4_dec *d, const ds4_dec_call *c) {
     }
     return b.p ? b.p : strdup("Node updated");
 }
+/* ---- the chat page ------------------------------------------------------ */
+
+void ds4_dec_use_branch(ds4_dec *d, const char *branch) {
+    if (d && branch && branch[0]) snprintf(d->branch, sizeof(d->branch), "%s", branch);
+}
+
+/* One end of a step, as the object form capture_conversation_turn takes: a short
+ * title for the graph's lists and the whole text in the description. */
+static void dec_turn_part(dec_buf *b, const char *title, const char *text, int success) {
+    char *held = NULL;
+    size_t len = text ? strlen(text) : 0;
+    if (len > DEC_CHAT_TEXT_MAX) {
+        held = strndup(text, dec_utf8_floor(text, DEC_CHAT_TEXT_MAX));
+        text = held;
+    }
+    dec_buf_add(b, "{\"title\":");
+    dec_buf_add_json_str(b, title);
+    if (text && text[0]) {
+        dec_buf_add(b, ",\"description\":");
+        dec_buf_add_json_str(b, text);
+    }
+    if (success >= 0) dec_buf_add(b, success ? ",\"success\":true" : ",\"success\":false");
+    dec_buf_add(b, "}");
+    free(held);
+}
+
+static const char *dec_chat_outcome_word(const char *ending) {
+    if (!strcmp(ending, "stopped")) return "Stopped";
+    if (!strcmp(ending, "length")) return "Cut off at the length limit";
+    if (!strcmp(ending, "failed")) return "Failed";
+    return "Answered";
+}
+
+char *ds4_dec_record_chat_turn(ds4_dec *d, const ds4_dec_chat_turn *t,
+                               char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    if (!d || !d->active) {
+        dec_set_err(err, err_len, "%s", "no deciduous server is connected");
+        return NULL;
+    }
+    if (!t || !t->chat_id || !t->chat_id[0] || !t->question || !t->question[0]) {
+        dec_set_err(err, err_len, "%s", "a chat turn needs a chat id and a question");
+        return NULL;
+    }
+    const char *opening = t->first_question && t->first_question[0] ? t->first_question : t->question;
+    const char *ending = t->ending ? t->ending : "";
+
+    /* The same change id and title return the node already made, which is what
+     * lets every turn of a conversation ask for its goal without anyone keeping
+     * the answer. The title comes from the opening question for that reason. */
+    char change_id[160], title[DS4_DEC_GOAL_TITLE_MAX], what[160];
+    snprintf(change_id, sizeof(change_id), "chat-%s", t->chat_id);
+    dec_clip_title(title, sizeof(title), opening);
+    dec_args a;
+    dec_args_init(&a);
+    dec_args_str(&a, "node_type", "goal");
+    dec_args_str(&a, "title", title);
+    dec_args_str(&a, "prompt", opening);
+    dec_args_str(&a, "status", "active");
+    dec_args_str(&a, "change_id", change_id);
+    if (t->model && t->model[0]) {
+        snprintf(what, sizeof(what), "Conversation on the chat page with %s", t->model);
+        dec_args_str(&a, "description", what);
+    }
+    char *payload = dec_tool_ctx(d, "add_node", &a, true, err, err_len);
+    if (!payload) return NULL;
+    char *goal = dec_json_str(payload, "id");
+    free(payload);
+    if (!goal || !goal[0]) {
+        free(goal);
+        dec_set_err(err, err_len, "%s", "the server did not name the conversation's goal");
+        return NULL;
+    }
+
+    char asked[DS4_DEC_GOAL_TITLE_MAX], summary[DS4_DEC_GOAL_TITLE_MAX + 32];
+    char outcome[DS4_DEC_GOAL_TITLE_MAX + 40], line[DS4_DEC_GOAL_TITLE_MAX];
+    dec_clip_title(asked, sizeof(asked), t->question);
+    snprintf(summary, sizeof(summary), "Asked: %s", asked);
+    dec_clip_title(line, sizeof(line), t->answer && t->answer[0] ? t->answer : "no answer");
+    snprintf(outcome, sizeof(outcome), "%s: %s", dec_chat_outcome_word(ending), line);
+
+    dec_args_init(&a);
+    dec_args_str(&a, "summary", summary);
+    dec_args_str(&a, "parent_node_id", goal);
+    dec_buf part = {0};
+    dec_turn_part(&part, summary, t->question, -1);
+    dec_args_raw(&a, "action", part.p);
+    free(part.p);
+    part = (dec_buf){0};
+    dec_turn_part(&part, outcome, t->answer, strcmp(ending, "failed") != 0);
+    dec_args_raw(&a, "outcome", part.p);
+    free(part.p);
+    payload = dec_tool_ctx(d, "capture_conversation_turn", &a, true, err, err_len);
+    if (!payload) {
+        free(goal);
+        return NULL;
+    }
+    free(payload);
+    return goal;
+}
+
 /* ---- the seam the agent uses ------------------------------------------- */
 
 char *ds4_dec_execute(ds4_dec *d, const ds4_dec_call *call, char *err, size_t err_len) {

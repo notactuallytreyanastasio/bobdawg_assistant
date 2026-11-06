@@ -31,6 +31,10 @@ ds4 binary before starting the server, or it refuses to start.
 
 ## The chat page
 
+Conversations on this page are written to the decision graph, peers' included. Start
+the server with `--chat-graph off` if that is not what the tailnet expects; see
+[the chat page in the decision graph docs](DECISION_GRAPH.md#the-chat-page).
+
 The server that comes up can carry the repository's own chat page, so a peer
 needs nothing installed to chat. `serve-tailnet.sh` builds it when its output is
 missing or older than the page sources - `npm --prefix chat-web run build`, a

@@ -205,6 +205,73 @@ describe('App', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy());
   });
 
+  it('hands each finished turn to the server for the graph, thinking left out', async () => {
+    const user = userEvent.setup();
+    const records: string[] = [];
+    const recording: FetchLike = async (input, init) => {
+      if (String(input).endsWith('/chat/record')) {
+        records.push(String(init?.body));
+        return new Response('{"recorded":true}');
+      }
+      return served(input, init);
+    };
+    render(<App origin="" fetchImpl={recording} store={memoryStore()} />);
+    await waitFor(() => expect(textBox().disabled).toBe(false));
+
+    await user.type(textBox(), 'What is a redlock?{Enter}');
+
+    await waitFor(() => expect(records).toHaveLength(1));
+    const turn = JSON.parse(records[0] ?? '{}');
+    expect(turn.question).toBe('What is a redlock?');
+    expect(turn.answer).toBe('a gate held by water');
+    expect(turn.model).toBe('alias');
+    await waitFor(() => expect(screen.getByText('In the decision graph')).toBeTruthy());
+  });
+
+  it('keeps one id for a conversation across its turns', async () => {
+    const user = userEvent.setup();
+    const chats: string[] = [];
+    const recording: FetchLike = async (input, init) => {
+      if (String(input).endsWith('/chat/record')) {
+        chats.push(JSON.parse(String(init?.body)).chat);
+        return new Response('{}');
+      }
+      return served(input, init);
+    };
+    render(<App origin="" fetchImpl={recording} store={memoryStore()} />);
+    await waitFor(() => expect(textBox().disabled).toBe(false));
+
+    await user.type(textBox(), 'one{Enter}');
+    await waitFor(() => expect(chats).toHaveLength(1));
+    await user.type(textBox(), 'two{Enter}');
+    await waitFor(() => expect(chats).toHaveLength(2));
+    await user.click(screen.getByRole('button', { name: 'New chat' }));
+    await user.type(textBox(), 'three{Enter}');
+    await waitFor(() => expect(chats).toHaveLength(3));
+
+    expect(chats[0]).toBe(chats[1]);
+    expect(chats[2]).not.toBe(chats[0]);
+  });
+
+  it('says when a turn did not reach the graph, and not when the server does not record', async () => {
+    const user = userEvent.setup();
+    let status = 404;
+    const refusing: FetchLike = async (input, init) => {
+      if (String(input).endsWith('/chat/record')) return new Response('{}', { status });
+      return served(input, init);
+    };
+    render(<App origin="" fetchImpl={refusing} store={memoryStore()} />);
+    await waitFor(() => expect(textBox().disabled).toBe(false));
+
+    await user.type(textBox(), 'one{Enter}');
+    await waitFor(() => expect(screen.getByText('a gate held by water')).toBeTruthy());
+    expect(screen.queryByText('Last turn not recorded')).toBeNull();
+
+    status = 503;
+    await user.type(textBox(), 'two{Enter}');
+    await waitFor(() => expect(screen.getByText('Last turn not recorded')).toBeTruthy());
+  });
+
   it('asks the failed question again from the banner', async () => {
     const user = userEvent.setup();
     let refused = true;

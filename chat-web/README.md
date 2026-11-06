@@ -59,11 +59,22 @@ a failure too, not a short answer.
 ## Where chats are kept
 
 Chats live in this browser's `localStorage`, the newest hundred of them, and the page
-reopens the one it was showing. The server stays stateless and never sees the list.
+reopens the one it was showing. The list is the page's own; the inference API stays
+stateless and never sees it.
 A chat is saved when a question goes out and when its answer ends, not on every word,
 so closing the tab mid-answer loses that answer but not the question. When storage is
 full the oldest chats give way, and a browser that refuses storage still chats, with
 nothing saved. Deleting a chat asks once, in place, and cannot be undone.
+
+Each finished turn is also written to the decision graph, by way of `POST /chat/record`
+on `ds4-server`: the conversation is a goal and each exchange a step under it, on the
+`chat` branch of the repository's workspace. The token that writes there stays on the
+server. The question and the answer are recorded, a stop or a failure included, and
+thinking is not. The header says when a turn is in the graph and when one did not land;
+the answer is unaffected either way, and a turn is sent once rather than retried. A turn
+abandoned by switching to another chat is not recorded. `--chat-graph off` turns this
+off, and [the decision graph docs](../docs/DECISION_GRAPH.md#the-chat-page) say what
+is written.
 
 The tailnet page is plain `http://`, which is not a secure context, so
 `navigator.clipboard` and `crypto.randomUUID` do not exist there. Copying falls back
@@ -115,6 +126,7 @@ src/chat/storage.ts         the browser's storage behind a narrow door
 src/api/sse.ts              byte scanner turning a stream into data payloads
 src/api/chatClient.ts       the streaming request, deltas, stop and how it ended
 src/api/models.ts           model id, name and context size from GET /v1/models
+src/api/recordTurn.ts       a finished turn, handed to the server for the graph
 src/env.ts                  the server origin, once
 src/clipboard.ts            copying, with and without a secure context
 src/hooks/useChat.ts        a turn: request, deltas, stop, retry, failure

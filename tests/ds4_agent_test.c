@@ -743,6 +743,7 @@ typedef struct {
     volatile int initializes;
     volatile int tool_calls;
     char last_body[8192];
+    size_t last_len;
     pthread_t thread;
 } fake_mcp;
 
@@ -758,7 +759,7 @@ static void fake_reply(int fd, const char *head, const char *body) {
 static void *fake_mcp_main(void *arg) {
     fake_mcp *f = arg;
     for (;;) {
-        char req[16384];
+        static char req[131072];
         size_t got = 0;
         int fd = accept(f->listen_fd, NULL, NULL);
         if (fd < 0) return NULL;
@@ -785,6 +786,7 @@ static void *fake_mcp_main(void *arg) {
         } else {
             f->tool_calls++;
             snprintf(f->last_body, sizeof(f->last_body), "%s", body);
+            f->last_len = strlen(body);
             if (f->mode == FAKE_STALE_ONCE) {
                 f->mode = FAKE_OK;
                 fake_reply(fd, "404 Not Found",
@@ -905,6 +907,57 @@ static void test_deciduous_seam_failures(void) {
         AGENT_TEST_ASSERT(ds4_dec_goal_bound(fresh));
         AGENT_TEST_ASSERT(!agent_worker_bind_request(&turn, "and this is a second request"));
         ds4_dec_close(fresh);
+    }
+
+    /* A conversation is a goal and an exchange a step under it. The change id comes
+     * from the page's chat id, so the writer keeps nothing between turns; the
+     * session's own goal is not touched. */
+    {
+        ds4_dec *chats = ds4_dec_open("/tmp", "ds4-chat");
+        ds4_dec_chat_turn turn = {.chat_id = "abc-1", .first_question = "why is the sky blue?",
+                                  .question = "and at sunset?", .answer = "red, it scatters less",
+                                  .ending = "length", .model = "Qwen"};
+        char *goal;
+        AGENT_TEST_ASSERT(chats != NULL);
+        ds4_dec_use_branch(chats, "chat");
+        calls = f.tool_calls;
+        goal = ds4_dec_record_chat_turn(chats, &turn, err, sizeof(err));
+        AGENT_TEST_ASSERT(goal && !strcmp(goal, "11111111-aaaa"));
+        free(goal);
+        AGENT_TEST_ASSERT(f.tool_calls == calls + 2);
+        AGENT_TEST_ASSERT(!ds4_dec_goal_bound(chats));
+        AGENT_TEST_ASSERT(strstr(f.last_body, "capture_conversation_turn") != NULL);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "\"parent_node_id\":\"11111111-aaaa\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "Cut off at the length limit") != NULL);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "red, it scatters less") != NULL);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "\"branch\":\"chat\"") != NULL);
+
+        turn.ending = "failed";
+        turn.answer = "model busy";
+        goal = ds4_dec_record_chat_turn(chats, &turn, err, sizeof(err));
+        free(goal);
+        AGENT_TEST_ASSERT(strstr(f.last_body, "\"success\":false") != NULL);
+
+        /* Not recorded is reported, never swallowed. */
+        f.mode = FAKE_TRUNCATE_JSON;
+        AGENT_TEST_ASSERT(ds4_dec_record_chat_turn(chats, &turn, err, sizeof(err)) == NULL);
+        AGENT_TEST_ASSERT(err[0] != '\0');
+        f.mode = FAKE_OK;
+
+        /* A very long answer is kept up to the limit, on a character. */
+        char *longer = malloc(40000);
+        memset(longer, 'y', 39999);
+        memcpy(longer + 32767, "\xe2\x80\x94", 3);
+        longer[39999] = '\0';
+        turn.ending = "";
+        turn.answer = longer;
+        snprintf(f.last_body, sizeof(f.last_body), "%s", "");
+        goal = ds4_dec_record_chat_turn(chats, &turn, err, sizeof(err));
+        AGENT_TEST_ASSERT(goal != NULL);
+        free(goal);
+        free(longer);
+        AGENT_TEST_ASSERT(f.last_len > 32000 && f.last_len < 34000);
+        ds4_dec_close(chats);
     }
 
     /* A reply is a message number on the wire, whatever the model typed. */

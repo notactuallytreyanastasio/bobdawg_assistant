@@ -30,7 +30,7 @@ export function Sidebar({ chats, activeId, open, onNew, onOpen, onDelete, onClos
           New chat
         </button>
         {chats.length === 0 ? (
-          <p className="none">Your chats stay in this browser.</p>
+          <p className="none">Nothing here yet.</p>
         ) : (
           <ul className="chats">
             {chats.map((chat) => (
