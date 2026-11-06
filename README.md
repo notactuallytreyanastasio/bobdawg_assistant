@@ -139,6 +139,18 @@ behind the work, and `/hints off` to stop them. Changes take effect at the next
 conversation boundary without rebuilding the cached context. New and resumed
 sessions start with hints off.
 
+When a decision graph exists for the workspace, the agent records why the work
+happened, not only what it changed. The graph is server state: it lives on the
+shared deciduous server over its MCP/HTTP API, and that server is the only
+writer. `deciduous` is one tool with ops — `goal`, `decide`, `turn`, `note`,
+`graph`, `board`, `status` — the model writes the request as a goal and the
+choices it actually made, and a resumed session reads the reasoning where a
+colleague left it and claims the goal that is already there rather than writing a
+duplicate. Before the model writes, ds4 briefs it on what the graph already holds;
+when the session ends it posts one closing note, and only if that session actually
+recorded something. `/goal` shows or changes the goal; `/done` marks it completed,
+and only when you ask. See [the decision graph](docs/DECISION_GRAPH.md).
+
 Sessions are stored in `~/.ds4/kvcache`:
 
 | Command | Action |
@@ -255,6 +267,8 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
 - [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
+- [Decision graph](docs/DECISION_GRAPH.md): workspace memory of why the work happened.
+- [Decision graph roadmap](docs/DECISION_GRAPH_ROADMAP.md): plan to make the graph required by the loop, not merely available.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
 

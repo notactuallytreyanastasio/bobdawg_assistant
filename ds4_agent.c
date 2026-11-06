@@ -7,6 +7,7 @@
 #include "ds4_prompt_prefix.h"
 #include "ds4_tp.h"
 #include "ds4_web.h"
+#include "ds4_deciduous.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -89,6 +90,9 @@ typedef struct {
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     const char *chdir_path;
+    const char *goal;      /* --goal: the decision-graph goal this session serves */
+    const char *dec_label; /* --label: who this session is on the graph */
+    bool graph_off;        /* --graph off: stay blind to any decision graph */
     bool non_interactive;
     bool edit_upto;
 } agent_config;
@@ -193,6 +197,14 @@ typedef struct {
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
     bool raw_mode_needs_restore;
+    /* The graph this workspace keeps on the deciduous server, when the server
+     * is reachable. The deciduous tool is the only writer the model has, and the
+     * harness writes nothing itself - it only reminds (see agent_note_graph_moments). */
+    ds4_dec *dec;
+    /* Whether this transcript currently carries the graph rules and recovery
+     * note. /new rebuilds the transcript from the system prompt, so it clears
+     * this and the graph rules get injected again. */
+    bool dec_note_injected;
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
@@ -641,7 +653,8 @@ static bool agent_slash_command_known(const char *cmd) {
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
-           agent_slash_command_with_args(cmd, "/history");
+           agent_slash_command_with_args(cmd, "/history") ||
+           agent_slash_command_with_args(cmd, "/goal");
 }
 
 static uint64_t parse_u64(const char *s, const char *opt) {
@@ -954,6 +967,18 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             steering_scale_set = true;
+        } else if (!strcmp(arg, "--goal")) {
+            c.goal = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--label")) {
+            c.dec_label = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--graph")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (!strcmp(mode, "off")) c.graph_off = true;
+            else if (!strcmp(mode, "on")) c.graph_off = false;
+            else {
+                fprintf(stderr, "ds4-agent: --graph wants on or off\n");
+                exit(2);
+            }
         } else {
             fprintf(stderr, "ds4-agent: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -1273,6 +1298,39 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"path\"]\n"
     "    }\n"
     "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"deciduous\",\n"
+    "    \"description\": \"Record and read this workspace's decision graph on the deciduous server: op decide|turn|note|graph|board|goal|status.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"op\": {\"type\": \"string\", \"enum\": [\"decide\", \"turn\", \"note\", \"graph\", \"board\", \"goal\", \"status\"]},\n"
+    "        \"title\": {\"type\": \"string\", \"description\": \"op=decide and op=note: what the record is about\"},\n"
+    "        \"chosen_option\": {\"type\": \"string\", \"description\": \"op=decide: the option taken\"},\n"
+    "        \"rejected_option\": {\"type\": \"string\", \"description\": \"op=decide: an option closed off; repeat once per option\"},\n"
+    "        \"rationale\": {\"type\": \"string\", \"description\": \"op=decide: why the chosen option won\"},\n"
+    "        \"summary\": {\"type\": \"string\", \"description\": \"op=turn: the step in one line\"},\n"
+    "        \"observation\": {\"type\": \"string\", \"description\": \"op=turn: what a tool result showed; repeat as needed\"},\n"
+    "        \"decision\": {\"type\": \"string\", \"description\": \"op=turn: the choice the step settled\"},\n"
+    "        \"action\": {\"type\": \"string\", \"description\": \"op=turn: what was done\"},\n"
+    "        \"outcome\": {\"type\": \"string\", \"description\": \"op=turn: how it ended\"},\n"
+    "        \"description\": {\"type\": \"string\", \"description\": \"op=note: the fact, in full\"},\n"
+    "        \"why\": {\"type\": \"string\", \"description\": \"op=note: why it matters; op=board: why the message is being sent\"},\n"
+    "        \"question\": {\"type\": \"string\", \"description\": \"op=graph: what to ask the graph\"},\n"
+    "        \"subject\": {\"type\": \"string\", \"description\": \"op=board: headline of the message to post\"},\n"
+    "        \"body\": {\"type\": \"string\", \"description\": \"op=board: the message to post; subject and body together post, neither alone reads\"},\n"
+    "        \"reply_to\": {\"type\": \"string\", \"description\": \"op=board: message id being answered\"},\n"
+    "        \"all\": {\"type\": \"string\", \"description\": \"op=board: read every recent message, not only those waiting for this session\"},\n"
+    "        \"prompt\": {\"type\": \"string\", \"description\": \"op=goal: the request, verbatim\"},\n"
+    "        \"node_id\": {\"type\": \"string\", \"description\": \"op=status: the node to move\"},\n"
+    "        \"status\": {\"type\": \"string\", \"description\": \"op=status: the state to move it to\"}\n"
+    "      },\n"
+    "      \"required\": [\"op\"]\n"
+    "    }\n"
+    "  }\n"
     "}\n"
     "\n"
     "# Rules\n\n"
@@ -1353,7 +1411,8 @@ static const char agent_glm_tool_schemas[] =
     "{\"name\":\"write\",\"description\":\"Create or overwrite a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}\n"
     "{\"name\":\"edit\",\"description\":\"Replace one exact old text match.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},\"required\":[\"path\",\"old\",\"new\"]}}\n"
     "{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\",\"enum\":[\"literal\",\"regex\"]},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"integer\"},\"max_results\":{\"type\":\"integer\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}\n"
-    "{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n";
+    "{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n"
+    "{\"name\":\"deciduous\",\"description\":\"Record and read this workspace's decision graph on the deciduous server: op decide|turn|note|graph|board|goal|status.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"enum\":[\"decide\",\"turn\",\"note\",\"graph\",\"board\",\"goal\",\"status\"]},\"title\":{\"type\":\"string\",\"description\":\"op=decide and op=note: what the record is about\"},\"chosen_option\":{\"type\":\"string\",\"description\":\"op=decide: the option taken\"},\"rejected_option\":{\"type\":\"string\",\"description\":\"op=decide: an option closed off; repeat once per option\"},\"rationale\":{\"type\":\"string\",\"description\":\"op=decide: why the chosen option won\"},\"summary\":{\"type\":\"string\",\"description\":\"op=turn: the step in one line\"},\"observation\":{\"type\":\"string\",\"description\":\"op=turn: what a tool result showed; repeat as needed\"},\"decision\":{\"type\":\"string\",\"description\":\"op=turn: the choice the step settled\"},\"action\":{\"type\":\"string\",\"description\":\"op=turn: what was done\"},\"outcome\":{\"type\":\"string\",\"description\":\"op=turn: how it ended\"},\"description\":{\"type\":\"string\",\"description\":\"op=note: the fact, in full\"},\"why\":{\"type\":\"string\",\"description\":\"op=note: why it matters; op=board: why the message is being sent\"},\"question\":{\"type\":\"string\",\"description\":\"op=graph: what to ask the graph\"},\"subject\":{\"type\":\"string\",\"description\":\"op=board: headline of the message to post\"},\"body\":{\"type\":\"string\",\"description\":\"op=board: the message to post; subject and body together post, neither alone reads\"},\"reply_to\":{\"type\":\"string\",\"description\":\"op=board: message id being answered\"},\"all\":{\"type\":\"string\",\"description\":\"op=board: read every recent message, not only those waiting for this session\"},\"prompt\":{\"type\":\"string\",\"description\":\"op=goal: the request, verbatim\"},\"node_id\":{\"type\":\"string\",\"description\":\"op=status: the node to move\"},\"status\":{\"type\":\"string\",\"description\":\"op=status: the state to move it to\"}},\"required\":[\"op\"]}}\n";
 
 static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     size_t schemas_len = strlen(agent_glm_tool_schemas);
@@ -1593,6 +1652,83 @@ static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
     ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
     agent_trace_text(w, "datetime-context", msg, strlen(msg));
     w->datetime_context_injected = true;
+}
+
+/* Open the shared decision graph this repository writes into, once per
+ * session, and hand the model the graph rules plus the recovery state it needs
+ * to pick up someone else's (or a previous session's) work. This runs after
+ * --chdir is final, so the walk-up finds the same workspace a human shell
+ * would resolve, and it happens before the first generated token, so the rules
+ * are present while the model still has room to change direction.
+ *
+ * The graph lives on the deciduous server, so "opening" it is a handshake:
+ * without a reachable server this session is graph-blind, and says so. ds4
+ * holds no local copy to fall back to. */
+static void agent_worker_maybe_open_graph(agent_worker *w, const agent_config *cfg) {
+    char root[PATH_MAX];
+    char *goal_obs, *msg, *brief;
+    const char *section, *note;
+
+    if (cfg->graph_off) return;
+    if (w->dec && w->dec_note_injected) return;
+
+    if (!w->dec) {
+        if (!ds4_dec_find_root(NULL, root, sizeof(root))) {
+            if (cfg->goal && cfg->goal[0])
+                fprintf(stderr, "ds4-agent: --goal has nowhere to record: no repository or "
+                                "deciduous workspace here, and ds4 keeps no local graph\n");
+            return;
+        }
+        w->dec = ds4_dec_open(root, cfg->dec_label);
+        if (!ds4_dec_active(w->dec)) {
+            fprintf(stderr, "ds4-agent: %s\nThis session runs without the graph: nothing it "
+                            "learns will be remembered.\n", ds4_dec_open_error());
+            return;
+        }
+        if (cfg->goal && cfg->goal[0]) {
+            goal_obs = ds4_dec_bind_goal(w->dec, cfg->goal);
+            if (goal_obs && goal_obs[0]) {
+                fprintf(stderr, "ds4-agent: %s\n", goal_obs);
+                agent_trace_text(w, "decision-graph-goal", goal_obs, strlen(goal_obs));
+            }
+            free(goal_obs);
+        }
+    }
+
+    /* Rules, the recovery briefing and what the graph already holds travel
+     * together, as one system message: a resumed session gets the same graph it
+     * left and the record of what is already decided, a /new session gets the
+     * rules again without a goal to inherit. */
+    section = ds4_dec_prompt_section(w->dec);
+    note = ds4_dec_recovery_note(w->dec);
+    brief = ds4_dec_briefing(w->dec);
+    msg = xmalloc(strlen(section) + (note ? strlen(note) : 0) +
+                  (brief ? strlen(brief) : 0) + 5);
+    strcpy(msg, section);
+    if (note && note[0]) {
+        strcat(msg, "\n");
+        strcat(msg, note);
+    }
+    if (brief && brief[0]) strcat(msg, brief);
+    ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
+    agent_trace_text(w, "decision-graph", msg, strlen(msg));
+    free(msg);
+    free(brief);
+    w->dec_note_injected = true;
+    w->session_dirty = true;
+}
+
+/* Make sure the session has a graph handle, so /goal can bind before the first
+ * turn would have created one.  False means there is nothing to write to: the
+ * operator chose --graph off, or the deciduous server is not reachable. */
+static bool agent_worker_graph_ready(agent_worker *w) {
+    char root[PATH_MAX];
+
+    if (w->cfg && w->cfg->graph_off) return false;
+    if (w->dec) return ds4_dec_active(w->dec);
+    if (!ds4_dec_find_root(NULL, root, sizeof(root))) return false;
+    w->dec = ds4_dec_open(root, w->cfg ? w->cfg->dec_label : NULL);
+    return ds4_dec_active(w->dec);
 }
 
 static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
@@ -5345,7 +5481,20 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
  * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
  * model families rebuilds this cache instead of restoring incompatible KV. */
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
+    char *closing;
+
     agent_worker_images_clear(w);
+    /* A new session is new work: the graph stays open, but the goal does not
+     * carry over. The other agents on this workspace hear what this session
+     * decided before the goal is released, because that note names the goal it
+     * held; sessions that recorded nothing post nothing. The recovery note that
+     * gets injected again below offers to claim a goal that already exists
+     * instead of silently inheriting one. */
+    closing = ds4_dec_close_session(w->dec);
+    if (closing && closing[0]) fprintf(stderr, "ds4-agent: %s\n", closing);
+    free(closing);
+    ds4_dec_release_goal(w->dec);
+    w->dec_note_injected = false;
     ds4_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
 
@@ -9448,6 +9597,70 @@ static void agent_tool_view_image(agent_worker *w,
     agent_tool_observation_puts(obs, meta);
 }
 
+/* deciduous is a graph operation, not a file operation: the shared server is
+ * the writer of the graph, and its answer is the observation the model gets
+ * back. The op= the model chose selects the server tool; the harness never
+ * invents a decision on its own. */
+static char *agent_execute_graph_call(agent_worker *w, const agent_tool_call *call) {
+    ds4_dec_call gcall;
+    ds4_dec_arg *args;
+    char err[512];
+    agent_buf result = {0};
+    char *out;
+    int n = call->argc;
+
+    if (!w->dec) {
+        return xstrdup("Tool error: no decision graph is open for this session "
+                       "(--graph off, or the deciduous server is unreachable). Nothing "
+                       "was recorded, and ds4 keeps no local graph to record it in "
+                       "instead.\n");
+    }
+    args = n > 0 ? xmalloc(sizeof(*args) * (size_t)n) : NULL;
+    for (int i = 0; i < n; i++) {
+        args[i].name = call->args[i].name;
+        args[i].value = call->args[i].value;
+    }
+    gcall.tool = agent_tool_arg_value(call, "op");
+    gcall.args = args;
+    gcall.argc = n;
+    err[0] = '\0';
+    out = ds4_dec_execute(w->dec, &gcall, err, sizeof(err));
+    free(args);
+    if (!out) {
+        agent_buf_puts(&result, "Tool error: ");
+        agent_buf_puts(&result, err[0] ? err : "the graph call failed");
+        agent_buf_puts(&result, "\n");
+        return agent_buf_take(&result);
+    }
+    return out;
+}
+
+/* The server's rules say an agent writes at three moments and nowhere else, and
+ * say plainly that reading, searching and planning must not be logged. So the
+ * harness records nothing on its own; it only reminds the model - once per
+ * session at each moment - when a tool result looks like one of those moments. */
+static void agent_note_graph_moments(agent_worker *w, const agent_tool_call *call,
+                                     const char *observation,
+                                     agent_tool_observation *obs) {
+    char *nudge;
+    const char *arg = NULL;
+    int status = -1;
+
+    if (!w->dec || !call->name || !observation) return;
+    if (!strcmp(call->name, "edit") || !strcmp(call->name, "write")) {
+        arg = agent_tool_arg_value(call, "path");
+    } else if (!strcmp(call->name, "bash")) {
+        const char *seen = strstr(observation, "exit_status=");
+        arg = agent_tool_arg_value(call, "command");
+        if (seen) status = (int)strtol(seen + 12, NULL, 10);
+    } else return;
+    nudge = ds4_dec_note_result(w->dec, call->name, arg, observation, status);
+    if (!nudge) return;
+    agent_tool_observation_puts(obs, nudge);
+    agent_tool_observation_puts(obs, "\n");
+    free(nudge);
+}
+
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
@@ -9501,6 +9714,9 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
     }
 
+    if (!strcmp(call->name, "deciduous"))
+        return agent_execute_graph_call(w, call);
+
     {
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
@@ -9527,6 +9743,7 @@ static agent_tool_observation agent_execute_tool_observation(
         }
         char *res = agent_execute_tool_call(w, &calls->v[i]);
         agent_tool_observation_puts(&obs, res);
+        agent_note_graph_moments(w, &calls->v[i], res, &obs);
         if (res[0] && res[strlen(res) - 1] != '\n')
             agent_tool_observation_puts(&obs, "\n");
         free(res);
@@ -9992,6 +10209,18 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
     agent_buf_puts(&summary_msg, "[End compacted summary. Recent conversation continues verbatim below.]\n\n");
     ds4_chat_append_message(w->engine, &compacted, "user", summary_msg.ptr);
     free(summary_msg.ptr);
+    /* A decision graph does not need summarizing: it is a database that outlives
+     * the context window. Re-describe it from live state so the model is not
+     * left remembering half of it, and so compaction cannot quietly drop the
+     * goal the session is working under. */
+    if (w->dec) {
+        char *graph_digest = ds4_dec_compaction_digest(w->dec);
+        if (graph_digest) {
+            ds4_chat_append_message(w->engine, &compacted, "system", graph_digest);
+            agent_trace_text(w, "graph-digest", graph_digest, strlen(graph_digest));
+            free(graph_digest);
+        }
+    }
     free(summary.ptr);
 
     int resumed_start = -1;
@@ -10121,9 +10350,28 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
     return agent_worker_compact(w, reason, err, err_len);
 }
 
+/* A goal node is worth writing only when the message carries something to
+ * work on. "hi", "ok" and a slash command are not intent, and a graph of junk
+ * goals is a graph nobody reads; the next session's recovery note would be
+ * quoting noise. */
+static bool agent_text_is_goal_worthy(const char *text) {
+    size_t n;
+
+    if (!text || !text[0] || text[0] == '/') return false;
+    n = strlen(text);
+    while (n && (text[n - 1] == ' ' || text[n - 1] == '\n' ||
+                 text[n - 1] == '\t' || text[n - 1] == '\r')) n--;
+    return n >= 12 && memchr(text, ' ', n) != NULL;
+}
+
 static bool agent_worker_append_user(agent_worker *w, const char *text,
                                      char *err, size_t err_len) {
     ds4_tokens message = {0}, sys = {0};
+    /* Without --goal, the opening request is what this session is working for:
+     * record it as the goal node, so options and decisions later have something
+     * honest to hang under and a future session can recover the intent. */
+    if (w->dec && !ds4_dec_goal_bound(w->dec) && agent_text_is_goal_worthy(text))
+        ds4_dec_bind_goal(w->dec, text);
     ds4_chat_append_message(w->engine, &message, "user", text);
     agent_worker_build_system_tokens(w, &sys);
     int ctx = agent_worker_effective_ctx_size(w);
@@ -10310,6 +10558,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         return 1;
     }
     agent_worker_maybe_append_datetime_context(w);
+    /* Then the decision graph: its rules shape the first response, and its
+     * recovery state is what tells a resumed session where to resume. */
+    agent_worker_maybe_open_graph(w, cfg);
     agent_worker_append_hints_context(w);
     agent_trace_text(w, "user", user_text ? user_text : "",
                      user_text ? strlen(user_text) : 0);
@@ -12613,6 +12864,8 @@ static void runtime_help(void) {
     puts("  /help        Show this help.");
     puts("  /save        Save the current session.");
     puts("  /compact     Compact the current session context now.");
+    puts("  /goal [TEXT] Show the decision-graph goal, or bind a new one.");
+    puts("  /done        Mark the bound goal completed on the decision graph.");
     puts("  /list        List saved sessions.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
@@ -12714,9 +12967,18 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
 /* Shut down the worker and release owned resources, including any live bash
  * process groups. */
 static void agent_worker_free(agent_worker *w) {
+    char *closing;
+
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
+    /* The session is ending, not only pausing: the other agents sharing this
+     * workspace hear what it decided, and hear nothing if it decided nothing. */
+    closing = ds4_dec_close_session(w->dec);
+    if (closing && closing[0]) fprintf(stderr, "ds4-agent: %s\n", closing);
+    free(closing);
+    ds4_dec_close(w->dec);
+    w->dec = NULL;
     ds4_web_free(w->web);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
@@ -13283,6 +13545,51 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     worker_request_compact(&worker);
                     if (busy)
                         printf("compaction scheduled at next safe point\n");
+                } else if (agent_slash_command_with_args(cmd, "/goal")) {
+                    char *arg = cmd + strlen("/goal");
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (busy) {
+                        /* The graph writes go out from the worker thread while it
+                         * generates; a goal swap waits for a safe point. */
+                        printf("/goal applies between turns; interrupt or wait, "
+                               "then try again\n");
+                    } else if (!agent_worker_graph_ready(&worker)) {
+                        printf("%s\n", worker.cfg && worker.cfg->graph_off
+                               ? "the decision graph is off for this session "
+                                 "(--graph off)"
+                               : "no deciduous server is reachable from here; "
+                                 "ds4 keeps no local graph");
+                    } else if (!arg[0]) {
+                        const char *note = ds4_dec_recovery_note(worker.dec);
+                        if (note && note[0]) printf("%s\n", note);
+                        else printf("no goal is bound; /goal <text> binds one\n");
+                    } else if (!ds4_dec_bind_goal(worker.dec, arg)) {
+                        printf("could not bind that goal (see the message above)\n");
+                    } else {
+                        const char *note = ds4_dec_recovery_note(worker.dec);
+                        printf("%s\n", note ? note : "");
+                        /* Tell the model about the swap on its next turn. */
+                        worker.dec_note_injected = false;
+                    }
+                } else if (!strcmp(cmd, "/done")) {
+                    /* Explicit only.  ds4 never concludes a goal is finished: a
+                     * session stopping, or its tests passing, is not evidence the
+                     * work ended, and a goal wrongly completed misleads every
+                     * session that reads the graph afterwards. */
+                    if (busy) {
+                        printf("/done applies between turns; interrupt or wait, "
+                               "then try again\n");
+                    } else if (!agent_worker_graph_ready(&worker)) {
+                        printf("%s\n", worker.cfg && worker.cfg->graph_off
+                               ? "the decision graph is off for this session "
+                                 "(--graph off)"
+                               : "no deciduous server is reachable from here; "
+                                 "ds4 keeps no local graph");
+                    } else {
+                        char *obs = ds4_dec_mark_goal_done(worker.dec);
+                        printf("%s\n", obs ? obs : "");
+                        free(obs);
+                    }
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
                 } else if (!strncmp(cmd, "/power", 6) &&

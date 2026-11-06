@@ -683,12 +683,301 @@ static void test_tool_contracts(void) {
             AGENT_TEST_ASSERT((strstr(prompt, "view_image") != NULL) == vision);
             AGENT_TEST_ASSERT(strstr(prompt, "POSIX extended") && strstr(prompt, "128 KiB"));
             AGENT_TEST_ASSERT(strstr(prompt, "&amp;lt;/"));
+            /* The decision graph is a core tool of the harness: it is offered in every
+             * prompt, under one name, and the prompt says what the moments to write are. */
+            AGENT_TEST_ASSERT(strstr(prompt, "deciduous") != NULL);
+            AGENT_TEST_ASSERT(strstr(prompt, "decide|turn|note|graph|board|goal|status") != NULL);
+            AGENT_TEST_ASSERT(strstr(prompt, "goal") != NULL);
+            if (!glm) AGENT_TEST_ASSERT(strstr(prompt, "\"name\": \"deciduous\"") != NULL);
+            if (glm == 1) AGENT_TEST_ASSERT(strstr(prompt, "\"name\":\"deciduous\"") != NULL);
+            if (glm == 2) AGENT_TEST_ASSERT(strstr(prompt, "\"name\":\"deciduous\"") != NULL);
             char name[64];
             snprintf(name, sizeof(name), "prompt-%s-%d.txt", glm == 2 ? "qwen" : glm ? "glm" : "dsml", vision);
             test_fixture(name, prompt, strlen(prompt));
             free(prompt);
         }
     }
+}
+
+/* The graph lives on the shared deciduous server, so these tests talk to a real
+ * one through the API and skip silently when nothing is listening. They reuse one
+ * workspace of their own so a run does not scatter names over somebody's database,
+ * and they never shell out to the deciduous CLI: the server API is the only writer
+ * ds4 has, which is the point of the seam. */
+typedef struct { const char *key; const char *value; } graph_kv;
+
+static char *graph_call(agent_worker *w, const char *op, const graph_kv *kv) {
+    agent_tool_call call = {0};
+    char *out;
+
+    call.name = xstrdup("deciduous");
+    if (op)
+        agent_tool_call_add_arg(&call, "op", op, strlen(op), true, "</arg_value>");
+    for (int i = 0; kv && kv[i].key; i++)
+        agent_tool_call_add_arg(&call, kv[i].key, kv[i].value,
+                                strlen(kv[i].value), true, "</arg_value>");
+    out = agent_execute_tool_call(w, &call);
+    agent_tool_call_free(&call);
+    return out;
+}
+
+static void test_deciduous_graph(void) {
+    char dir[] = "/tmp/ds4-dec-XXXXXX";
+    char saved[PATH_MAX], root[PATH_MAX], *res;
+    char *digest, *brief, *closing, *refused;
+    const char *goal_id;
+    const char *note;
+    agent_worker w = {0};
+    agent_worker blind = {0};
+
+    AGENT_TEST_ASSERT(getcwd(saved, sizeof(saved)) != NULL);
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    AGENT_TEST_ASSERT(chdir(dir) == 0);
+    AGENT_TEST_ASSERT(system("git init -q . >/dev/null 2>&1") == 0);
+    AGENT_TEST_ASSERT(ds4_dec_find_root(NULL, root, sizeof(root)));
+
+    /* One workspace and one branch for every run of this test: recognisable, and
+     * never mistaken for somebody's project. */
+    setenv("DECIDUOUS_WORKSPACE", "ds4-selftest", 1);
+    setenv("DECIDUOUS_BRANCH", "main", 1);
+
+    w.dec = ds4_dec_open(root, "tester");
+    if (!w.dec) {
+        fprintf(stderr, "ds4-agent tests: deciduous server not reachable (%s); graph tests skipped\n",
+                ds4_dec_open_error());
+        AGENT_TEST_ASSERT(chdir(saved) == 0);
+        return;
+    }
+    AGENT_TEST_ASSERT(ds4_dec_active(w.dec));
+
+    /* A decision with nothing to be about is refused, and the refusal names the
+     * way out: the graph stays honest only if every node hangs under a goal. */
+    res = graph_call(&w, "decide", (const graph_kv[]){
+        {"title", "which seam for the graph"}, {"chosen_option", "the server API"},
+        {NULL, NULL}});
+    AGENT_TEST_ASSERT(strstr(res, "Tool error") && strstr(res, "op=goal"));
+    free(res);
+
+    /* The opening request becomes the goal node, on the server, and is held. */
+    res = graph_call(&w, "goal", (const graph_kv[]){
+        {"prompt", "make deciduous a core concept of the ds4 harness"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(strstr(res, "Goal recorded on the server") != NULL);
+    AGENT_TEST_ASSERT(strstr(res, "held by this session") != NULL);
+    AGENT_TEST_ASSERT(ds4_dec_goal_bound(w.dec));
+    goal_id = ds4_dec_goal_id(w.dec);
+    AGENT_TEST_ASSERT(goal_id && strlen(goal_id) == 36 && strchr(goal_id, '-'));
+    free(res);
+
+    /* A session holds one goal: a second request says so instead of quietly
+     * writing a second node beside the first. */
+    res = graph_call(&w, "goal", (const graph_kv[]){
+        {"prompt", "something else entirely"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(strstr(res, "already holds") != NULL);
+    free(res);
+
+    /* A fact is attached to the goal it matters for, in one call. */
+    res = graph_call(&w, "note", (const graph_kv[]){
+        {"title", "the MCP endpoint answers plain JSON, not SSE"},
+        {"description", "initialize and tools/call return application/json; the client "
+                        "must dechunk it"},
+        {"why", "the client would otherwise wait for an event stream that never comes"},
+        {NULL, NULL}});
+    AGENT_TEST_ASSERT(strstr(res, "Observation recorded") != NULL);
+    AGENT_TEST_ASSERT(strstr(res, "attached to the goal") != NULL);
+    free(res);
+
+    /* A real choice: the server makes the option nodes itself, so ds4 sends the
+     * titles and gets back what it closed off. */
+    res = graph_call(&w, "decide", (const graph_kv[]){
+        {"title", "how ds4 reaches the graph"},
+        {"chosen_option", "the server API over HTTP"},
+        {"rejected_option", "the deciduous CLI with a local SQLite cache"},
+        {"rationale", "the server holds every workspace in one Postgres and validates "
+                      "arguments strictly; a local cache would fork the truth per machine"},
+        {NULL, NULL}});
+    AGENT_TEST_ASSERT(!strstr(res, "Tool error"));
+    AGENT_TEST_ASSERT(strstr(res, "recorded as rejected") != NULL);
+    free(res);
+
+    res = graph_call(&w, "turn", (const graph_kv[]){
+        {"summary", "the seam was moved onto the server API"},
+        {"observation", "add_node is idempotent when a change_id is supplied"},
+        {"outcome", "retries cannot leave duplicate nodes behind"},
+        {NULL, NULL}});
+    AGENT_TEST_ASSERT(!strstr(res, "Tool error"));
+    free(res);
+
+    /* Reading is a question, and an unanswered question is an honest answer. */
+    res = graph_call(&w, "graph", (const graph_kv[]){
+        {"question", "which option was rejected for reaching the graph"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(!strstr(res, "Tool error"));
+    free(res);
+
+    res = graph_call(&w, "graph", (const graph_kv[]){
+        {"question", "zzqx nothing in this shape"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(!strstr(res, "Tool error"));
+    free(res);
+
+    /* The board: post as this session, then read it back with all=1. */
+    res = graph_call(&w, "board", (const graph_kv[]){
+        {"subject", "graph seam now writes through the API"},
+        {"body", "deciduous is one tool with ops; nothing local is written"},
+        {"why", "so sessions agree on where decisions live"},
+        {NULL, NULL}});
+    AGENT_TEST_ASSERT(!strstr(res, "Tool error"));
+    AGENT_TEST_ASSERT(strstr(res, "Posted to the board as tester") != NULL);
+    free(res);
+
+    res = graph_call(&w, "board", (const graph_kv[]){{"all", "1"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(!strstr(res, "Tool error"));
+    AGENT_TEST_ASSERT(strstr(res, "graph seam now writes through the API") != NULL);
+    free(res);
+
+    /* A half-posted message is not posted: the server would reject it anyway, and
+     * ds4 says so before making the request. */
+    res = graph_call(&w, "board", (const graph_kv[]){{"subject", "only a headline"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(strstr(res, "Tool error") && strstr(res, "subject and body"));
+    free(res);
+
+    /* Moments, not provenance: the harness never writes for itself, it reminds. */
+    res = graph_call(&w, "status", (const graph_kv[]){
+        {"node_id", goal_id}, {"status", "active"}, {NULL, NULL}});
+    free(res);
+    note = ds4_dec_note_result(w.dec, "edit", "ds4_agent.c",
+                               "Tool result 1 (edit): Edited ds4_agent.c\n", -1);
+    AGENT_TEST_ASSERT(note != NULL && strstr(note, "fork in the road") != NULL);
+    {
+        const char *again = ds4_dec_note_result(w.dec, "edit", "ds4_agent.c",
+                                                "Tool result 1 (edit): Edited again\n", -1);
+        AGENT_TEST_ASSERT(again == NULL);
+    }
+    note = ds4_dec_note_result(w.dec, "bash", "make ds4_agent_test",
+                               "bash job=1 pid=1 status=done\nexit_status=0\n", 0);
+    AGENT_TEST_ASSERT(note != NULL && strstr(note, "op=turn") != NULL);
+    note = ds4_dec_note_result(w.dec, "bash", "make test",
+                               "bash job=2 pid=2 status=done\nexit_status=2\n", 2);
+    AGENT_TEST_ASSERT(note == NULL);
+    note = ds4_dec_note_result(w.dec, "read", "ds4_agent.c", "read 40 lines\n", -1);
+    AGENT_TEST_ASSERT(note == NULL);
+
+    /* Compaction replaces the transcript; the graph keeps what mattered. */
+    digest = ds4_dec_compaction_digest(w.dec);
+    AGENT_TEST_ASSERT(digest && strstr(digest, "ds4-selftest") != NULL);
+    AGENT_TEST_ASSERT(strstr(digest, "Goal held by this session:") != NULL);
+    free(digest);
+
+    note = ds4_dec_recovery_note(w.dec);
+    AGENT_TEST_ASSERT(note && strstr(note, "holds the goal") != NULL);
+
+    /* What the graph already holds is shown before the session acts, not after
+     * it wonders: the briefing names the goal, the decisions under it, and where
+     * an answer was already rejected. */
+    brief = ds4_dec_briefing(w.dec);
+    AGENT_TEST_ASSERT(brief && strstr(brief, "What the graph already holds") != NULL);
+    AGENT_TEST_ASSERT(strstr(brief, "make deciduous a core concept") != NULL);
+    AGENT_TEST_ASSERT(strstr(brief, "how ds4 reaches the graph") != NULL);
+    AGENT_TEST_ASSERT(strstr(brief, "Ask op=graph") != NULL);
+    free(brief);
+
+    /* Nothing to brief and nothing to post: a handle that wrote no moment has no
+     * news, and silence is what it owes the workspace. */
+    {
+        ds4_dec *quiet = ds4_dec_open(root, "quiet");
+        AGENT_TEST_ASSERT(quiet != NULL);
+        AGENT_TEST_ASSERT(ds4_dec_briefing(quiet) == NULL);
+        AGENT_TEST_ASSERT(ds4_dec_close_session(quiet) == NULL);
+        ds4_dec_close(quiet);
+    }
+
+    /* The other agents hear what this session decided, once, because it recorded
+     * moments; the headline names the goal so they can find the reasoning. */
+    closing = ds4_dec_close_session(w.dec);
+    AGENT_TEST_ASSERT(closing && strstr(closing, "closing note posted") != NULL);
+    AGENT_TEST_ASSERT(strstr(closing, "make deciduous a core concept") != NULL);
+    AGENT_TEST_ASSERT(strstr(closing, "1 decision, 1 step, 1 note") != NULL);
+    res = graph_call(&w, "board", (const graph_kv[]){{"all", "1"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(strstr(res, "1 decision, 1 step, 1 note") != NULL);
+    free(res);
+    free(closing);
+    /* The same session posts again only after writing again. */
+    AGENT_TEST_ASSERT(ds4_dec_close_session(w.dec) == NULL);
+
+    /* A new session in the same workspace should claim the goal that exists rather
+     * than write a duplicate beside it: release names it, and op=status claims it. */
+    ds4_dec_release_goal(w.dec);
+    AGENT_TEST_ASSERT(!ds4_dec_goal_bound(w.dec));
+    {
+        const char *released = ds4_dec_recovery_note(w.dec);
+        AGENT_TEST_ASSERT(released && strstr(released, "has not claimed it") != NULL);
+        AGENT_TEST_ASSERT(strstr(released, goal_id) != NULL);
+
+        agent_worker second = {0};
+        char *claim;
+        second.dec = ds4_dec_open(root, "second");
+        AGENT_TEST_ASSERT(ds4_dec_active(second.dec));
+        AGENT_TEST_ASSERT(!ds4_dec_goal_bound(second.dec));
+        /* A session with no goal has no subtree to be briefed about. */
+        AGENT_TEST_ASSERT(ds4_dec_briefing(second.dec) == NULL);
+        claim = graph_call(&second, "status", (const graph_kv[]){
+            {"node_id", goal_id}, {"status", "active"}, {NULL, NULL}});
+        AGENT_TEST_ASSERT(strstr(claim, "is now this session's bound goal") != NULL);
+        AGENT_TEST_ASSERT(ds4_dec_goal_bound(second.dec));
+        free(claim);
+
+        /* Finishing a goal belongs to the operator alone: ds4 never decides a goal
+         * is done, and a handle that holds no goal has nothing to finish. */
+        refused = ds4_dec_mark_goal_done(w.dec);
+        AGENT_TEST_ASSERT(refused != NULL && strstr(refused, "no goal is bound") != NULL);
+        free(refused);
+
+        /* The server's vocabulary for writing a status is pending, active,
+         * completed, rejected, superseded, abandoned.  The deciduous CLI help
+         * prints "done" and "parked", and the server accepts neither for a
+         * write - it even lists a "done" filter for reads that can never match
+         * anything.  ds4 says completed, and when the server refuses a write it
+         * says so in its own words rather than retrying a guess. */
+        res = graph_call(&second, "status", (const graph_kv[]){
+            {"node_id", goal_id}, {"status", "done"}, {NULL, NULL}});
+        AGENT_TEST_ASSERT(strstr(res, "status must be one of") != NULL);
+        AGENT_TEST_ASSERT(strstr(res, "completed") != NULL);
+        AGENT_TEST_ASSERT(strstr(res, "The graph did not record this") != NULL);
+        free(res);
+
+        closing = ds4_dec_mark_goal_done(second.dec);
+        AGENT_TEST_ASSERT(closing != NULL &&
+                          strstr(closing, "goal completed on the server") != NULL);
+        AGENT_TEST_ASSERT(strstr(closing, "make deciduous a core concept") != NULL);
+        /* The server echoes the status it stored; that is the proof, not ds4's
+         * own wording. */
+        AGENT_TEST_ASSERT(strstr(closing, "(now completed)") != NULL);
+        free(closing);
+        ds4_dec_close(second.dec);
+    }
+
+    /* The op is what selects the server tool, so a bad one is named back. */
+    res = graph_call(&w, "nonsense", (const graph_kv[]){{"title", "x"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(strstr(res, "Tool error") && strstr(res, "has no op") != NULL);
+    free(res);
+    res = graph_call(&w, NULL, (const graph_kv[]){{"title", "x"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(strstr(res, "Tool error") && strstr(res, "op=decide") != NULL);
+    free(res);
+
+    /* Auto-binding the opening request as the goal is the default, but only for
+     * text that carries intent: a slash command or "hi" is not a goal. */
+    AGENT_TEST_ASSERT(!agent_text_is_goal_worthy(NULL));
+    AGENT_TEST_ASSERT(!agent_text_is_goal_worthy("hi"));
+    AGENT_TEST_ASSERT(!agent_text_is_goal_worthy("/new"));
+    AGENT_TEST_ASSERT(!agent_text_is_goal_worthy("short text"));
+    AGENT_TEST_ASSERT(agent_text_is_goal_worthy("fix the compaction boundary bug"));
+
+    /* Without a live server the tool explains itself instead of writing. */
+    res = graph_call(&blind, "graph", (const graph_kv[]){{"question", "what was decided"}, {NULL, NULL}});
+    AGENT_TEST_ASSERT(strstr(res, "no decision graph is open") != NULL);
+    free(res);
+
+    ds4_dec_close(w.dec);
+    w.dec = NULL;
+    AGENT_TEST_ASSERT(chdir(saved) == 0);
 }
 
 /* Model-free real-PTY driver for tests/ds4_agent_terminal_test.py. */
@@ -1017,6 +1306,19 @@ int main(int argc, char **argv) {
     agent_config cfg = parse_options((int)(sizeof(options) / sizeof(options[0])), options);
     AGENT_TEST_ASSERT(cfg.engine.vision_path && !strcmp(cfg.engine.vision_path, "mmproj.gguf"));
     AGENT_TEST_ASSERT(cfg.engine.model_path && !strcmp(cfg.engine.model_path, "qwen.gguf"));
+    {
+        char *goptions[] = {"ds4-agent", "--model", "qwen.gguf", "--goal", "ship the POC",
+                            "--label", "coworker", "--graph", "off", "--non-interactive",
+                            "-p", "test"};
+        char *boptions[] = {"ds4-agent", "--model", "qwen.gguf", "--graph", "on",
+                            "--non-interactive", "-p", "test"};
+        agent_config gcfg = parse_options((int)(sizeof(goptions) / sizeof(goptions[0])), goptions);
+        agent_config bcfg = parse_options((int)(sizeof(boptions) / sizeof(boptions[0])), boptions);
+        AGENT_TEST_ASSERT(gcfg.goal && !strcmp(gcfg.goal, "ship the POC"));
+        AGENT_TEST_ASSERT(gcfg.dec_label && !strcmp(gcfg.dec_label, "coworker"));
+        AGENT_TEST_ASSERT(gcfg.graph_off);
+        AGENT_TEST_ASSERT(!bcfg.graph_off);
+    }
     ds4_agent_unit_tests_run();
     test_v41_tool_syntax();
     test_qwen_tool_syntax();
@@ -1033,6 +1335,7 @@ int main(int argc, char **argv) {
     test_unicode_output_and_footer();
     test_footer_only_updates();
     test_tool_contracts();
+    test_deciduous_graph();
     if (agent_test_failures) {
         fprintf(stderr, "ds4-agent tests: %d failure(s)\n",
                 agent_test_failures);
