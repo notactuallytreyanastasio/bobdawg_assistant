@@ -199,3 +199,83 @@ describe('load', () => {
     expect(loaded).toEqual({ messages: [userMessage('u9', 'old')], streaming: false, error: null });
   });
 });
+
+describe('the tool loop', () => {
+  const call = { id: 'c1', name: 'plot', arguments: '{"code":"x"}' };
+  const sent = reduceConversation(emptyConversation, { type: 'send', userId: 'u1', assistantId: 'a1', text: 'q', plot: true });
+  const called = reduceConversation(sent, { type: 'calls', calls: [call] });
+  const answered = reduceConversation(called, { type: 'result', id: 't1', callId: 'c1', ok: false, text: 'boom' });
+
+  it('marks the question as sent with Plot on', () => {
+    expect(sent.messages[0]?.plot).toBe(true);
+  });
+
+  it('puts the calls on the newest answer', () => {
+    expect(called.messages.at(-1)?.calls).toEqual([call]);
+  });
+
+  it('appends one tool message per result', () => {
+    expect(answered.messages.at(-1)).toMatchObject({
+      id: 't1',
+      role: 'tool',
+      text: 'boom',
+      result: { callId: 'c1', ok: false },
+    });
+  });
+
+  it('opens the next answer after the results', () => {
+    const next = reduceConversation(answered, { type: 'next', assistantId: 'a2' });
+    expect(next.messages.map((message) => message.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+    expect(next.streaming).toBe(true);
+  });
+
+  it('ignores all three once nothing is streaming', () => {
+    const ended = reduceConversation(answered, { type: 'end' });
+    expect(reduceConversation(ended, { type: 'calls', calls: [call] })).toBe(ended);
+    expect(reduceConversation(ended, { type: 'result', id: 't2', callId: 'c1', ok: true, text: 'x' })).toBe(ended);
+    expect(reduceConversation(ended, { type: 'next', assistantId: 'a2' })).toBe(ended);
+  });
+
+  it('marks the newest answer when the turn ends on a tool message', () => {
+    const ended = reduceConversation(answered, { type: 'end', ending: 'gaveup' });
+    expect(ended.messages[1]?.ending).toBe('gaveup');
+    expect(ended.messages.at(-1)?.role).toBe('tool');
+    expect(ended.streaming).toBe(false);
+  });
+
+  it('keeps a stopped answer that has calls and nothing else', () => {
+    const ended = reduceConversation(answered, { type: 'end', ending: 'stopped' });
+    expect(ended.messages).toHaveLength(3);
+  });
+
+  it('marks the answer before an empty one the reader stopped', () => {
+    const next = reduceConversation(answered, { type: 'next', assistantId: 'a2' });
+    const ended = reduceConversation(next, { type: 'end', ending: 'stopped' });
+    expect(ended.messages.map((message) => message.role)).toEqual(['user', 'assistant', 'tool']);
+    expect(ended.messages[1]?.ending).toBe('stopped');
+  });
+
+  it('can end with a banner', () => {
+    const ended = reduceConversation(answered, { type: 'end', ending: 'gaveup', error: 'left the page' });
+    expect(ended.error).toBe('left the page');
+  });
+
+  it('drops the empty answer a failure leaves, and keeps the one with calls', () => {
+    const next = reduceConversation(answered, { type: 'next', assistantId: 'a2' });
+    expect(reduceConversation(next, { type: 'fail', text: 'gone' }).messages).toHaveLength(3);
+    expect(reduceConversation(called, { type: 'fail', text: 'gone' }).messages).toHaveLength(2);
+  });
+
+  it('retries from the last question, taking every round with it', () => {
+    const ended = reduceConversation(answered, { type: 'end', ending: 'gaveup' });
+    const retried = reduceConversation(ended, { type: 'retry', assistantId: 'a9' });
+    expect(retried.messages.map((message) => message.id)).toEqual(['u1', 'a9']);
+    expect(retried.streaming).toBe(true);
+  });
+
+  it('lets a retry say whether Plot is on this time', () => {
+    const ended = reduceConversation(answered, { type: 'end' });
+    expect(reduceConversation(ended, { type: 'retry', assistantId: 'a9', plot: false }).messages[0]?.plot).toBe(false);
+    expect(reduceConversation(ended, { type: 'retry', assistantId: 'a9' }).messages[0]?.plot).toBe(true);
+  });
+});

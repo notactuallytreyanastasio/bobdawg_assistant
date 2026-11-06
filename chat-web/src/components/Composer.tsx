@@ -6,7 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 import { canSend } from '../chat/conversation';
 import type { Conversation } from '../chat/conversation';
-import { BulbIcon, SendIcon, StopIcon } from './icons';
+import { BulbIcon, ChartIcon, SendIcon, StopIcon } from './icons';
 
 export type ComposerProps = {
   readonly conversation: Conversation;
@@ -15,6 +15,8 @@ export type ComposerProps = {
   readonly thinking?: boolean;
   readonly contextPercent?: number | null;
   readonly onThinking?: (thinking: boolean) => void;
+  readonly plot?: boolean;
+  readonly onPlot?: (plot: boolean) => void;
   readonly onSend: (text: string) => void;
   readonly onStop: () => void;
 };
@@ -29,6 +31,8 @@ export function Composer({
   thinking,
   contextPercent = null,
   onThinking,
+  plot,
+  onPlot,
   onSend,
   onStop,
 }: ComposerProps) {
@@ -96,6 +100,22 @@ export function Composer({
             >
               <BulbIcon />
               Thinking
+            </button>
+          )}
+          {plot === undefined || onPlot === undefined ? null : (
+            <button
+              className={plot ? 'toggle on' : 'toggle'}
+              type="button"
+              aria-pressed={plot}
+              title={
+                plot
+                  ? 'The model draws what you send as a chart. Its code runs in a sandbox when you press Run'
+                  : 'Plain chat: no code runs'
+              }
+              onClick={() => onPlot(!plot)}
+            >
+              <ChartIcon />
+              Plot
             </button>
           )}
           {notice === undefined ? null : <span className="hint">{notice}</span>}

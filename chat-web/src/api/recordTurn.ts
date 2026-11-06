@@ -5,6 +5,7 @@
 
 import { platformFetch } from './chatClient';
 import type { FetchLike } from './chatClient';
+import { artifactsOf } from '../chat/artifact';
 import type { ChatMessage } from '../chat/message';
 
 export type TurnRecord = {
@@ -27,7 +28,8 @@ export type RecordOptions = {
 
 // What the transcript says about its newest exchange, or nothing if no question was asked.
 // The answer is missing when the turn failed or was stopped before a word, and the turn is
-// worth recording all the same: that it went wrong is part of what happened.
+// worth recording all the same: that it went wrong is part of what happened. A chart the
+// model drew without comment goes in by name; its code never goes in.
 export function turnRecordOf(
   chat: string,
   model: string,
@@ -37,12 +39,23 @@ export function turnRecordOf(
   const asked = messages.filter((message) => message.role === 'user');
   const question = asked.at(-1)?.text;
   if (question === undefined) return null;
-  const last = messages.at(-1);
-  const answer = last?.role === 'assistant' ? last.text : '';
+  const turn = messages.slice(messages.findLastIndex((message) => message.role === 'user') + 1);
+  const answers = turn.filter((message) => message.role === 'assistant');
+  const words = answers.findLast((message) => message.text !== '')?.text;
+  const drawn = artifactsOf(turn).findLast((artifact) => artifact.status === 'ok');
+  const answer = words ?? (drawn === undefined ? '' : `Drew: ${drawn.title}`);
+  const ending = answers.at(-1)?.ending ?? null;
   const base = { chat, model, question, first: asked[0]?.text ?? question };
   if (failure !== null) return { ...base, answer: failure, ending: 'failed' };
+  if (ending === 'gaveup') return { ...base, answer, ending: 'failed' };
+  // The server's list of endings has no word for this, and it is no clean success: nobody
+  // looked at the chart. Any words are from before the last call, so they are not an answer.
+  if (ending === 'capped') {
+    const last = drawn === undefined ? answer : `Drew: ${drawn.title}`;
+    return { ...base, answer: `Ran out of rounds. ${last}`.trimEnd(), ending: 'failed' };
+  }
   if (answer === '') return { ...base, answer, ending: 'stopped' };
-  return { ...base, answer, ending: last?.ending ?? '' };
+  return { ...base, answer, ending: ending ?? '' };
 }
 
 export async function recordTurn(options: RecordOptions): Promise<RecordResult> {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { recordTurn, turnRecordOf } from '../../src/api/recordTurn';
 import type { FetchLike } from '../../src/api/chatClient';
-import { assistantMessage, userMessage } from '../../src/chat/message';
+import { assistantMessage, toolMessage, userMessage } from '../../src/chat/message';
 
 const first = userMessage('u1', 'why is the sky blue?');
 const answered = { ...assistantMessage('a1'), text: 'scattering' };
@@ -68,5 +68,55 @@ describe('recordTurn', () => {
       throw new TypeError('connection refused');
     };
     expect(await recordTurn({ origin: '', fetchImpl: down, turn })).toBe('missed');
+  });
+});
+
+describe('a turn with tool calls', () => {
+  const asked = userMessage('u1', 'chart this', true);
+  const code = '// title: Loaves\ndraw()';
+  const calling = {
+    ...assistantMessage('a1'),
+    calls: [{ id: 'c1', name: 'plot', arguments: JSON.stringify({ code }) }],
+  };
+  const drew = toolMessage('t1', 'c1', true, 'ok: drew 1 svg');
+
+  it('takes the newest words the model said', () => {
+    const closing = { ...assistantMessage('a2'), text: 'Saturdays lead.' };
+    const record = turnRecordOf('c1', 'm', [asked, calling, drew, closing], null);
+    expect(record).toMatchObject({ answer: 'Saturdays lead.', ending: '' });
+  });
+
+  it('names the chart when the model said nothing', () => {
+    const record = turnRecordOf('c1', 'm', [asked, calling, drew], null);
+    expect(record).toMatchObject({ answer: 'Drew: Loaves', ending: '' });
+  });
+
+  it('never records the code', () => {
+    const record = turnRecordOf('c1', 'm', [asked, calling, drew], null);
+    expect(JSON.stringify(record)).not.toContain('draw()');
+  });
+
+  it('records giving up as a failure', () => {
+    const gaveup = { ...calling, ending: 'gaveup' as const };
+    const failed = toolMessage('t1', 'c1', false, 'error');
+    expect(turnRecordOf('c1', 'm', [asked, gaveup, failed], null)?.ending).toBe('failed');
+  });
+
+  it('records running out of rounds as a failure, and not the words before the last call', () => {
+    const capped = { ...calling, text: 'Let me re-test', ending: 'capped' as const };
+    const record = turnRecordOf('c1', 'm', [asked, capped, drew], null);
+    expect(record).toMatchObject({ answer: 'Ran out of rounds. Drew: Loaves', ending: 'failed' });
+  });
+
+  it('records a stop after the chart as a stop', () => {
+    const stopped = { ...calling, ending: 'stopped' as const };
+    const declined = toolMessage('t1', 'c1', false, 'stopped by the reader');
+    expect(turnRecordOf('c1', 'm', [asked, stopped, declined], null)).toMatchObject({ answer: '', ending: 'stopped' });
+  });
+
+  it('does not borrow words from an earlier turn', () => {
+    const earlier = { ...assistantMessage('a0'), text: 'old words' };
+    const record = turnRecordOf('c1', 'm', [first, earlier, asked, calling, drew], null);
+    expect(record?.answer).toBe('Drew: Loaves');
   });
 });

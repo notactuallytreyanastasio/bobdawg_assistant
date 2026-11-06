@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import { App } from '../src/App';
 import type { FetchLike } from '../src/api/chatClient';
+import type { ArtifactHost, HostRun, HostStatus } from '../src/artifact/host';
+import { emptyReport } from '../src/artifact/protocol';
 import type { StoreLike } from '../src/chat/storage';
 
 const encoder = new TextEncoder();
@@ -291,5 +293,198 @@ describe('App', () => {
 
     await waitFor(() => expect(screen.getByText('a gate held by water')).toBeTruthy());
     expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  describe('with Plot', () => {
+    type Body = { readonly messages: readonly { readonly role: string }[]; readonly tools?: unknown };
+
+    const code = '// title: Loaves\ndraw()';
+    const callChunk = `data: ${JSON.stringify({
+      choices: [
+        {
+          delta: { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'plot', arguments: JSON.stringify({ code }) } }] },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    })}\n\n`;
+
+    // A server that calls the tool first and speaks second, and a host that draws at once.
+    function rig() {
+      const bodies: Body[] = [];
+      const fetchImpl: FetchLike = async (input, init) => {
+        if (String(input).endsWith('/v1/models')) {
+          return new Response(JSON.stringify({ data: [{ id: 'alias' }] }));
+        }
+        if (String(input).endsWith('/chat/record')) return new Response('{}');
+        bodies.push(JSON.parse(String(init?.body)) as Body);
+        return bodies.length === 1
+          ? sseResponse([callChunk, done])
+          : sseResponse([contentChunk('Saturdays lead.'), done]);
+      };
+      const runs: HostRun[] = [];
+      const removed = vi.fn();
+      let status: HostStatus = { live: false, checking: false, ended: null };
+      const listeners = new Set<() => void>();
+      const set = (next: HostStatus) => {
+        status = next;
+        for (const listener of listeners) listener();
+      };
+      const createHost = (): ArtifactHost => ({
+        run: async (input) => {
+          runs.push(input);
+          set({ live: true, checking: false, ended: null });
+          return { ...emptyReport, nodes: 3, svgs: 1, marks: 3, bbox: { w: 5, h: 5 } };
+        },
+        remove: () => {
+          removed();
+          set({ live: false, checking: false, ended: null });
+        },
+        status: () => status,
+        subscribe: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+        dispose: () => undefined,
+      });
+      return { bodies, runs, removed, fetchImpl, createHost };
+    }
+
+    async function ask(user: ReturnType<typeof userEvent.setup>, text: string): Promise<void> {
+      await waitFor(() => expect(textBox().disabled).toBe(false));
+      await user.type(textBox(), `${text}{Enter}`);
+    }
+
+    function panel(): Element {
+      const found = document.querySelector('.panel');
+      if (found === null) throw new Error('no panel');
+      return found;
+    }
+
+    it('remembers the toggle', async () => {
+      const user = userEvent.setup();
+      const store = memoryStore();
+      const first = render(<App origin="" fetchImpl={served} store={store} />);
+      await user.click(screen.getByRole('button', { name: 'Plot' }));
+      first.unmount();
+      render(<App origin="" fetchImpl={served} store={store} />);
+      expect(screen.getByRole('button', { name: 'Plot' }).getAttribute('aria-pressed')).toBe('true');
+    });
+
+    it('sends no tools with Plot off', async () => {
+      const user = userEvent.setup();
+      const server = rig();
+      render(<App origin="" fetchImpl={server.fetchImpl} store={memoryStore()} createHost={server.createHost} />);
+      await ask(user, 'hello');
+      await waitFor(() => expect(server.bodies).toHaveLength(1));
+      expect(server.bodies[0]?.tools).toBeUndefined();
+    });
+
+    it('runs nothing until Run, then reveals the chart and carries on', async () => {
+      const user = userEvent.setup();
+      const server = rig();
+      render(<App origin="" fetchImpl={server.fetchImpl} store={memoryStore()} createHost={server.createHost} />);
+      await user.click(screen.getByRole('button', { name: 'Plot' }));
+      await ask(user, 'the data');
+      const run = await screen.findByRole('button', { name: 'Run' });
+      expect(server.runs).toHaveLength(0);
+      expect(panel().className).toBe('panel');
+      await user.click(run);
+      await screen.findByText('Saturdays lead.');
+      expect(server.runs).toHaveLength(1);
+      expect(server.runs[0]?.messages).toEqual(['the data']);
+      await waitFor(() => expect(panel().className).toBe('panel open'));
+      expect(server.bodies[1]?.messages.map((message) => message.role)).toEqual([
+        'system',
+        'user',
+        'assistant',
+        'tool',
+      ]);
+    });
+
+    it('shows the code before running, with no frame', async () => {
+      const user = userEvent.setup();
+      const server = rig();
+      render(<App origin="" fetchImpl={server.fetchImpl} store={memoryStore()} createHost={server.createHost} />);
+      await user.click(screen.getByRole('button', { name: 'Plot' }));
+      await ask(user, 'the data');
+      await screen.findByRole('button', { name: 'Run' });
+      const card = document.querySelector('.card');
+      if (!(card instanceof HTMLElement)) throw new Error('no card');
+      await user.click(within(card).getByRole('button', { name: 'Code' }));
+      expect(document.querySelector('.panel-code')?.textContent).toBe(code);
+      expect(panel().className).toBe('panel open');
+      expect(server.runs).toHaveLength(0);
+    });
+
+    it('takes Stop at the Run prompt as no', async () => {
+      const user = userEvent.setup();
+      const server = rig();
+      render(<App origin="" fetchImpl={server.fetchImpl} store={memoryStore()} createHost={server.createHost} />);
+      await user.click(screen.getByRole('button', { name: 'Plot' }));
+      await ask(user, 'the data');
+      await screen.findByRole('button', { name: 'Run' });
+      await user.click(screen.getByRole('button', { name: 'Stop' }));
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Run' })).toBeNull());
+      expect(server.runs).toHaveLength(0);
+      expect(server.bodies).toHaveLength(1);
+    });
+
+    it('runs nothing on reopening a chat, until the placeholder is tapped', async () => {
+      const user = userEvent.setup();
+      const server = rig();
+      const store = memoryStore();
+      const first = render(<App origin="" fetchImpl={server.fetchImpl} store={store} createHost={server.createHost} />);
+      await user.click(screen.getByRole('button', { name: 'Plot' }));
+      await ask(user, 'the data');
+      await user.click(await screen.findByRole('button', { name: 'Run' }));
+      await screen.findByText('Saturdays lead.');
+      await screen.findByRole('button', { name: 'Send' });
+      first.unmount();
+      server.runs.length = 0;
+      render(<App origin="" fetchImpl={server.fetchImpl} store={store} createHost={server.createHost} />);
+      expect(server.runs).toHaveLength(0);
+      expect(panel().className).toBe('panel');
+      await user.click(await screen.findByRole('button', { name: /Loaves/ }));
+      expect(panel().className).toBe('panel open');
+      expect(server.runs).toHaveLength(0);
+      await user.click(screen.getByRole('button', { name: 'Run' }));
+      expect(server.runs).toHaveLength(1);
+    });
+
+    it('clears the panel for a new chat', async () => {
+      const user = userEvent.setup();
+      const server = rig();
+      render(<App origin="" fetchImpl={server.fetchImpl} store={memoryStore()} createHost={server.createHost} />);
+      await user.click(screen.getByRole('button', { name: 'Plot' }));
+      await ask(user, 'the data');
+      await user.click(await screen.findByRole('button', { name: 'Run' }));
+      await screen.findByText('Saturdays lead.');
+      await waitFor(() => expect(panel().className).toBe('panel open'));
+      await user.click(screen.getByRole('button', { name: 'New chat' }));
+      expect(panel().className).toBe('panel');
+      expect(server.removed).toHaveBeenCalled();
+    });
+
+    it('takes the frame down when a retry removes the chart it belongs to', async () => {
+      const user = userEvent.setup();
+      const server = rig();
+      render(<App origin="" fetchImpl={server.fetchImpl} store={memoryStore()} createHost={server.createHost} />);
+      await user.click(screen.getByRole('button', { name: 'Plot' }));
+      await ask(user, 'the data');
+      await user.click(await screen.findByRole('button', { name: 'Run' }));
+      await screen.findByText('Saturdays lead.');
+      await waitFor(() => expect(panel().className).toBe('panel open'));
+      server.removed.mockClear();
+      await user.click(screen.getByRole('button', { name: 'Retry' }));
+      await waitFor(() => expect(server.removed).toHaveBeenCalled());
+      expect(panel().className).toBe('panel');
+    });
+
+    it('keeps the panel third in the row, and renders it with no chart', async () => {
+      const { container } = render(<App origin="" fetchImpl={served} store={memoryStore()} />);
+      const shell = container.querySelector('.app');
+      expect(shell?.lastElementChild?.className).toBe('panel');
+      expect(shell?.textContent).toContain('Do not type anything private into it.');
+    });
   });
 });

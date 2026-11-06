@@ -12,6 +12,7 @@ export type StoreLike = {
 
 const LIBRARY_KEY = 'ds4.chat.library';
 const THINKING_KEY = 'ds4.chat.thinking';
+const PLOT_KEY = 'ds4.chat.plot';
 
 export function platformStore(): StoreLike | null {
   try {
@@ -62,4 +63,13 @@ export function loadThinking(store: StoreLike | null): boolean {
 
 export function saveThinking(store: StoreLike | null, thinking: boolean): boolean {
   return write(store, THINKING_KEY, thinking ? 'on' : 'off');
+}
+
+// Plot is off unless it was turned on: it is the one setting that lets model code run.
+export function loadPlot(store: StoreLike | null): boolean {
+  return read(store, PLOT_KEY) === 'on';
+}
+
+export function savePlot(store: StoreLike | null, plot: boolean): boolean {
+  return write(store, PLOT_KEY, plot ? 'on' : 'off');
 }

@@ -42,7 +42,7 @@ const NON_MIRRORED_SRC: readonly string[] = ['src/main.tsx', 'src/vite-env.d.ts'
 // This suite checks the package instead of a runtime module, so it has no mirror.
 const NON_MIRRORED_TEST: readonly string[] = ['test/hygiene.test.ts'];
 
-const EXTENSIONS = ['.ts', '.tsx'];
+const EXTENSIONS = ['.ts', '.tsx', '.js'];
 
 function filesUnder(directory: string): string[] {
   const found: string[] = [];
@@ -74,7 +74,7 @@ function excluded(path: string, owners: readonly string[]): boolean {
 // src/chat/sse.ts and test/chat/sse.test.tsx share the base test/chat/sse, so the mirror
 // is found whether either side is written as .ts or .tsx.
 function baseOf(path: string, from: string, to: string): string {
-  return path.replace(new RegExp(`^${from}/`), `${to}/`).replace(/\.(test\.)?tsx?$/, '');
+  return path.replace(new RegExp(`^${from}/`), `${to}/`).replace(/\.(test\.)?(tsx?|js)$/, '');
 }
 
 function suitesFor(modulePath: string): string[] {
@@ -84,7 +84,7 @@ function suitesFor(modulePath: string): string[] {
 
 function modulesFor(testPath: string): string[] {
   const base = baseOf(testPath, 'test', 'src');
-  return [`${base}.ts`, `${base}.tsx`];
+  return [`${base}.ts`, `${base}.tsx`, `${base}.js`];
 }
 
 function violationsOf(
@@ -143,4 +143,23 @@ it('every test suite faces its own module', () => {
     if (modules.every((module) => readOrMiss(module) === null)) orphans.push(`${suite} has no ${modules[0]}`);
   }
   expect(orphans).toEqual([]);
+});
+
+// The sandbox rests on these staying absent. Each one gives model code the page's origin,
+// and none of them has a use here.
+const SANDBOX_BREAKERS: readonly string[] = ['allow-' + 'same-origin', 'createObject' + 'URL', 'window' + '.open'];
+
+it('nothing in src can hand a frame the page origin', () => {
+  const violations = violationsOf(filesUnder('src'), (line) =>
+    SANDBOX_BREAKERS.some((breaker) => line.includes(breaker)) ? 'sandbox breaker' : null,
+  );
+  expect(violations).toEqual([]);
+});
+
+it('the page holds the exact parent policy, first after the charset', () => {
+  const html = readOrMiss('index.html') ?? '';
+  const tags = [...html.matchAll(/<(meta|link|title|script)\b[^>]*>/g)].map((match) => match[0]);
+  expect(tags[0]).toBe('<meta charset="utf-8" />');
+  expect(tags[1]).toBe(`<meta http-equiv="Content-Security-Policy" content="frame-src 'none'" />`);
+  expect(html.match(/Content-Security-Policy/g)).toHaveLength(1);
 });

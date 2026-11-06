@@ -155,4 +155,26 @@ describe('Composer', () => {
     );
     expect(screen.getByText('12% of context')).toBeTruthy();
   });
+
+  it('offers Plot beside Thinking, and says which way it is', async () => {
+    const user = userEvent.setup();
+    const onPlot = vi.fn();
+    const view = render(
+      <Composer conversation={emptyConversation} ready plot={false} onPlot={onPlot} onSend={() => undefined} onStop={() => undefined} />,
+    );
+    const toggle = button('Plot');
+    expect(toggle.getAttribute('aria-pressed')).toBe('false');
+    await user.click(toggle);
+    expect(onPlot).toHaveBeenCalledWith(true);
+    view.rerender(
+      <Composer conversation={emptyConversation} ready plot onPlot={onPlot} onSend={() => undefined} onStop={() => undefined} />,
+    );
+    expect(button('Plot').getAttribute('aria-pressed')).toBe('true');
+    expect(button('Plot').className).toBe('toggle on');
+  });
+
+  it('leaves Plot out when nothing handles it', () => {
+    render(<Composer conversation={emptyConversation} ready onSend={() => undefined} onStop={() => undefined} />);
+    expect(screen.queryByRole('button', { name: 'Plot' })).toBeNull();
+  });
 });

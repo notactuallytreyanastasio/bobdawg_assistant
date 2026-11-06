@@ -47,7 +47,8 @@ added and 28 removed:</p>
   <li><strong>A hooks engine for the agent.</strong> Rules kept by the harness, rather
     than by the model remembering them.</li>
   <li><strong>A chat page</strong>, served by <code>ds4-server</code> itself, whose
-    conversations go into the same graph.</li>
+    conversations go into the same graph. With Plot on, the model can turn pasted data into a
+    D3 chart that runs in a sandbox beside the chat.</li>
   <li><strong>Serving over a tailnet</strong>, so other machines can use the model
     without opening it to the local network.</li>
   <li><strong>A session recorder</strong>, and a Tetris written to give all of this
@@ -63,6 +64,32 @@ it: the graph records <code>ds4-agent</code> sessions on Qwen3.8 Flash Next behi
 Tetris, the tailnet serving and the first chat page. Later work, including this page, was
 done with Claude Code. A person directed all of it. The commits carry one name, so the
 decision graph is the better record of who did what.</p>
+
+<h2 id="2026-11-06-artifacts">Charts the model writes and the page runs</h2>
+<p><time datetime="2026-11-06">2026-11-06</time></p>
+
+<p>The chat page can now use tools. The first one is a plot assistant: paste something messy,
+and the model writes D3 code for a chart, which runs beside the chat once you press Run. Think
+of Claude's artifacts, for ds4. The first probe called <code>D3.svg().appendTo()</code>, which
+does not exist, so runtime errors go back to the model as the tool's answer and it repairs its
+own code, up to five rounds under one Run. A repair can still end with no chart, and the page
+says so. A chart that ran without errors can also be wrong, so check its numbers.</p>
+
+<p>Running what a model wrote is dangerous on this page in particular. It sits on the same
+origin as an unauthenticated API, and pasted data can carry a prompt injection. So the code
+runs in a sandboxed frame with an opaque origin and a policy allowing no network, and it
+never gets a page of its own. A policy inside a frame does not stop that frame navigating
+itself to an address holding your data; the parent's <code>frame-src 'none'</code> does, and
+that was established by experiment in Chrome rather than assumed.</p>
+
+<p>It does not stop everything. Data embedded in a chart can still leak through DNS and TCP,
+about 28 KB per run by a rough estimate, and the page cannot prevent that. Turning off Chrome's
+Preload pages setting silenced all nine channels tested, but that is each browser's own
+choice, so the Run card says so instead. A chart can also draw fake UI inside its panel,
+links in answers can carry data if clicked, and pasted data reaches the decision graph
+because it is the question. All of this was tested on Chrome desktop only. The
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/blob/main/chat-web/README.md#charts">chat page's README</a>
+has the full list.</p>
 
 <h2 id="2026-11-06-publishing">This page, and rewriting history safely</h2>
 <p><time datetime="2026-11-06">2026-11-06</time></p>

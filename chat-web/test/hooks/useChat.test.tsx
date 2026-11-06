@@ -4,7 +4,12 @@ import { useChat } from '../../src/hooks/useChat';
 import type { FetchLike } from '../../src/api/chatClient';
 import { emptyConversation } from '../../src/chat/conversation';
 import type { Conversation } from '../../src/chat/conversation';
-import { userMessage } from '../../src/chat/message';
+import { toolMessage, assistantMessage, userMessage } from '../../src/chat/message';
+import type { ChatMessage } from '../../src/chat/message';
+import type { ChatConfig } from '../../src/hooks/useChat';
+import type { Assistant } from '../../src/tools/assistant';
+import { MAX_ROUNDS, roundLine } from '../../src/tools/tool';
+import type { ToolResult } from '../../src/tools/tool';
 
 const encoder = new TextEncoder();
 
@@ -341,5 +346,422 @@ describe('useChat', () => {
       view.result.current.send('second');
     });
     expect(view.result.current.conversation.messages[0]?.text).toBe('second');
+  });
+});
+
+describe('the tool loop', () => {
+  type Body = { readonly messages: readonly Record<string, unknown>[]; readonly tools?: unknown };
+
+  const callChunk = (id: string, code = 'draw()') =>
+    `data: ${JSON.stringify({
+      choices: [
+        {
+          delta: { tool_calls: [{ index: 0, id, type: 'function', function: { name: 'plot', arguments: JSON.stringify({ code }) } }] },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    })}\n\n`;
+  const lengthCut = `data: ${JSON.stringify({
+    choices: [
+      {
+        delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'plot', arguments: '{"co' } }] },
+        finish_reason: 'length',
+      },
+    ],
+  })}\n\n`;
+  const finished = `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`;
+
+  // A server that answers each request with the next script, and keeps what it was sent.
+  function scripted(rounds: readonly (readonly string[])[]) {
+    const bodies: Body[] = [];
+    const fetchImpl: FetchLike = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Body);
+      return sseResponse(rounds[bodies.length - 1] ?? [contentChunk('more'), finished, done]);
+    };
+    return { fetchImpl, bodies };
+  }
+
+  type Ran = { readonly code: unknown; readonly messages: readonly ChatMessage[] };
+
+  function assistantOf(run: (args: Readonly<Record<string, unknown>>, signal: AbortSignal) => Promise<ToolResult>) {
+    const ran: Ran[] = [];
+    const assistant: Assistant = {
+      id: 'plot',
+      label: 'Plot',
+      system: 'draw',
+      tools: [
+        {
+          name: 'plot',
+          description: 'd',
+          parameters: {},
+          run: (args, context) => {
+            ran.push({ code: args['code'], messages: context.messages });
+            return run(args, context.signal);
+          },
+        },
+      ],
+    };
+    return { assistant, ran };
+  }
+
+  const good = async (): Promise<ToolResult> => ({ ok: true, text: 'ok: drew 1 svg' });
+  const bad = async (): Promise<ToolResult> => ({ ok: false, text: 'error: D3 is not defined' });
+
+  function mount(config: Partial<ChatConfig> & { readonly fetchImpl: FetchLike }) {
+    const turns: (string | null)[] = [];
+    const view = renderHook(() =>
+      useChat({ ...settings, onTurn: (_conversation, failure) => turns.push(failure), ...config }),
+    );
+    return { view, turns };
+  }
+
+  const settled = async (view: ReturnType<typeof mount>['view']) => {
+    await waitFor(() => expect(view.result.current.conversation.streaming).toBe(false));
+  };
+
+  const shape = (messages: readonly ChatMessage[]) => messages.map((message) => message.role);
+
+  it('sends the prompt and tools, and marks the question as Plot', async () => {
+    const server = scripted([[contentChunk('no chart'), finished, done]]);
+    const { assistant } = assistantOf(good);
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(server.bodies[0]?.messages[0]).toEqual({ role: 'system', content: 'draw' });
+    expect(server.bodies[0]?.tools).toBeDefined();
+    expect(view.result.current.conversation.messages[0]?.plot).toBe(true);
+  });
+
+  it('sends neither without an assistant', async () => {
+    const server = scripted([[contentChunk('hi'), finished, done]]);
+    const { view } = mount({ fetchImpl: server.fetchImpl });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(server.bodies[0]?.tools).toBeUndefined();
+    expect(view.result.current.conversation.messages[0]?.plot).toBe(false);
+  });
+
+  it('does not run a call the server sent to plain chat', async () => {
+    const server = scripted([[callChunk('c1'), done]]);
+    const { view } = mount({ fetchImpl: server.fetchImpl });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(view.result.current.conversation.messages[1]?.calls).toEqual([]);
+  });
+
+  it('runs a call, tells the model, and finishes on its answer', async () => {
+    const server = scripted([[callChunk('c1'), done], [contentChunk('A chart.'), finished, done]]);
+    const { assistant, ran } = assistantOf(good);
+    const { view, turns } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(ran.map((entry) => entry.code)).toEqual(['draw()']);
+    expect(shape(view.result.current.conversation.messages)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+    expect(server.bodies[1]?.messages.slice(-2)).toMatchObject([
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1' }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'Round 1 of 5.\nok: drew 1 svg' },
+    ]);
+    expect(turns).toEqual([null]);
+  });
+
+  it('repairs: a failure goes back and the next code succeeds', async () => {
+    const server = scripted([
+      [callChunk('c1', 'D3.svg()'), done],
+      [callChunk('c2', 'd3.select(root)'), done],
+      [contentChunk('Fixed.'), finished, done],
+    ]);
+    let attempts = 0;
+    const { assistant, ran } = assistantOf(async () => {
+      attempts += 1;
+      return attempts === 1 ? bad() : good();
+    });
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(ran.map((entry) => entry.code)).toEqual(['D3.svg()', 'd3.select(root)']);
+    expect(server.bodies).toHaveLength(3);
+    expect(view.result.current.conversation.messages.at(-1)?.text).toBe('Fixed.');
+    expect(view.result.current.conversation.messages.at(-1)?.ending).toBeNull();
+  });
+
+  it('gives up at the cap, and never asks again', async () => {
+    const server = scripted(Array.from({ length: MAX_ROUNDS + 2 }, (_, index) => [callChunk(`c${index}`), done]));
+    const { assistant, ran } = assistantOf(bad);
+    const { view, turns } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(server.bodies).toHaveLength(MAX_ROUNDS);
+    expect(ran).toHaveLength(MAX_ROUNDS);
+    const messages = view.result.current.conversation.messages;
+    expect(messages.findLast((message) => message.role === 'assistant')?.ending).toBe('gaveup');
+    expect(turns).toEqual([null]);
+  });
+
+  it('says it ran out of rounds at the cap when the last result was ok', async () => {
+    const server = scripted(Array.from({ length: MAX_ROUNDS }, (_, index) => [callChunk(`c${index}`), done]));
+    const { assistant } = assistantOf(good);
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    const messages = view.result.current.conversation.messages;
+    expect(messages.findLast((message) => message.role === 'assistant')?.ending).toBe('capped');
+  });
+
+  it('tells the model each round what it has spent, above anything the code wrote', async () => {
+    const server = scripted(Array.from({ length: MAX_ROUNDS }, (_, index) => [callChunk(`c${index}`), done]));
+    const { assistant } = assistantOf(bad);
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    const answers = view.result.current.conversation.messages.filter((message) => message.role === 'tool');
+    expect(answers.map((message) => message.text.split('\n')[0])).toEqual(
+      answers.map((_, index) => roundLine(index + 1, MAX_ROUNDS)),
+    );
+    expect(answers[0]?.text.split('\n')[1]).toBe('error: D3 is not defined');
+  });
+
+  it('warns the model before its last call, in the request that makes it', async () => {
+    const server = scripted(Array.from({ length: MAX_ROUNDS }, (_, index) => [callChunk(`c${index}`), done]));
+    const { assistant } = assistantOf(bad);
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    const heard = server.bodies.at(-1)?.messages.filter((message) => message['role'] === 'tool').at(-1);
+    expect(String(heard?.['content'])).toContain('your next call is your last');
+  });
+
+  it('gives up when the model goes quiet after a failed attempt', async () => {
+    const server = scripted([[callChunk('c1'), done], [finished, done]]);
+    const { assistant } = assistantOf(bad);
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(view.result.current.conversation.messages.at(-1)?.ending).toBe('gaveup');
+  });
+
+  it('takes the words of a model that explains a failed attempt as its answer', async () => {
+    const server = scripted([[callChunk('c1'), done], [contentChunk('I could not read it.'), finished, done]]);
+    const { assistant } = assistantOf(bad);
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(view.result.current.conversation.messages.at(-1)?.ending).toBeNull();
+  });
+
+  it('never runs a call the length limit cut off', async () => {
+    const server = scripted([[lengthCut, done]]);
+    const { assistant, ran } = assistantOf(good);
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(ran).toEqual([]);
+    expect(view.result.current.conversation.messages.at(-1)?.ending).toBe('length');
+    expect(view.result.current.conversation.messages.at(-1)?.calls).toEqual([]);
+  });
+
+  it('stays streaming while a tool runs, so nothing else can be sent', async () => {
+    const server = scripted([[callChunk('c1'), done], [contentChunk('ok'), finished, done]]);
+    let release: (result: ToolResult) => void = () => undefined;
+    const { assistant } = assistantOf(() => new Promise((resolve) => (release = resolve)));
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await waitFor(() => expect(view.result.current.conversation.messages[1]?.calls).toHaveLength(1));
+    expect(view.result.current.conversation.streaming).toBe(true);
+    act(() => view.result.current.send('another'));
+    expect(view.result.current.conversation.messages.filter((message) => message.role === 'user')).toHaveLength(1);
+    await act(async () => release({ ok: true, text: 'ok' }));
+    await settled(view);
+  });
+
+  it('stop while the model streams a repair ends the turn stopped', async () => {
+    const pending = new Promise<Response>(() => undefined);
+    let requests = 0;
+    const fetchImpl: FetchLike = async (_input, init) => {
+      requests += 1;
+      if (requests === 1) return sseResponse([callChunk('c1'), done]);
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+        void pending;
+      });
+    };
+    const { assistant } = assistantOf(bad);
+    const { view, turns } = mount({ fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await waitFor(() => expect(requests).toBe(2));
+    act(() => view.result.current.stop());
+    await settled(view);
+    expect(shape(view.result.current.conversation.messages)).toEqual(['user', 'assistant', 'tool']);
+    expect(view.result.current.conversation.messages[1]?.ending).toBe('stopped');
+    expect(turns).toEqual([null]);
+  });
+
+  it('stop at the Run prompt writes the result and ends, with the pair complete', async () => {
+    const server = scripted([[callChunk('c1'), done]]);
+    // A tool that waits for a grant which never comes, as the runner does.
+    const { assistant } = assistantOf((_args, signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new Error('declined')));
+    }));
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await waitFor(() => expect(view.result.current.conversation.messages[1]?.calls).toHaveLength(1));
+    act(() => view.result.current.stop());
+    await settled(view);
+    const messages = view.result.current.conversation.messages;
+    expect(messages.at(-1)).toMatchObject({ role: 'tool', text: 'stopped by the reader', result: { callId: 'c1', ok: false } });
+    expect(messages[1]?.ending).toBe('stopped');
+    expect(server.bodies).toHaveLength(1);
+  });
+
+  it('stop while running does the same, and asks the model nothing more', async () => {
+    const server = scripted([[callChunk('c1'), done]]);
+    const { assistant } = assistantOf(() => new Promise(() => undefined));
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await waitFor(() => expect(view.result.current.conversation.messages[1]?.calls).toHaveLength(1));
+    act(() => view.result.current.stop());
+    await settled(view);
+    expect(view.result.current.conversation.messages.at(-1)?.result?.ok).toBe(false);
+    expect(server.bodies).toHaveLength(1);
+  });
+
+  it.each(['reset', 'load'] as const)('%s mid-tool drops the turn silently', async (how) => {
+    const server = scripted([[callChunk('c1'), done]]);
+    let release: (result: ToolResult) => void = () => undefined;
+    const { assistant } = assistantOf(() => new Promise((resolve) => (release = resolve)));
+    const { view, turns } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await waitFor(() => expect(view.result.current.conversation.messages[1]?.calls).toHaveLength(1));
+    act(() => (how === 'reset' ? view.result.current.reset() : view.result.current.load([userMessage('u9', 'other')])));
+    await act(async () => release({ ok: true, text: 'late' }));
+    const messages = view.result.current.conversation.messages;
+    expect(messages.some((message) => message.role === 'tool')).toBe(false);
+    expect(view.result.current.conversation.streaming).toBe(false);
+    expect(turns).toEqual([]);
+    expect(server.bodies).toHaveLength(1);
+  });
+
+  it('a failure in round two keeps the first round standing', async () => {
+    let requests = 0;
+    const fetchImpl: FetchLike = async () => {
+      requests += 1;
+      if (requests === 1) return sseResponse([callChunk('c1'), done]);
+      throw new Error('server gone');
+    };
+    const { assistant } = assistantOf(good);
+    const { view, turns } = mount({ fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(view.result.current.conversation.error).toBe('server gone');
+    expect(shape(view.result.current.conversation.messages)).toEqual(['user', 'assistant', 'tool']);
+    expect(turns).toEqual(['server gone']);
+  });
+
+  it('a fatal result ends the turn as gave up, with a banner, and no repair', async () => {
+    const server = scripted([[callChunk('c1'), done]]);
+    const { assistant } = assistantOf(async () => ({ ok: false, text: 'it left', fatal: true }));
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(view.result.current.conversation.messages[1]?.ending).toBe('gaveup');
+    expect(view.result.current.conversation.error).toBe('it left');
+    expect(server.bodies).toHaveLength(1);
+  });
+
+  it('answers the other calls in a round after a fatal one without running them', async () => {
+    const two = `data: ${JSON.stringify({
+      choices: [
+        {
+          delta: {
+            tool_calls: [
+              { index: 0, id: 'c1', function: { name: 'plot', arguments: '{"code":"a"}' } },
+              { index: 1, id: 'c2', function: { name: 'plot', arguments: '{"code":"b"}' } },
+            ],
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    })}\n\n`;
+    const server = scripted([[two, done]]);
+    const { assistant, ran } = assistantOf(async () => ({ ok: false, text: 'it left', fatal: true }));
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(ran).toHaveLength(1);
+    const results = view.result.current.conversation.messages.filter((message) => message.role === 'tool');
+    expect(results.map((message) => message.result?.callId)).toEqual(['c1', 'c2']);
+  });
+
+  // A round is one call. Otherwise a reply holding sixty calls runs sixty programs under one
+  // Run, and the cap on rounds caps nothing.
+  it('runs one call in a round and answers the rest without running them', async () => {
+    const many = `data: ${JSON.stringify({
+      choices: [
+        {
+          delta: {
+            tool_calls: Array.from({ length: 60 }, (_, index) => ({
+              index,
+              id: `c${index}`,
+              function: { name: 'plot', arguments: '{"code":"a"}' },
+            })),
+          },
+          finish_reason: 'tool_calls',
+        },
+      ],
+    })}\n\n`;
+    const server = scripted([[many, done], [contentChunk('drawn'), done]]);
+    const { assistant, ran } = assistantOf(async () => ({ ok: true, text: 'ok: drew 1 svg' }));
+    const { view } = mount({ fetchImpl: server.fetchImpl, assistant });
+    act(() => view.result.current.send('data'));
+    await settled(view);
+    expect(ran).toHaveLength(1);
+    const results = view.result.current.conversation.messages.filter((message) => message.role === 'tool');
+    expect(results).toHaveLength(60);
+    expect(results[0]?.result?.ok).toBe(true);
+    expect(results[1]?.text).toContain('not run');
+    // What the round comes to is the call that ran, so the rest cannot read as a failed chart.
+    expect(view.result.current.conversation.messages.at(-1)?.ending).toBeNull();
+  });
+
+  it('replays an old call on a later turn, with no tools', async () => {
+    const server = scripted([[contentChunk('sure'), finished, done]]);
+    const saved: readonly ChatMessage[] = [
+      userMessage('u1', 'data', true),
+      { ...assistantMessage('a1'), calls: [{ id: 'c1', name: 'plot', arguments: '{"code":  "x"}' }] },
+      toolMessage('t1', 'c1', true, 'ok'),
+      { ...assistantMessage('a2'), text: 'A chart.' },
+    ];
+    const { view } = mount({ fetchImpl: server.fetchImpl, initialMessages: saved });
+    act(() => view.result.current.send('make it a line chart'));
+    await settled(view);
+    const roles = server.bodies[0]?.messages.map((message) => message['role']);
+    expect(roles).toEqual(['user', 'assistant', 'tool', 'assistant', 'user']);
+    expect(JSON.stringify(server.bodies[0]?.messages[1])).toContain(String.raw`{\"code\":  \"x\"}`);
+    expect(server.bodies[0]?.tools).toBeUndefined();
+  });
+
+  it('says when a turn begins, once per turn', async () => {
+    const server = scripted([[contentChunk('a'), finished, done], [contentChunk('b'), finished, done]]);
+    let began = 0;
+    const { view } = mount({ fetchImpl: server.fetchImpl, onBegin: () => (began += 1) });
+    act(() => view.result.current.send('one'));
+    await settled(view);
+    act(() => view.result.current.retry());
+    await settled(view);
+    expect(began).toBe(2);
+  });
+
+  it('retries with the Plot setting of the moment', async () => {
+    const server = scripted([[contentChunk('a'), finished, done], [contentChunk('b'), finished, done]]);
+    const { assistant } = assistantOf(good);
+    const view = renderHook((props: { readonly on: boolean }) =>
+      useChat({ ...settings, fetchImpl: server.fetchImpl, assistant: props.on ? assistant : null }), {
+      initialProps: { on: false },
+    });
+    act(() => view.result.current.send('data'));
+    await waitFor(() => expect(view.result.current.conversation.streaming).toBe(false));
+    view.rerender({ on: true });
+    act(() => view.result.current.retry());
+    await waitFor(() => expect(view.result.current.conversation.streaming).toBe(false));
+    expect(view.result.current.conversation.messages[0]?.plot).toBe(true);
   });
 });

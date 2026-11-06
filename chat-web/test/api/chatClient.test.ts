@@ -326,7 +326,7 @@ describe('streamChat failures', () => {
     });
 
     streamController.enqueue(chunkOf(contentChunk('partial ')));
-    await expect(promise).resolves.toEqual({ finish: null, usage: null, stopped: true });
+    await expect(promise).resolves.toEqual({ finish: null, usage: null, stopped: true, calls: [] });
     expect(texts).toEqual(['partial ']);
   });
 
@@ -372,6 +372,7 @@ describe('streamChat outcome', () => {
       finish: 'length',
       usage: { promptTokens: 12, completionTokens: 30 },
       stopped: false,
+      calls: [],
     });
   });
 
@@ -389,5 +390,93 @@ describe('streamChat outcome', () => {
     expect(buildChatRequest('m', [], false).chat_template_kwargs).toEqual({ enable_thinking: false });
     expect(buildChatRequest('m', [], true).chat_template_kwargs).toEqual({ enable_thinking: true });
     expect(buildChatRequest('m', []).chat_template_kwargs).toBeUndefined();
+  });
+});
+
+describe('tools on the wire', () => {
+  const asked = [userMessage('u1', 'chart this')];
+  const tools = [{ type: 'function', function: { name: 'plot', description: 'd', parameters: {} } }] as const;
+
+  it('puts the system prompt first, on the wire only', () => {
+    const request = buildChatRequest('m', asked, undefined, { system: 'be a plotter', tools });
+    expect(request.messages[0]).toEqual({ role: 'system', content: 'be a plotter' });
+    expect(request.messages).toHaveLength(2);
+    expect(asked).toHaveLength(1);
+    expect(request.tools).toEqual(tools);
+  });
+
+  it('sends neither without an assistant, and leaves tool_choice unset', () => {
+    const request = buildChatRequest('m', asked);
+    expect(request.tools).toBeUndefined();
+    expect(request.messages).toHaveLength(1);
+    const tooled = buildChatRequest('m', asked, undefined, { system: 's', tools });
+    expect(JSON.stringify(tooled)).not.toContain('tool_choice');
+  });
+
+  it('applies the clip', () => {
+    const request = buildChatRequest('m', [userMessage('u1', 'long', true)], undefined, {
+      system: 's',
+      tools,
+      clip: () => 'short',
+    });
+    expect(request.messages[1]?.content).toBe('short');
+  });
+
+  function toolStream(payloads: readonly object[]): FetchLike {
+    const text = payloads.map((payload) => `data: ${JSON.stringify(payload)}\n\n`).join('') + 'data: [DONE]';
+    return async () => new Response(new TextEncoder().encode(text));
+  }
+
+  const run = (fetchImpl: FetchLike, onDelta: (delta: { text: string }) => void = () => undefined) =>
+    streamChat({ model: 'm', messages: asked, origin: '', fetchImpl, onDelta });
+
+  it('brings the calls back with the outcome', async () => {
+    const outcome = await run(
+      toolStream([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'plot', arguments: '{"co' } }] } }] },
+        { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'de":"x"}' } }] } }] },
+        { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+        { choices: [], usage: { prompt_tokens: 3, completion_tokens: 4 } },
+      ]),
+    );
+    expect(outcome).toEqual({
+      finish: 'tool_calls',
+      usage: { promptTokens: 3, completionTokens: 4 },
+      stopped: false,
+      calls: [{ id: 'c1', name: 'plot', arguments: '{"code":"x"}' }],
+    });
+  });
+
+  it('still reads content that shares a chunk with a call', async () => {
+    const texts: string[] = [];
+    const outcome = await run(
+      toolStream([
+        {
+          choices: [
+            {
+              delta: { content: 'Drawing.', tool_calls: [{ index: 0, id: 'c1', function: { name: 'plot', arguments: '{}' } }] },
+              finish_reason: 'tool_calls',
+            },
+          ],
+        },
+      ]),
+      (delta) => texts.push(delta.text),
+    );
+    expect(texts).toEqual(['Drawing.']);
+    expect(outcome.calls).toHaveLength(1);
+  });
+
+  it('gives each call with no id its own, from the caller when it has a sequence', async () => {
+    const outcome = await streamChat({
+      model: 'm',
+      messages: asked,
+      origin: '',
+      fetchImpl: toolStream([
+        { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'plot', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] },
+      ]),
+      onDelta: () => undefined,
+      nextCallId: () => 'made-here',
+    });
+    expect(outcome.calls[0]?.id).toBe('made-here');
   });
 });

@@ -2,7 +2,7 @@ import { userEvent } from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { Transcript } from '../../src/components/Transcript';
-import { assistantMessage, userMessage } from '../../src/chat/message';
+import { assistantMessage, toolMessage, userMessage } from '../../src/chat/message';
 import type { ChatMessage } from '../../src/chat/message';
 import type { Conversation } from '../../src/chat/conversation';
 
@@ -171,6 +171,111 @@ describe('Transcript', () => {
     );
     expect(screen.queryByRole('button', { name: 'Copy' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+  });
+});
+
+describe('Transcript with charts', () => {
+  const code = '// title: Loaves\ndraw()';
+  const asked = userMessage('u1', 'chart this', true);
+  const calling = {
+    ...assistantMessage('a1'),
+    calls: [{ id: 'c1', name: 'plot', arguments: JSON.stringify({ code }) }],
+  };
+  const drew = toolMessage('t1', 'c1', true, 'ok: drew 1 svg');
+  const threw = toolMessage('t1', 'c1', false, 'error: the code threw');
+  const streaming = (messages: readonly ChatMessage[]): Conversation => ({ messages, streaming: true, error: null });
+
+  it('renders tool messages as nothing', () => {
+    render(<Transcript conversation={finished([asked, calling, drew])} />);
+    expect(screen.queryByText('ok: drew 1 svg')).toBeNull();
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+  });
+
+  it('shows a card per call, by title, and opens it', async () => {
+    const user = userEvent.setup();
+    const onOpen = vi.fn();
+    render(<Transcript conversation={finished([asked, calling, drew])} onOpen={onOpen} />);
+    expect(screen.getByText('Ran without errors').textContent).toBe('Ran without errors');
+    await user.click(screen.getByRole('button', { name: /Loaves/ }));
+    expect(onOpen).toHaveBeenCalledWith('a1/c1');
+  });
+
+  it('asks before running, and names the risk', async () => {
+    const user = userEvent.setup();
+    const onRun = vi.fn();
+    const onCode = vi.fn();
+    render(
+      <Transcript
+        conversation={streaming([asked, calling])}
+        pending={{ callId: 'c1', chars: 1234, withheld: 0 }}
+        onRun={onRun}
+        onCode={onCode}
+      />,
+    );
+    screen.getByText(/This code will run with the 1234 characters you sent with Plot on/);
+    await user.click(screen.getByRole('button', { name: 'Run' }));
+    await user.click(screen.getByRole('button', { name: 'Code' }));
+    expect(onRun).toHaveBeenCalledOnce();
+    expect(onCode).toHaveBeenCalledWith('c1');
+    expect(screen.getByRole('status').textContent).toContain('waiting for you to run it');
+  });
+
+  it('says at the Run card what was sent with Plot off', () => {
+    render(<Transcript conversation={streaming([asked, calling])} pending={{ callId: 'c1', chars: 9, withheld: 2 }} />);
+    screen.getByText(/Your 2 earlier messages sent with Plot off are not given to the chart/);
+  });
+
+  it('says a turn ran out of rounds, and does not call it giving up', () => {
+    render(<Transcript conversation={finished([asked, { ...calling, ending: 'capped' }, drew])} />);
+    screen.getByText(/Out of rounds/);
+    expect(screen.queryByText('Gave up')).toBeNull();
+  });
+
+  it('offers no Run on a card that is not waiting', () => {
+    render(<Transcript conversation={finished([asked, calling, drew])} pending={null} />);
+    expect(screen.queryByRole('button', { name: 'Run' })).toBeNull();
+  });
+
+  it('says the code is running, and that it is being fixed', () => {
+    const view = render(<Transcript conversation={streaming([asked, calling])} />);
+    expect(screen.getByRole('status').textContent).toContain('running the code');
+    view.rerender(<Transcript conversation={streaming([asked, calling, threw, assistantMessage('a2')])} />);
+    expect(screen.getByRole('status').textContent).toContain('fixing the code');
+  });
+
+  it('folds a failed attempt away', () => {
+    const { container } = render(<Transcript conversation={finished([asked, calling, threw])} />);
+    const fold = container.querySelector('details.reasoning');
+    expect(fold?.textContent).toContain('Attempt that did not work');
+    expect(fold?.textContent).toContain('Loaves');
+    expect(fold?.textContent).toContain('error: the code threw');
+    expect(fold?.hasAttribute('open')).toBe(false);
+  });
+
+  it('names the model once across the rounds of a turn', () => {
+    const closing = { ...assistantMessage('a2'), text: 'Saturdays lead.' };
+    render(<Transcript conversation={finished([asked, calling, drew, closing])} />);
+    expect(screen.getAllByText('Model')).toHaveLength(1);
+  });
+
+  it('offers Retry on a turn that ended on a tool message', () => {
+    render(
+      <Transcript
+        conversation={finished([asked, { ...calling, ending: 'gaveup' as const }, threw])}
+        onRetry={() => undefined}
+      />,
+    );
+    expect(screen.getAllByRole('button', { name: 'Retry' })).toHaveLength(1);
+    expect(screen.getByText('Gave up').textContent).toBe('Gave up');
+  });
+
+  it('renders a hostile title as text', () => {
+    const hostile = {
+      ...calling,
+      calls: [{ id: 'c1', name: 'plot', arguments: JSON.stringify({ code: '// title: <img src=x onerror=alert(1)>' }) }],
+    };
+    const { container } = render(<Transcript conversation={finished([asked, hostile, drew])} />);
+    expect(container.querySelector('img')).toBeNull();
   });
 
   describe('the thinking box', () => {

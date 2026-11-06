@@ -1,10 +1,13 @@
 // Saved conversations as plain data: what a saved chat is, how it gets its title, and how
 // a stored value that may be old or damaged is read back. Storage itself is one file over.
 
-import type { ChatMessage, Ending, Role, TurnStats } from './message';
+import type { ChatMessage, Ending, Role, ToolCall, ToolOutcome, TurnStats } from './message';
 
 export const MAX_CHATS = 100;
 const TITLE_LENGTH = 60;
+// Past this a saved call is more likely damage than a chart, and storage is only a few
+// megabytes for every chat there is.
+export const MAX_SAVED_ARGUMENTS = 256 * 1024;
 
 export type SavedChat = {
   readonly id: string;
@@ -24,7 +27,12 @@ export const emptyLibrary: Library = { activeId: null, chats: [] };
 // An answer that never received a word is a placeholder of the moment, not something to
 // reopen later.
 function worthKeeping(message: ChatMessage): boolean {
-  return message.role === 'user' || message.text !== '' || message.reasoning !== '';
+  return (
+    message.role !== 'assistant' ||
+    message.text !== '' ||
+    message.reasoning !== '' ||
+    message.calls.length > 0
+  );
 }
 
 export function titleOf(messages: readonly ChatMessage[]): string {
@@ -32,6 +40,21 @@ export function titleOf(messages: readonly ChatMessage[]): string {
   const line = question.trim().split('\n')[0]?.trim() ?? '';
   if (line === '') return 'New chat';
   return line.length <= TITLE_LENGTH ? line : `${line.slice(0, TITLE_LENGTH - 1).trimEnd()}…`;
+}
+
+function sameCalls(a: readonly ToolCall[], b: readonly ToolCall[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((call, index) => {
+      const other = b[index];
+      return (
+        other !== undefined &&
+        call.id === other.id &&
+        call.name === other.name &&
+        call.arguments === other.arguments
+      );
+    })
+  );
 }
 
 function sameTranscript(a: readonly ChatMessage[], b: readonly ChatMessage[]): boolean {
@@ -44,7 +67,11 @@ function sameTranscript(a: readonly ChatMessage[], b: readonly ChatMessage[]): b
         message.role === other.role &&
         message.text === other.text &&
         message.reasoning === other.reasoning &&
-        message.ending === other.ending
+        message.ending === other.ending &&
+        message.plot === other.plot &&
+        message.result?.callId === other.result?.callId &&
+        message.result?.ok === other.result?.ok &&
+        sameCalls(message.calls, other.calls)
       );
     })
   );
@@ -99,7 +126,27 @@ function statsOf(value: unknown): TurnStats | null {
 }
 
 function endingOf(value: unknown): Ending | null {
-  return value === 'stopped' || value === 'length' ? value : null;
+  return value === 'stopped' || value === 'length' || value === 'gaveup' || value === 'capped' ? value : null;
+}
+
+function callOf(value: unknown): ToolCall | null {
+  const call = record(value);
+  if (call === null) return null;
+  const { id, name, arguments: raw } = call;
+  if (typeof id !== 'string' || typeof name !== 'string' || typeof raw !== 'string') return null;
+  return raw.length > MAX_SAVED_ARGUMENTS ? null : { id, name, arguments: raw };
+}
+
+function callsOf(value: unknown): readonly ToolCall[] {
+  if (!Array.isArray(value)) return [];
+  return (value as readonly unknown[]).map(callOf).filter((call) => call !== null);
+}
+
+function resultOf(value: unknown): ToolOutcome | null {
+  const result = record(value);
+  if (result === null) return null;
+  const { callId, ok } = result;
+  return typeof callId === 'string' && typeof ok === 'boolean' ? { callId, ok } : null;
 }
 
 function messageOf(value: unknown): ChatMessage | null {
@@ -107,7 +154,9 @@ function messageOf(value: unknown): ChatMessage | null {
   if (message === null) return null;
   const { id, role, text, reasoning } = message;
   if (typeof id !== 'string' || typeof text !== 'string') return null;
-  if (role !== 'user' && role !== 'assistant') return null;
+  if (role !== 'user' && role !== 'assistant' && role !== 'tool') return null;
+  const result = resultOf(message['result']);
+  if (role === 'tool' && result === null) return null;
   return {
     id,
     role: role satisfies Role,
@@ -115,6 +164,9 @@ function messageOf(value: unknown): ChatMessage | null {
     reasoning: typeof reasoning === 'string' ? reasoning : '',
     ending: endingOf(message['ending']),
     stats: statsOf(message['stats']),
+    calls: callsOf(message['calls']),
+    result,
+    plot: message['plot'] === true,
   };
 }
 

@@ -826,6 +826,230 @@ button:disabled {
   }
 }
 
+/* Charts: the card in the transcript, and the panel beside it */
+
+.card {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.open-chart {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  font-size: 14px;
+}
+
+.open-chart .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.state {
+  color: var(--dim);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.consent {
+  margin: 8px 0;
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.choices {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.run {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 14px 4px 10px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 14px;
+}
+
+.run:disabled {
+  opacity: 0.45;
+}
+
+/* Closed, the panel takes no room. It is never unmounted, because the frame's slot is in it. */
+.panel {
+  display: none;
+  width: clamp(360px, 46vw, 760px);
+  height: 100dvh;
+  flex: none;
+  flex-direction: column;
+  border-left: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.panel.open,
+.panel.checking {
+  display: flex;
+}
+
+/* A check draws out of sight, but inside the viewport: a frame off screen is throttled, and
+   its timers would look like a hang. The reveal is this class going away, so the same frame
+   carries on without loading twice. */
+.panel.checking {
+  position: fixed;
+  left: 0;
+  top: 0;
+  opacity: 0;
+  z-index: -1;
+  pointer-events: none;
+}
+
+.panel.full {
+  position: fixed;
+  inset: 0;
+  z-index: 3;
+  width: auto;
+  border-left: 0;
+}
+
+.panel-head {
+  padding: 10px 14px 6px;
+}
+
+.panel-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.panel-title b {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.panel-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.tab.on {
+  background: var(--raised);
+  color: var(--fg);
+}
+
+.square {
+  padding: 5px;
+  border-radius: 8px;
+  color: var(--dim);
+  line-height: 0;
+}
+
+.square:hover:enabled {
+  background: var(--raised);
+  color: var(--fg);
+}
+
+.square:disabled {
+  opacity: 0.35;
+}
+
+.panel-notice,
+.panel-ended {
+  margin: 0;
+  padding: 4px 14px;
+  color: var(--dim);
+  font-size: 12.5px;
+}
+
+.panel-ended.bad {
+  color: var(--danger);
+}
+
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 14px 14px;
+}
+
+/* Out of view and still running: this tab is a look at the code, not a stop. */
+.panel-body.behind {
+  flex: none;
+  height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.artifact-frame {
+  display: block;
+  width: 100%;
+  min-height: 120px;
+  border: 0;
+}
+
+.placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--dim);
+  font-size: 13.5px;
+}
+
+.placeholder p {
+  margin: 0;
+}
+
+.panel-code {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 14px;
+  background: var(--code-bg);
+  font: 13px/1.5 var(--mono);
+}
+
+/* A tablet: beside the sidebar the panel would leave the chat too narrow for its controls */
+
+@media (max-width: 1100px) {
+  .panel.open {
+    position: fixed;
+    inset: 0;
+    z-index: 3;
+    width: auto;
+    border-left: 0;
+  }
+}
+
 /* A phone: the chats become a drawer */
 
 @media (max-width: 800px) {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { emptyLibrary, saveChat } from '../../src/chat/library';
 import { userMessage } from '../../src/chat/message';
-import { loadLibrary, loadThinking, saveLibrary, saveThinking } from '../../src/chat/storage';
+import { loadLibrary, loadPlot, loadThinking, saveLibrary, savePlot, saveThinking } from '../../src/chat/storage';
 import type { StoreLike } from '../../src/chat/storage';
 
 function memoryStore(): StoreLike {
@@ -61,5 +61,21 @@ describe('storage', () => {
     expect(loadThinking(broken)).toBe(true);
     expect(loadLibrary(null)).toEqual(emptyLibrary);
     expect(saveThinking(null, true)).toBe(false);
+  });
+});
+
+describe('the Plot toggle', () => {
+  it('is off until it was turned on', () => {
+    const store = memoryStore();
+    expect(loadPlot(store)).toBe(false);
+    expect(savePlot(store, true)).toBe(true);
+    expect(loadPlot(store)).toBe(true);
+    savePlot(store, false);
+    expect(loadPlot(store)).toBe(false);
+  });
+
+  it('stays off without storage', () => {
+    expect(loadPlot(null)).toBe(false);
+    expect(savePlot(null, true)).toBe(false);
   });
 });

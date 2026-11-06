@@ -2,9 +2,10 @@
 // tests and defaults to the platform one, so the request shape, the stream
 // parsing and the failures are all checked without a server.
 
-import { toWireMessages } from '../chat/message';
-import type { ChatMessage, WireMessage } from '../chat/message';
+import { idSequence, toWireMessages } from '../chat/message';
+import type { ChatMessage, ToolCall, WireMessage } from '../chat/message';
 import { createSseScanner } from './sse';
+import { createCallCollector } from './toolCalls';
 import type { DeltaChannel } from '../chat/conversation';
 
 export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
@@ -20,6 +21,24 @@ export type ChatRequest = {
   readonly stream: true;
   readonly stream_options: { readonly include_usage: true };
   readonly chat_template_kwargs?: { readonly enable_thinking: boolean };
+  readonly tools?: readonly WireTool[];
+};
+
+export type WireTool = {
+  readonly type: 'function';
+  readonly function: {
+    readonly name: string;
+    readonly description: string;
+    readonly parameters: Readonly<Record<string, unknown>>;
+  };
+};
+
+// What an assistant adds to a request. None of it lives in the transcript: the prompt and
+// the tool list belong to the request, so a chat saved with them replays without them.
+export type Tooling = {
+  readonly system: string;
+  readonly tools: readonly WireTool[];
+  readonly clip?: (text: string) => string;
 };
 
 export type Usage = {
@@ -33,6 +52,7 @@ export type StreamOutcome = {
   readonly finish: string | null;
   readonly usage: Usage | null;
   readonly stopped: boolean;
+  readonly calls: readonly ToolCall[];
 };
 
 export type ChatStreamOptions = {
@@ -42,6 +62,8 @@ export type ChatStreamOptions = {
   readonly signal?: AbortSignal;
   readonly fetchImpl?: FetchLike;
   readonly thinking?: boolean;
+  readonly tooling?: Tooling;
+  readonly nextCallId?: () => string;
   readonly onDelta: (delta: Delta) => void;
 };
 
@@ -68,6 +90,7 @@ type Chunk = {
     readonly delta?: {
       readonly content?: unknown;
       readonly reasoning_content?: unknown;
+      readonly tool_calls?: unknown;
     };
     readonly finish_reason?: unknown;
   }[];
@@ -84,12 +107,15 @@ export function buildChatRequest(
   model: string,
   messages: readonly ChatMessage[],
   thinking?: boolean,
+  tooling?: Tooling,
 ): ChatRequest {
+  const wire = toWireMessages(messages, tooling?.clip);
   const request: ChatRequest = {
     model,
-    messages: toWireMessages(messages),
+    messages: tooling === undefined ? wire : [{ role: 'system', content: tooling.system }, ...wire],
     stream: true,
     stream_options: { include_usage: true },
+    ...(tooling === undefined ? {} : { tools: tooling.tools }),
   };
   return thinking === undefined
     ? request
@@ -168,10 +194,17 @@ function serverMessageOf(body: string): string | null {
 
 export async function streamChat(options: ChatStreamOptions): Promise<StreamOutcome> {
   const send = options.fetchImpl ?? platformFetch;
-  const request = buildChatRequest(options.model, options.messages, options.thinking);
+  const request = buildChatRequest(options.model, options.messages, options.thinking, options.tooling);
   let finish: string | null = null;
   let usage: Usage | null = null;
-  const outcome = (stopped: boolean): StreamOutcome => ({ finish, usage, stopped });
+  const collector = createCallCollector(options.nextCallId ?? idSequence('call-'));
+  // A call that was still arriving when the reader stopped is only half a call.
+  const outcome = (stopped: boolean): StreamOutcome => ({
+    finish,
+    usage,
+    stopped,
+    calls: stopped ? [] : collector.calls(),
+  });
 
   let response: Response;
   try {
@@ -207,6 +240,7 @@ export async function streamChat(options: ChatStreamOptions): Promise<StreamOutc
     if (chunk === null) return true;
     const delta = deltaOf(chunk);
     if (delta !== null) options.onDelta(delta);
+    collector.push(chunk.choices?.[0]?.delta?.tool_calls);
     finish = textOf(chunk.choices?.[0]?.finish_reason) ?? finish;
     usage = usageOf(chunk) ?? usage;
     return true;
