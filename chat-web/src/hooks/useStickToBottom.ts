@@ -1,6 +1,6 @@
-// Following a growing transcript without fighting the reader. The view stays on the newest
-// text while it is at the bottom; scrolling up lets go, and it takes a new question or the
-// jump button to hold on again.
+// Following growing text without fighting the reader, for the transcript and for the thinking
+// box inside it. The view stays on the newest text while it is at the bottom; scrolling up
+// lets go, and it takes a new question or a jump to hold on again.
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { RefObject } from 'react';

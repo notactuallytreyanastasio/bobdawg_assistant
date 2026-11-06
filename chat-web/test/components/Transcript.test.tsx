@@ -1,6 +1,6 @@
 import { userEvent } from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { Transcript } from '../../src/components/Transcript';
 import { assistantMessage, userMessage } from '../../src/chat/message';
 import type { ChatMessage } from '../../src/chat/message';
@@ -171,5 +171,55 @@ describe('Transcript', () => {
     );
     expect(screen.queryByRole('button', { name: 'Copy' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+  });
+
+  describe('the thinking box', () => {
+    const thinking = (reasoning: string, streaming = true): Conversation => ({
+      messages: [{ ...assistantMessage('a1'), reasoning }],
+      streaming,
+      error: null,
+    });
+
+    function open(container: HTMLElement): { fold: HTMLDetailsElement; box: HTMLElement } {
+      const fold = container.querySelector<HTMLDetailsElement>('details.reasoning');
+      const box = container.querySelector<HTMLElement>('details.reasoning .pre');
+      if (fold === null || box === null) throw new Error('no thinking box');
+      Object.defineProperty(box, 'scrollHeight', { value: 900, configurable: true });
+      Object.defineProperty(box, 'clientHeight', { value: 300, configurable: true });
+      fold.open = true;
+      fireEvent(fold, new Event('toggle'));
+      return { fold, box };
+    }
+
+    it('starts at the newest line when opened while the model thinks', () => {
+      const { container } = render(<Transcript conversation={thinking('hm')} />);
+      expect(open(container).box.scrollTop).toBe(900);
+    });
+
+    it('follows the thinking as it grows', () => {
+      const view = render(<Transcript conversation={thinking('hm')} />);
+      const { box } = open(view.container);
+      Object.defineProperty(box, 'scrollHeight', { value: 1200, configurable: true });
+
+      view.rerender(<Transcript conversation={thinking('hm, more')} />);
+
+      expect(box.scrollTop).toBe(1200);
+    });
+
+    it('leaves a reader who scrolled up where they are', () => {
+      const view = render(<Transcript conversation={thinking('hm')} />);
+      const { box } = open(view.container);
+      box.scrollTop = 100;
+      fireEvent.scroll(box);
+
+      view.rerender(<Transcript conversation={thinking('hm, more')} />);
+
+      expect(box.scrollTop).toBe(100);
+    });
+
+    it('starts at the top when opened after the thinking is done', () => {
+      const { container } = render(<Transcript conversation={thinking('hm', false)} />);
+      expect(open(container).box.scrollTop).toBe(0);
+    });
   });
 });

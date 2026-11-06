@@ -52,10 +52,21 @@ function Thinking({ message, live }: { message: ChatMessage; live: boolean }) {
     : thought === null || thought <= 0
       ? 'Thinking'
       : `Thought for ${formatDuration(thought)}`;
+  // The box scrolls on its own once it is full, so it follows the thinking the way the
+  // transcript follows the answer. Opened while the model is thinking, it starts at the newest
+  // line; opened afterwards, it starts at the top, where a reader begins.
+  const view = useStickToBottom(message.reasoning.length, null);
   return (
-    <details className="reasoning">
+    <details
+      className="reasoning"
+      onToggle={(event) => {
+        if (live && event.currentTarget.open) view.jump();
+      }}
+    >
       <summary>{label}</summary>
-      <p className="pre">{message.reasoning}</p>
+      <div className="pre" ref={view.scroller} onScroll={view.onScroll}>
+        {message.reasoning}
+      </div>
     </details>
   );
 }
