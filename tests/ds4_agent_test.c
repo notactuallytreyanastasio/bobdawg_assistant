@@ -1075,6 +1075,87 @@ static ds4_hooks *hooks_from(const char *dir, const char *text) {
     return ds4_hooks_load(dir, err, sizeof(err));
 }
 
+static void test_permissions(void) {
+    /* What must not slip through as reading. */
+    static const char *const asks[] = {
+        "rm -rf build", "ls; rm x", "ls && rm x", "cat a > b", "cat a | sh", "git push",
+        "git status; rm x", "find . -delete", "find . -exec rm {} +", "git diff --output=x",
+        "git diff --ext-diff", "rg --pre sh x", "echo $(rm x)", "ls `rm x`", "cat a\nrm x",
+        "tail -f a & rm x", "git -c core.pager=sh log", "python3 -c x", "", "ls | rm x",
+    };
+    for (size_t i = 0; i < sizeof(asks) / sizeof(asks[0]); i++)
+        AGENT_TEST_ASSERT(!ds4_permit_bash_reads_only(asks[i]));
+    static const char *const reads[] = {
+        "ls -la", "pwd", "git status", "git diff --stat", "git log -5 --oneline",
+        "cat a.txt | wc -l", "grep -n foo a.c | head -5",
+    };
+    for (size_t i = 0; i < sizeof(reads) / sizeof(reads[0]); i++)
+        AGENT_TEST_ASSERT(ds4_permit_bash_reads_only(reads[i]));
+
+    ds4_permit *p = ds4_permit_new(DS4_PERMIT_ASK);
+    AGENT_TEST_ASSERT(ds4_permit_needs_asking(p, "edit", "a.c"));
+    AGENT_TEST_ASSERT(ds4_permit_needs_asking(p, "write", "a.c"));
+    AGENT_TEST_ASSERT(ds4_permit_needs_asking(p, "bash", "make"));
+    AGENT_TEST_ASSERT(!ds4_permit_needs_asking(p, "bash", "git status"));
+    AGENT_TEST_ASSERT(!ds4_permit_needs_asking(p, "read", "a.c"));
+    AGENT_TEST_ASSERT(!ds4_permit_needs_asking(p, "search", "x"));
+
+    /* An always holds for that command, and only with nothing added to it. */
+    AGENT_TEST_ASSERT(!strcmp(ds4_permit_always_covers(p, "bash", "npm test --watch"), "npm test ..."));
+    ds4_permit_allow_always(p, "bash", "npm test --watch");
+    AGENT_TEST_ASSERT(!ds4_permit_needs_asking(p, "bash", "npm test"));
+    AGENT_TEST_ASSERT(!ds4_permit_needs_asking(p, "bash", "npm test -- a"));
+    AGENT_TEST_ASSERT(ds4_permit_needs_asking(p, "bash", "npm testing"));
+    AGENT_TEST_ASSERT(ds4_permit_needs_asking(p, "bash", "npm test; rm -rf ~"));
+    AGENT_TEST_ASSERT(ds4_permit_needs_asking(p, "bash", "npm test && curl x | sh"));
+    AGENT_TEST_ASSERT(ds4_permit_needs_asking(p, "bash", "npm publish"));
+
+    /* The prompt shows how far one word reaches, and a compound stays exact. */
+    AGENT_TEST_ASSERT(!strcmp(ds4_permit_always_covers(p, "bash", "rm -rf build"), "rm ..."));
+    AGENT_TEST_ASSERT(!strcmp(ds4_permit_always_covers(p, "bash", "make a && make b"), "make a && make b"));
+    ds4_permit_allow_always(p, "bash", "make a && make b");
+    AGENT_TEST_ASSERT(!ds4_permit_needs_asking(p, "bash", "make a && make b"));
+    AGENT_TEST_ASSERT(ds4_permit_needs_asking(p, "bash", "make a && make c"));
+
+    ds4_permit_allow_always(p, "edit", "a.c");
+    AGENT_TEST_ASSERT(!ds4_permit_needs_asking(p, "write", "b.c"));
+
+    ds4_permit_set_mode(p, DS4_PERMIT_EDITS);
+    AGENT_TEST_ASSERT(!ds4_permit_needs_asking(p, "edit", "z"));
+    AGENT_TEST_ASSERT(ds4_permit_needs_asking(p, "bash", "make z"));
+    ds4_permit_set_mode(p, DS4_PERMIT_ALL);
+    AGENT_TEST_ASSERT(!ds4_permit_needs_asking(p, "bash", "rm -rf x"));
+    ds4_permit_free(p);
+
+    ds4_permit_mode mode;
+    AGENT_TEST_ASSERT(ds4_permit_parse_mode("edits", &mode) && mode == DS4_PERMIT_EDITS);
+    AGENT_TEST_ASSERT(!ds4_permit_parse_mode("yes", &mode));
+}
+
+/* The wiring: a session with nobody to ask refuses, and says so, and the tool does not run. */
+static void test_permissions_refuse_a_tool(void) {
+    char marker[PATH_MAX];
+    snprintf(marker, sizeof(marker), "%s/must-not-exist", test_output_dir ? test_output_dir : "/tmp");
+    unlink(marker);
+    agent_config cfg = {0};
+    cfg.non_interactive = true;
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.permit = ds4_permit_new(DS4_PERMIT_ASK);
+    agent_tool_call call = {0};
+    call.name = xstrdup("write");
+    test_tool_arg(&call, "path", marker);
+    test_tool_arg(&call, "content", "x");
+    agent_tool_observation obs;
+    agent_tool_observation_init(&obs);
+    AGENT_TEST_ASSERT(agent_tool_refused_by_person(&w, &call, &obs));
+    AGENT_TEST_ASSERT(obs.part_count > 0 && strstr(obs.parts[obs.part_count - 1].text, "nobody is here to ask"));
+    AGENT_TEST_ASSERT(access(marker, F_OK) != 0);
+    agent_tool_observation_free(&obs);
+    agent_tool_call_free(&call);
+    ds4_permit_free(w.permit);
+}
+
 /* In a child with a real terminal, because the point is what a terminal shares. */
 static void test_output_descriptions(void) {
     int master = posix_openpt(O_RDWR | O_NOCTTY);
@@ -2004,6 +2085,8 @@ int main(int argc, char **argv) {
     test_footer_only_updates();
     test_tool_contracts();
     test_hooks_engine();
+    test_permissions();
+    test_permissions_refuse_a_tool();
     test_output_descriptions();
     test_deciduous_git();
     test_deciduous_seam_failures();

@@ -12,6 +12,7 @@
 #include <mach-o/dyld.h>
 #endif
 #include "ds4_hooks.h"
+#include "ds4_permit.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -98,6 +99,8 @@ typedef struct {
     const char *dec_label; /* --label: who this session is on the graph */
     bool graph_off;        /* --graph off: stay blind to any decision graph */
     bool hooks_off;        /* --hooks off: run no .ds4/hooks */
+    bool permissions_set;  /* --permissions was given */
+    ds4_permit_mode permissions;
     bool non_interactive;
     bool edit_upto;
 } agent_config;
@@ -187,6 +190,13 @@ typedef struct {
     bool web_approval_result;
     char web_approval_message[256];
     char web_approval_error[160];
+    /* A tool call waiting for a person: the same handshake as above, with a third
+     * answer. */
+    bool tool_approval_pending;
+    bool tool_approval_answered;
+    char tool_approval_answer;   /* y, n or a */
+    char tool_approval_message[512];
+    ds4_permit *permit;
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -653,6 +663,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
+           agent_slash_command_with_args(cmd, "/permissions") ||
            agent_slash_command_with_args(cmd, "/power") ||
            agent_slash_command_with_args(cmd, "/think") ||
            agent_slash_command_with_args(cmd, "/steer") ||
@@ -978,6 +989,13 @@ static agent_config parse_options(int argc, char **argv) {
             c.goal = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--label")) {
             c.dec_label = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--permissions")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (!ds4_permit_parse_mode(mode, &c.permissions)) {
+                fprintf(stderr, "ds4-agent: --permissions takes ask, edits or all\n");
+                exit(2);
+            }
+            c.permissions_set = true;
         } else if (!strcmp(arg, "--hooks")) {
             const char *mode = need_arg(&i, argc, argv, arg);
             if (!strcmp(mode, "off")) c.hooks_off = true;
@@ -5398,6 +5416,43 @@ static int agent_web_confirm(void *privdata, const char *message,
     return ok ? 1 : 0;
 }
 
+/* Blocks the tool until a person answers. Nobody answering, by interrupt or by there
+ * being nobody, is a no. */
+static char agent_tool_confirm(agent_worker *w, const char *message) {
+    if (w->cfg->non_interactive) return 'n';
+    pthread_mutex_lock(&w->mu);
+    w->tool_approval_pending = true;
+    w->tool_approval_answered = false;
+    w->tool_approval_answer = 'n';
+    snprintf(w->tool_approval_message, sizeof(w->tool_approval_message), "%s", message);
+    agent_wake_locked(w);
+    while (!w->stop && !w->interrupt && !w->tool_approval_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    char answer = w->tool_approval_answered ? w->tool_approval_answer : 'n';
+    w->tool_approval_pending = false;
+    pthread_mutex_unlock(&w->mu);
+    return answer;
+}
+
+static bool worker_take_tool_approval(agent_worker *w, char *message, size_t message_len) {
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->tool_approval_pending;
+    if (pending) {
+        snprintf(message, message_len, "%s", w->tool_approval_message);
+        w->tool_approval_pending = false;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return pending;
+}
+
+static void worker_answer_tool_approval(agent_worker *w, char answer) {
+    pthread_mutex_lock(&w->mu);
+    w->tool_approval_answer = answer;
+    w->tool_approval_answered = true;
+    pthread_cond_broadcast(&w->cond);
+    pthread_mutex_unlock(&w->mu);
+}
+
 static void agent_web_log(void *privdata, const char *message) {
     agent_worker *w = privdata;
     if (!w || !message || !message[0]) return;
@@ -9815,6 +9870,25 @@ static bool agent_tool_refused_by_hook(agent_worker *w, const agent_tool_call *c
     return blocked;
 }
 
+/* The model hears a no as a tool error, and is told not to find a way round it. */
+static bool agent_tool_refused_by_person(agent_worker *w, const agent_tool_call *call,
+                                         agent_tool_observation *obs) {
+    if (!w->permit || !call->name) return false;
+    const char *arg = agent_hook_arg(call);
+    if (!ds4_permit_needs_asking(w->permit, call->name, arg)) return false;
+    char message[512];
+    snprintf(message, sizeof(message), "Allow %s: %.300s\n  y yes, n no, a always allow %.120s: ",
+             call->name, arg ? arg : "", ds4_permit_always_covers(w->permit, call->name, arg));
+    char answer = agent_tool_confirm(w, message);
+    if (answer == 'a') ds4_permit_allow_always(w->permit, call->name, arg);
+    if (answer != 'n') return false;
+    agent_tool_observation_puts(obs, w->cfg->non_interactive
+        ? "Tool error: not run: this session allows no such tool and nobody is here to ask.\n"
+        : "Tool error: the user said no, and the tool did not run. Do not try to reach the same "
+          "end another way; stop and ask what they want instead.\n");
+    return true;
+}
+
 static void agent_tool_post_hooks(agent_worker *w, const agent_tool_call *call, const char *res,
                                   agent_tool_observation *obs) {
     if (!w->hooks || !call->name) return;
@@ -9836,10 +9910,12 @@ static agent_tool_observation agent_execute_tool_observation(
                  calls->v[i].name ? calls->v[i].name : "unknown");
         agent_tool_observation_puts(&obs, hdr);
         if (calls->v[i].name && !strcmp(calls->v[i].name, "view_image")) {
-            if (!agent_tool_refused_by_hook(w, &calls->v[i], &obs))
+            if (!agent_tool_refused_by_person(w, &calls->v[i], &obs) &&
+                !agent_tool_refused_by_hook(w, &calls->v[i], &obs))
                 agent_tool_view_image(w, &calls->v[i], &obs);
             continue;
         }
+        if (agent_tool_refused_by_person(w, &calls->v[i], &obs)) continue;
         if (agent_tool_refused_by_hook(w, &calls->v[i], &obs)) continue;
         char *res = agent_execute_tool_call(w, &calls->v[i]);
         agent_tool_observation_puts(&obs, res);
@@ -13052,6 +13128,9 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     };
     w->web = ds4_web_create(&web_cfg);
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
+    /* A session with nobody at the keyboard has nobody to ask. */
+    w->permit = ds4_permit_new(cfg->permissions_set ? cfg->permissions :
+                               cfg->non_interactive ? DS4_PERMIT_ALL : DS4_PERMIT_ASK);
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {
@@ -13091,6 +13170,7 @@ static void agent_worker_free(agent_worker *w) {
     agent_worker_images_clear(w);
     free(w->cache_dir);
     free(w->sysprompt_path);
+    ds4_permit_free(w->permit);
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
@@ -13119,6 +13199,26 @@ static const char *agent_yes_no_auto_name(agent_yes_no_auto answer) {
     case AGENT_YES_NO_AUTO_NO: return "no";
     case AGENT_YES_NO_AUTO_YES: return "yes";
     default: return "";
+    }
+}
+
+/* y, n or a, waiting as long as it takes. A closed terminal is a no. */
+static char agent_prompt_choice(const char *prompt) {
+    char buf[32];
+    for (;;) {
+        printf("%s", prompt);
+        fflush(stdout);
+        int saved_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+        if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+            fcntl(STDIN_FILENO, F_SETFL, saved_flags & ~O_NONBLOCK);
+        bool got_line = fgets(buf, sizeof(buf), stdin) != NULL;
+        if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+            fcntl(STDIN_FILENO, F_SETFL, saved_flags);
+        if (!got_line) return 'n';
+        char *p = buf;
+        while (*p == ' ' || *p == '\t') p++;
+        char c = (char)tolower((unsigned char)*p);
+        if (c == 'y' || c == 'n' || c == 'a') return c;
     }
 }
 
@@ -13581,6 +13681,23 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             continue;
         }
 
+        char tool_approval_msg[512];
+        if (worker_take_tool_approval(&worker, tool_approval_msg, sizeof(tool_approval_msg))) {
+            char *saved_input = NULL;
+            if (editor.active && editor.edit.buf && editor.edit.len)
+                saved_input = xstrndup(editor.edit.buf, editor.edit.len);
+            editor_stop(&editor);
+            editor_restore_terminal_layout(&editor);
+            worker_answer_tool_approval(&worker, agent_prompt_choice(tool_approval_msg));
+            worker_get_status(&worker, &st);
+            build_prompt_text(&st, prompt, sizeof(prompt));
+            int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
+            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            editor_start(&editor, prompt, statusline, saved_input);
+            free(saved_input);
+            continue;
+        }
+
         char web_approval_msg[256];
         if (worker_take_web_approval_request(&worker, web_approval_msg,
                                              sizeof(web_approval_msg)))
@@ -13829,6 +13946,17 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     restore_line = xstrdup(cmd);
                 } else if (cmd[0] == '/' && busy) {
                     printf("command requires the model to be idle: %s\n", cmd);
+                } else if (agent_slash_command_with_args(cmd, "/permissions")) {
+                    char *arg = cmd + strlen("/permissions");
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    ds4_permit_mode mode;
+                    if (arg[0] && !ds4_permit_parse_mode(arg, &mode)) {
+                        printf("usage: /permissions [ask|edits|all]\n");
+                    } else {
+                        if (arg[0]) ds4_permit_set_mode(worker.permit, mode);
+                        printf("permissions: %s\n",
+                               ds4_permit_mode_name(ds4_permit_mode_of(worker.permit)));
+                    }
                 } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
                     /* Stop the editor so raw mode and non-blocking stdin are
                      * disabled before we prompt the user.  Then restore the

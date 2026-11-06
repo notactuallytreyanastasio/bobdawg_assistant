@@ -325,6 +325,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--goal TEXT", "Record TEXT as this workspace's goal node on the deciduous server; the opening prompt becomes the goal otherwise.");
     opt(fp, c, "--label LABEL", "Who this session is when it writes decisions or posts to the board. Default: DECIDUOUS_AGENT_LABEL or ds4.");
     opt(fp, c, "--hooks on|off", "Run the repository's .ds4/hooks at session and tool events. Default: on");
+    opt(fp, c, "--permissions MODE", "What runs without asking: ask, edits or all. Default: ask; all with --non-interactive");
     opt(fp, c, "--graph on|off", "Talk to the deciduous server for this workspace, found by walking up from it. ds4 keeps no local graph. Default: on");
     fputc('\n', fp);
 }
@@ -342,6 +343,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/think [N]", "V4.1: set effort 0..100 (default 75) after this turn; rebuilds the prefix.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
+    opt(fp, c, "/permissions [MODE]", "Show or set what runs without asking: ask, edits or all.");
     opt(fp, c, "/quit, /exit", "Exit.");
     fputc('\n', fp);
 }
