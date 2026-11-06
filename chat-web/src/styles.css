@@ -1,0 +1,183 @@
+/* A dark page with one column of text. The transcript scrolls, the question box stays
+   at the bottom, and the model's own line breaks survive into the answer. */
+
+:root {
+  color-scheme: dark;
+  --bg: #14161a;
+  --fg: #e6e6e6;
+  --dim: #8b8b8b;
+  --line: #2a2d34;
+  --accent: #7fb4ff;
+  --danger: #ff8b8b;
+  --entry-bg: #1b1e24;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.6 ui-sans-serif, system-ui, sans-serif;
+}
+
+#root {
+  min-height: 100%;
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 100vh;
+  max-width: 72ch;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+}
+
+.header h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.model {
+  margin: 0;
+  color: var(--dim);
+  font-size: 14px;
+  flex: 1;
+}
+
+.reset,
+.send,
+.stop {
+  font: inherit;
+  color: var(--fg);
+  background: var(--entry-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.reset:disabled,
+.send:disabled {
+  color: var(--dim);
+  cursor: default;
+}
+
+.error {
+  margin: 0;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.empty {
+  margin: 0;
+  color: var(--dim);
+}
+
+.transcript {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.entries {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.entry {
+  background: var(--entry-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.entry .role {
+  display: block;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+  margin-bottom: 4px;
+}
+
+.entry.user .role {
+  color: var(--accent);
+}
+
+.pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.reasoning {
+  margin: 0 0 8px;
+  color: var(--dim);
+}
+
+.reasoning summary {
+  cursor: pointer;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.status {
+  margin: 12px 0 0;
+  color: var(--dim);
+  font-size: 14px;
+}
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.question {
+  font: inherit;
+  color: var(--fg);
+  background: var(--entry-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  resize: vertical;
+  min-height: 70px;
+}
+
+.question:disabled {
+  color: var(--dim);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.hint {
+  color: var(--dim);
+  font-size: 14px;
+}
