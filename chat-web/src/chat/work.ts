@@ -41,7 +41,7 @@ export type Work = {
   readonly changes: readonly Change[];
 };
 
-export type NoteKind = 'comment' | 'ask' | 'reject';
+export type NoteKind = 'comment' | 'reject';
 
 // Something the reader said about some lines of a change.
 export type Note = {
@@ -161,8 +161,7 @@ export function workOf(messages: readonly ChatMessage[]): Work {
 }
 
 const OPENINGS: Readonly<Record<NoteKind, string>> = {
-  comment: 'A comment on this code in',
-  ask: 'A question about this code in',
+  comment: 'About this code in',
   reject: 'I reject this code, so revert it, in',
 };
 

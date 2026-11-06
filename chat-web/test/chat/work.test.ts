@@ -69,7 +69,7 @@ describe('workOf', () => {
 describe('noteMessage', () => {
   it('quotes the code, so the model knows what is meant', () => {
     expect(noteMessage({ kind: 'comment', path: 'c.py', code: 'x = 1', text: 'Why one?' })).toBe(
-      'A comment on this code in c.py:\n\n```\nx = 1\n```\n\nWhy one?',
+      'About this code in c.py:\n\n```\nx = 1\n```\n\nWhy one?',
     );
   });
 

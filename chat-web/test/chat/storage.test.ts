@@ -5,8 +5,10 @@ import {
   loadLibrary,
   loadPlot,
   loadThinking,
+  loadWorkSizes,
   loadWorkspaceId,
   loadWorkspaceOn,
+  saveWorkSizes,
   saveLibrary,
   savePlot,
   saveThinking,
@@ -100,5 +102,27 @@ describe('the workspace settings', () => {
     expect(loadWorkspaceId(store)).toBeNull();
     saveWorkspaceId(store, 'abc');
     expect(loadWorkspaceId(store)).toBe('abc');
+  });
+});
+
+describe('work sizes', () => {
+  const memory = (): StoreLike => {
+    const held = new Map<string, string>();
+    return { getItem: (key) => held.get(key) ?? null, setItem: (key, value) => void held.set(key, value) };
+  };
+
+  it('keeps what was dragged', () => {
+    const store = memory();
+    expect(saveWorkSizes(store, { thinking: 320, chat: null })).toBe(true);
+    expect(loadWorkSizes(store)).toEqual({ thinking: 320, chat: null });
+  });
+
+  it('falls back to the defaults for anything else', () => {
+    const store = memory();
+    expect(loadWorkSizes(null)).toEqual({ thinking: null, chat: null });
+    store.setItem('ds4.chat.work.sizes', 'not json');
+    expect(loadWorkSizes(store)).toEqual({ thinking: null, chat: null });
+    store.setItem('ds4.chat.work.sizes', '{"thinking":-4,"chat":"wide"}');
+    expect(loadWorkSizes(store)).toEqual({ thinking: null, chat: null });
   });
 });

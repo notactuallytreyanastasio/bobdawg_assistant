@@ -1208,6 +1208,12 @@ button:disabled {
 }
 
 @media (min-width: 1101px) {
+  /* Dragged widths arrive here, and these limits keep every pane usable in any window. */
+  .app.work {
+    --thinking-now: clamp(200px, var(--work-thinking, 280px), 35vw);
+    --chat-now: clamp(300px, var(--work-chat, clamp(340px, 28vw, 440px)), 50vw);
+  }
+
   .app.work .menu {
     display: block;
   }
@@ -1230,13 +1236,13 @@ button:disabled {
     flex: 1;
     min-width: 0;
     display: grid;
-    grid-template-columns: minmax(250px, 300px) minmax(0, 1fr);
+    grid-template-columns: var(--thinking-now) minmax(0, 1fr);
     position: relative;
   }
 
   .app.work .page {
     flex: none;
-    width: clamp(340px, 28vw, 440px);
+    width: var(--chat-now);
     border-left: 1px solid var(--line);
     background: var(--side);
   }
@@ -1414,6 +1420,11 @@ button:disabled {
   border-left-color: var(--accent);
 }
 
+.work-line.chosen {
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
 .work-line.struck {
   border-left-color: var(--danger);
   text-decoration: line-through;
@@ -1463,6 +1474,15 @@ button:disabled {
   gap: 6px;
 }
 
+.work-note-row .spacer {
+  flex: 1;
+}
+
+.work-note-row .reject {
+  color: var(--danger);
+  border: 1px solid var(--danger);
+}
+
 .work-note-row .go {
   color: var(--on-accent);
   background: var(--accent);
@@ -1470,6 +1490,30 @@ button:disabled {
 
 .work-note-row .go:disabled {
   opacity: 0.5;
+}
+
+.work-bar {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+  width: 9px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.work-bar.thinking {
+  left: calc(var(--thinking-now) - 5px);
+}
+
+.work-bar.chat {
+  right: -5px;
+}
+
+.work-bar:hover,
+.work-bar:focus-visible {
+  outline: 0;
+  background: linear-gradient(to right, transparent 3px, var(--accent) 3px, var(--accent) 6px, transparent 6px);
 }
 
 .work-thread {
@@ -1487,36 +1531,3 @@ button:disabled {
   stroke-dasharray: 4 4;
 }
 
-.work-menu {
-  position: fixed;
-  z-index: 5;
-  display: grid;
-  min-width: 200px;
-  padding: 4px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--surface);
-  box-shadow: var(--shadow);
-}
-
-.work-menu p {
-  margin: 0 0 3px;
-  padding: 3px 10px 5px;
-  font-size: 12px;
-  color: var(--dim);
-  border-bottom: 1px solid var(--line);
-}
-
-.work-menu button {
-  padding: 5px 10px;
-  text-align: left;
-  border-radius: 6px;
-}
-
-.work-menu button:hover {
-  background: var(--raised);
-}
-
-.work-menu .danger {
-  color: var(--danger);
-}

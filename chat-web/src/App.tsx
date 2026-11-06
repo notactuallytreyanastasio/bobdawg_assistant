@@ -18,19 +18,21 @@ import { contextPercent } from './chat/format';
 import {
   loadPlot,
   loadThinking,
+  loadWorkSizes,
   loadWorkspaceId,
   loadWorkspaceOn,
   platformStore,
   savePlot,
   saveThinking,
+  saveWorkSizes,
   saveWorkspaceId,
   saveWorkspaceOn,
 } from './chat/storage';
-import type { StoreLike } from './chat/storage';
+import type { StoreLike, WorkSizes } from './chat/storage';
 import { noteMessage, workOf } from './chat/work';
 import type { Note } from './chat/work';
 import { ArtifactPanel } from './components/ArtifactPanel';
-import { WorkPanes } from './components/WorkPanes';
+import { WorkPanes, paneWidths } from './components/WorkPanes';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import type { PanelTab } from './components/ArtifactPanel';
 import { Composer } from './components/Composer';
@@ -87,6 +89,7 @@ export function App({
   const [notes, setNotes] = useState<readonly Note[]>([]);
   const [queued, setQueued] = useState<readonly string[]>([]);
   const noteIds = useRef(0);
+  const [sizes, setSizes] = useState(() => loadWorkSizes(store));
 
   const artifacts = useArtifacts({
     onReveal: (callId) => {
@@ -142,6 +145,11 @@ export function App({
     noteIds.current += 1;
     setNotes((held) => [...held, { ...note, id: `note-${noteIds.current}` }]);
     setQueued((waiting) => [...waiting, noteMessage(note)]);
+  }
+
+  function resize(next: WorkSizes): void {
+    setSizes(next);
+    saveWorkSizes(store, next);
   }
 
   function clearNotes(): void {
@@ -294,7 +302,7 @@ export function App({
   const working = workspace && messages.length > 0;
 
   return (
-    <div className={working ? 'app work' : 'app'}>
+    <div className={working ? 'app work' : 'app'} style={paneWidths(sizes)}>
       <Sidebar
         chats={library.chats}
         activeId={activeId}
@@ -305,7 +313,15 @@ export function App({
         onClose={() => setDrawer(false)}
       />
       {working ? (
-        <WorkPanes work={workOf(messages)} notes={notes} live={streaming} queued={queued.length} onNote={addNote} />
+        <WorkPanes
+          work={workOf(messages)}
+          notes={notes}
+          live={streaming}
+          queued={queued.length}
+          sizes={sizes}
+          onSizes={resize}
+          onNote={addNote}
+        />
       ) : null}
       <main className="page">
         <header className="header">

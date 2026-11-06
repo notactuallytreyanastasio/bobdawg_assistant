@@ -15,6 +15,7 @@ const THINKING_KEY = 'ds4.chat.thinking';
 const PLOT_KEY = 'ds4.chat.plot';
 const WORKSPACE_ON_KEY = 'ds4.chat.workspace';
 const WORKSPACE_ID_KEY = 'ds4.chat.workspace.id';
+const WORK_SIZES_KEY = 'ds4.chat.work.sizes';
 
 export function platformStore(): StoreLike | null {
   try {
@@ -91,4 +92,31 @@ export function saveWorkspaceId(store: StoreLike | null, id: string): boolean {
 
 export function savePlot(store: StoreLike | null, plot: boolean): boolean {
   return write(store, PLOT_KEY, plot ? 'on' : 'off');
+}
+
+// How wide the reader dragged the panes beside the chat, in pixels. Null is the default width.
+export type WorkSizes = {
+  readonly thinking: number | null;
+  readonly chat: number | null;
+};
+
+export const DEFAULT_WORK_SIZES: WorkSizes = { thinking: null, chat: null };
+
+function widthOf(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+export function loadWorkSizes(store: StoreLike | null): WorkSizes {
+  try {
+    const saved: unknown = JSON.parse(read(store, WORK_SIZES_KEY) ?? 'null');
+    if (typeof saved !== 'object' || saved === null) return DEFAULT_WORK_SIZES;
+    const { thinking, chat } = saved as Readonly<Record<string, unknown>>;
+    return { thinking: widthOf(thinking), chat: widthOf(chat) };
+  } catch {
+    return DEFAULT_WORK_SIZES;
+  }
+}
+
+export function saveWorkSizes(store: StoreLike | null, sizes: WorkSizes): boolean {
+  return write(store, WORK_SIZES_KEY, JSON.stringify(sizes));
 }

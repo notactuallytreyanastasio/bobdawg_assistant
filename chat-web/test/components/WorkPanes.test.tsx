@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
-import { WorkPanes, linesAt } from '../../src/components/WorkPanes';
+import { WorkPanes, linesOfSelection, paneWidths } from '../../src/components/WorkPanes';
 import type { WorkPanesProps } from '../../src/components/WorkPanes';
 import type { Change, Work } from '../../src/chat/work';
 
@@ -24,7 +24,30 @@ const work: Work = {
 };
 
 function panes(overrides: Partial<WorkPanesProps> = {}) {
-  return <WorkPanes work={work} notes={[]} live={false} queued={0} onNote={() => undefined} {...overrides} />;
+  return (
+    <WorkPanes
+      work={work}
+      notes={[]}
+      live={false}
+      queued={0}
+      sizes={{ thinking: null, chat: null }}
+      onSizes={() => undefined}
+      onNote={() => undefined}
+      {...overrides}
+    />
+  );
+}
+
+function highlight(from: RegExp, to: RegExp): void {
+  const start = screen.getByText(from);
+  const end = screen.getByText(to);
+  const range = document.createRange();
+  range.setStart(start, 0);
+  range.setEnd(end, end.childNodes.length);
+  const selection = getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+  fireEvent.pointerUp(document);
 }
 
 describe('WorkPanes', () => {
@@ -40,33 +63,40 @@ describe('WorkPanes', () => {
     expect(screen.getByText(/Nothing changed yet/).textContent).toContain('Edits appear');
   });
 
-  it('sends a comment on the line right-clicked', async () => {
+  it('opens a box on a highlight, and sends what is written there', async () => {
     const onNote = vi.fn();
     render(panes({ onNote }));
-    fireEvent.contextMenu(screen.getByText(/pop\(0\)/));
-    await userEvent.click(screen.getByRole('menuitem', { name: 'Comment' }));
-    await userEvent.type(screen.getByRole('textbox', { name: 'Comment' }), 'Is this O(n)?');
+    highlight(/pop\(\)/, /pop\(0\)/);
+    await userEvent.type(await screen.findByRole('textbox', { name: 'Your note' }), 'Is this O(n)?');
     await userEvent.click(screen.getByRole('button', { name: 'Send to chat' }));
     expect(onNote).toHaveBeenCalledWith({
       change: 'a1/c1',
       path: 'c.py',
       kind: 'comment',
-      code: 'pop(0)',
+      code: 'pop()\npop(0)',
       text: 'Is this O(n)?',
-      first: 1,
+      first: 0,
       last: 1,
     });
+    expect(screen.queryByRole('textbox', { name: 'Your note' })).toBeNull();
   });
 
-  it('wants words for a comment but not for a rejection', async () => {
-    render(panes());
-    fireEvent.contextMenu(screen.getByText(/pop\(0\)/));
-    await userEvent.click(screen.getByRole('menuitem', { name: 'Comment' }));
+  it('rejects with no words needed, but will not send an empty note', async () => {
+    const onNote = vi.fn();
+    render(panes({ onNote }));
+    highlight(/pop\(0\)/, /pop\(0\)/);
+    await screen.findByRole('textbox', { name: 'Your note' });
     expect((screen.getByRole('button', { name: 'Send to chat' }) as HTMLButtonElement).disabled).toBe(true);
-    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
-    fireEvent.contextMenu(screen.getByText(/pop\(0\)/));
-    await userEvent.click(screen.getByRole('menuitem', { name: 'Reject' }));
-    expect((screen.getByRole('button', { name: 'Send to chat' }) as HTMLButtonElement).disabled).toBe(false);
+    await userEvent.click(screen.getByRole('button', { name: 'Reject' }));
+    expect(onNote).toHaveBeenCalledWith(expect.objectContaining({ kind: 'reject', text: '', code: 'pop(0)' }));
+  });
+
+  it('opens nothing for a click or a highlight outside the code', async () => {
+    render(panes());
+    fireEvent.pointerUp(document);
+    highlight(/The pop takes/, /The pop takes/);
+    await new Promise((done) => setTimeout(done, 5));
+    expect(screen.queryByRole('textbox', { name: 'Your note' })).toBeNull();
   });
 
   it('keeps a note on its lines, and strikes rejected ones', () => {
@@ -82,19 +112,39 @@ describe('WorkPanes', () => {
   });
 });
 
-describe('linesAt', () => {
-  it('takes the highlighted range inside the change', () => {
-    render(panes());
-    const first = screen.getByText(/pop\(\)/);
-    const second = screen.getByText(/pop\(0\)/);
-    const selection = { isCollapsed: false, anchorNode: second, focusNode: first } as unknown as Selection;
-    expect(linesAt(second, selection, change)).toMatchObject({ first: 0, last: 1 });
+describe('resizing', () => {
+  it('follows a drag until the button comes up', () => {
+    const onSizes = vi.fn();
+    render(panes({ onSizes }));
+    fireEvent.pointerDown(screen.getByRole('separator', { name: 'Resize the thinking pane' }));
+    act(() => {
+      dispatchEvent(new MouseEvent('pointermove', { clientX: 333 }));
+      dispatchEvent(new MouseEvent('pointerup'));
+      dispatchEvent(new MouseEvent('pointermove', { clientX: 400 }));
+    });
+    expect(onSizes).toHaveBeenCalledTimes(1);
+    expect(onSizes).toHaveBeenCalledWith({ thinking: 333, chat: null });
   });
 
-  it('falls back to the line clicked, and finds nothing outside the code', () => {
-    render(panes());
-    const line = screen.getByText(/pop\(0\)/);
-    expect(linesAt(line, null, change)).toMatchObject({ first: 1, last: 1 });
-    expect(linesAt(document.body, null, change)).toBeNull();
+  it('moves with the arrow keys, and resets on a double click', () => {
+    const onSizes = vi.fn();
+    render(panes({ onSizes, sizes: { thinking: 300, chat: 400 } }));
+    const bar = screen.getByRole('separator', { name: 'Resize the chat' });
+    fireEvent.keyDown(bar, { key: 'ArrowLeft' });
+    expect(onSizes).toHaveBeenLastCalledWith({ thinking: 300, chat: 24 });
+    fireEvent.doubleClick(bar);
+    expect(onSizes).toHaveBeenLastCalledWith({ thinking: 300, chat: null });
+  });
+
+  it('sets only the widths the reader chose', () => {
+    expect(paneWidths({ thinking: null, chat: null })).toBeUndefined();
+    expect(paneWidths({ thinking: 310, chat: null })).toEqual({ '--work-thinking': '310px' });
+  });
+});
+
+describe('linesOfSelection', () => {
+  it('finds nothing without a highlight', () => {
+    expect(linesOfSelection(null, [change])).toBeNull();
+    expect(linesOfSelection(getSelection(), [change])).toBeNull();
   });
 });
