@@ -200,6 +200,32 @@ What this does not stop:
   boundary. Its pattern for HTML-parsing method names should be rechecked when Chrome updates,
   because Chrome keeps adding them.
 
+## Pages and links
+
+Asked for a page, a report or a dashboard, the model calls the `page` tool instead of
+`plot`, with a title, the markup and code to go with it. It comes down to code like any
+other, whose first line puts the markup in `root`, so a page runs in the same frame, under
+the same Run and the same lockdown, and the guard on `innerHTML` reads every tag. A page is
+held to having run and drawn something, not to having drawn a chart.
+
+Anything that ran can be shared. **Share as a page** says what that means and takes a second
+press: the document goes to the server whole, D3 and the Plot-on text included, and comes back
+as a link that opens without the chat. The server has to be started with `--share-dir`, which
+`serve-tailnet.sh` does. A link lasts until its file is deleted from that directory, and anyone
+who can reach the server and has the link can open it.
+
+The server trusts no upload. It serves a shell with no script in it and the page in a sandboxed
+`srcdoc` frame, under a policy of its own, kept in step with `FRAME_POLICY` by a test. See
+`ds4_share.h` and `docs/SERVER.md`.
+
+Tested in Chrome desktop against the real server, by us and not independently: 208 escapes,
+each uploaded both as the chat sends it and bare, with no policy and no lockdown. Of the 193
+that need no click, 61 reached the listener with nothing around them. Nothing tagged reached it
+from a shared page. WebRTC and TCP were run on their own: a page from the chat sent nothing by
+WebRTC, a blocked navigation still opened a TCP connection as it does in the chat, and a bare
+upload did reach out by WebRTC and TCP, so such a page can send what it holds. DNS was not
+measured on shared pages, and it is expected to leak as it does in the chat.
+
 ## Where chats are kept
 
 Chats live in this browser's `localStorage`, the newest hundred of them, and the page

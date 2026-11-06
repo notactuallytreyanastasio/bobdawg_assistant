@@ -57,6 +57,12 @@ export function consentText(chars: number, withheld = 0): string {
   return `This code will run with the ${chars} characters you sent with Plot on.${left} A hostile chart could leak that text through DNS, which this page cannot stop.`;
 }
 
+// What keeping a link means, said before it happens. The data goes with the page, which is the
+// part a reader is least likely to think of.
+export function shareConsentText(chars: number): string {
+  return `This puts the page on this server with the ${chars} characters you sent with Plot on, and the page keeps them. Anyone who can reach this server and has the link can open it, and it stays until someone deletes it from the server. Whoever opens it runs the model's code, and a hostile page could leak that text through DNS.`;
+}
+
 function textsOf(messages: readonly ChatMessage[]): FrameTexts {
   const texts: string[] = [];
   let used = 0;
@@ -84,10 +90,20 @@ export function frameTexts(messages: readonly ChatMessage[], upToCall: string): 
   return index < 0 ? { texts: [], truncated: false, withheld: 0 } : textsOf(messages.slice(0, index));
 }
 
+// A page as the code that builds it, which is all a frame and the Code tab need to know of it.
+// JSON makes the markup one line of a string, so the line an error gives still means something.
+export function pageSource(args: Readonly<Record<string, unknown>>): string | null {
+  const { title, html, code = '' } = args;
+  if (typeof title !== 'string' || typeof html !== 'string' || typeof code !== 'string') return null;
+  if (html.trim() === '') return null;
+  return `// title: ${title.replace(/\s+/g, ' ')}\nroot.innerHTML = ${JSON.stringify(html)};\n${code}`;
+}
+
 function codeOf(call: ToolCall): string {
   try {
     const parsed: unknown = JSON.parse(call.arguments);
     if (typeof parsed !== 'object' || parsed === null) return '';
+    if (call.name === 'page') return pageSource(parsed as Readonly<Record<string, unknown>>) ?? '';
     const { code } = parsed as { readonly code?: unknown };
     return typeof code === 'string' ? code : '';
   } catch {
@@ -97,7 +113,7 @@ function codeOf(call: ToolCall): string {
 
 export function artifactsOf(messages: readonly ChatMessage[]): readonly Artifact[] {
   return messages.flatMap((message, index) => {
-    const plots = message.calls.filter((call) => call.name === 'plot');
+    const plots = message.calls.filter((call) => call.name === 'plot' || call.name === 'page');
     if (plots.length === 0) return [];
     const block = toolBlockAfter(messages, index);
     const { texts, withheld } = textsOf(messages.slice(0, index));

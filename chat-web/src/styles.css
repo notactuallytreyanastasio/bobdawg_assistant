@@ -981,6 +981,27 @@ button:disabled {
   opacity: 0.35;
 }
 
+.share {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.share p {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--dim);
+}
+
+.share a {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .panel-notice,
 .panel-ended {
   margin: 0;

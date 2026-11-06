@@ -3,11 +3,13 @@
 // that moves is a frame that reloads. Everything that changes here changes by class.
 
 import type { RefObject } from 'react';
+import type { ShareResult } from '../api/sharePage';
 import type { FrameEnd } from '../artifact/host';
 import { consentText, plotCharacters } from '../chat/artifact';
 import type { Artifact } from '../chat/artifact';
 import { BLOCKED_BANNER } from '../tools/plot';
 import { CopyButton } from './CopyButton';
+import { ShareBar } from './ShareBar';
 import { CloseIcon, CodeIcon, ChartIcon, ExpandIcon, LeftIcon, PlayIcon, RightIcon, StopIcon } from './icons';
 
 export type PanelTab = 'preview' | 'code';
@@ -29,6 +31,7 @@ export type ArtifactPanelProps = {
   readonly onClose: () => void;
   readonly onFull: (full: boolean) => void;
   readonly onStep: (step: -1 | 1) => void;
+  readonly onShare: () => Promise<ShareResult>;
 };
 
 // Only a label. The frame's claims go into it, so it never says more than this.
@@ -55,7 +58,7 @@ function classOf(open: boolean, checking: boolean, full: boolean): string {
 
 export function ArtifactPanel(props: ArtifactPanelProps) {
   const { slot, artifact, position, tab, checking, live, ended, full, busy } = props;
-  const { onTab, onRun, onStop, onClose, onFull, onStep } = props;
+  const { onTab, onRun, onStop, onClose, onFull, onStep, onShare } = props;
   const showing = tab === 'preview';
   return (
     <aside className={classOf(artifact !== null, checking, full)} aria-label="Chart">
@@ -102,6 +105,7 @@ export function ArtifactPanel(props: ArtifactPanelProps) {
         Written by the model and running in a sandbox. Do not type anything private into it. Running without errors does
         not make the numbers right, so check them against your data.
       </p>
+      {artifact === null ? null : <ShareBar key={artifact.key} artifact={artifact} onShare={onShare} />}
       {ended === null ? null : (
         <p className={ended === 'blocked' ? 'panel-ended bad' : 'panel-ended'} role="status">
           {ENDED[ended]}

@@ -26,5 +26,10 @@ export const HEIGHT_MAX = 4000;
 export const MIN_DRAW_WIDTH = 640;
 export const MIN_DRAW_HEIGHT = 416;
 
+// A shared page has no slot to measure, so it is drawn at one size and the viewBox fits it to
+// whoever opens it.
+export const SHARE_WIDTH = 960;
+export const SHARE_HEIGHT = 624;
+
 export const MAX_DATA_CHARS = 1_000_000;
 export const TOOL_RESULT_CHARS = 4000;

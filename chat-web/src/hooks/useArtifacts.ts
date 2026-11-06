@@ -109,7 +109,7 @@ export function useArtifacts(config: ArtifactsConfig): Artifacts {
       try {
         const report = await running.run({ code: input.code, messages: input.messages, signal: input.signal });
         if (input.signal.aborted) return report;
-        if (describeReport(report).ok) reveal.current(input.callId);
+        if (describeReport(report, input.drawing).ok) reveal.current(input.callId);
         else running.remove();
         return report;
       } finally {

@@ -56,9 +56,13 @@ export type RunReport = {
   readonly dataLines: number;
 };
 
+// What a run is held to: a chart has to have drawn a chart, and a page only something.
+export type Drawing = 'chart' | 'page';
+
 export type ArtifactRunner = (input: {
   readonly callId: string;
   readonly code: string;
+  readonly drawing: Drawing;
   readonly messages: readonly string[];
   // How many earlier messages were sent with Plot off, which the reader is told at Run.
   readonly withheld: number;

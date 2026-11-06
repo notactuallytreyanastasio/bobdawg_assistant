@@ -44,6 +44,7 @@ function props(overrides: Partial<ArtifactPanelProps> = {}): ArtifactPanelProps 
     onClose: vi.fn(),
     onFull: vi.fn(),
     onStep: vi.fn(),
+    onShare: vi.fn(),
     ...overrides,
   };
 }

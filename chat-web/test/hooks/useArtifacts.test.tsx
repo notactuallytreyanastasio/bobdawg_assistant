@@ -45,6 +45,7 @@ function mount(answers: readonly RunReport[] = []) {
 const input = (signal = new AbortController().signal, callId = 'c1') => ({
   callId,
   code: 'draw()',
+  drawing: 'chart' as const,
   messages: ['one', 'two'],
   withheld: 1,
   signal,

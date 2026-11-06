@@ -1,5 +1,9 @@
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { FRAME_POLICY, artifactDocument, escapeScript } from '../../src/artifact/document';
+import { FRAME_POLICY, artifactDocument, escapeScript, sharedDocument } from '../../src/artifact/document';
+import { SHARE_WIDTH } from '../../src/artifact/limits';
 
 const input = { code: 'draw();', messages: ['data'], width: 600, height: 400, d3: 'var d3={};' };
 
@@ -91,5 +95,25 @@ describe('artifactDocument', () => {
   it('counts past new lines in D3 and in the data', () => {
     const { html, codeLine } = artifactDocument({ ...input, d3: 'a\nb\nc', messages: ['x\ny'] });
     expect(html.split('\n')[codeLine - 1]).toBe('draw();');
+  });
+});
+
+describe('the shared document and the server', () => {
+  const server = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../ds4_share.h'), 'utf8');
+  const policy = [...server.matchAll(/^\s+"(.*?)"(?: \\)?$/gm)].map((match) => match[1]).join('');
+
+  it('is held by the server to everything a frame in the chat is held to', () => {
+    for (const directive of FRAME_POLICY.split('; ')) expect(policy).toContain(directive);
+  });
+
+  it('adds the sandbox and refuses frames, which a top-level reply needs', () => {
+    expect(policy.startsWith('sandbox allow-scripts; ')).toBe(true);
+    expect(policy).toContain("frame-src 'none'");
+  });
+
+  it('is drawn at a fixed size and carries no harness', () => {
+    const html = sharedDocument({ code: 'draw()', messages: ['m'], d3: 'd3' });
+    expect(html).toContain(`"width":${SHARE_WIDTH}`);
+    expect(html).not.toContain('HEARTBEAT_MS');
   });
 });

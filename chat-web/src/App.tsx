@@ -8,6 +8,7 @@ import type { FetchLike } from './api/chatClient';
 import { fetchModels } from './api/models';
 import type { ModelInfo } from './api/models';
 import { recordTurn, turnRecordOf } from './api/recordTurn';
+import { sharePage } from './api/sharePage';
 import type { RecordResult } from './api/recordTurn';
 import { artifactsOf } from './chat/artifact';
 import type { Conversation } from './chat/conversation';
@@ -296,6 +297,7 @@ export function App({
         onClose={closeChart}
         onFull={setFullView}
         onStep={step}
+        onShare={async () => (current === null ? { kind: 'failed' } : sharePage({ origin, artifact: current, fetchImpl: send }))}
       />
     </div>
   );

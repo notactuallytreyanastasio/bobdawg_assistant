@@ -65,6 +65,28 @@ Tetris, the tailnet serving and the first chat page. Later work, including this 
 done with Claude Code. A person directed all of it. The commits carry one name, so the
 decision graph is the better record of who did what.</p>
 
+<h2 id="2026-11-06-pages">Whole pages, and links to them</h2>
+<p><time datetime="2026-11-06">2026-11-06</time></p>
+
+<p>The chart tool grew. Ask for a report or a dashboard and the model now builds a whole page,
+with headings, words, tables and charts, in the same sandbox and under the same Run. A page that
+ran can be shared: the server keeps it and gives back a link that opens without the chat.</p>
+
+<p>A link is the harder part. The server has no authentication, and a page served from it would
+sit beside the API. Served at the top level, a page could also navigate itself away with its
+data, and could pass for the chat with nothing around it. So a reader gets a shell with no
+script in it, a line saying what this is, and the page in a sandboxed frame, under a policy the
+server sets. The upload is not trusted to bring its own.</p>
+
+<p>We ran 208 escapes through the real server, each both as the chat sends it and as a bare upload
+with no protection of its own. None of those reached the listener, and without the sandbox 61 of
+the 193 that need no click did. Run separately, WebRTC got out of a bare upload, because a policy
+cannot stop it, and only the lockdown in the chat's own document does. Such a page can send what
+its author put in it and learn it was opened, as any website can, and it gets nothing of the
+reader's. DNS was not measured here, and should be expected to leak as it does in the chat. A link
+carries the data with it and lasts until its file is deleted, so the page says so before it
+shares. All of this is Chrome desktop, tested by us, and nobody independent has attacked it.</p>
+
 <h2 id="2026-11-06-artifacts">Charts the model writes and the page runs</h2>
 <p><time datetime="2026-11-06">2026-11-06</time></p>
 

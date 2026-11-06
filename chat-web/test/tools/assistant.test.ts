@@ -67,7 +67,7 @@ describe('plotAssistant', () => {
     expect(assistant.id).toBe('plot');
     expect(assistant.label).toBe('Plot');
     expect(assistant.system).toBe(PLOT_SYSTEM);
-    expect(assistant.tools.map((tool) => tool.name)).toEqual(['plot']);
+    expect(assistant.tools.map((tool) => tool.name)).toEqual(['plot', 'page']);
   });
 
   it('clips long pastes for the model', () => {

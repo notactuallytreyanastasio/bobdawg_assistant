@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { artifactsOf, consentText, frameTexts, plotCharacters, titleOfCode } from '../../src/chat/artifact';
+import { artifactsOf, consentText, frameTexts, pageSource, plotCharacters, titleOfCode } from '../../src/chat/artifact';
 import { MAX_DATA_CHARS } from '../../src/artifact/limits';
 import { assistantMessage, toolMessage, userMessage } from '../../src/chat/message';
 import type { ChatMessage } from '../../src/chat/message';
@@ -154,5 +154,19 @@ describe('artifactsOf', () => {
     expect(artifactsOf([asked, other])).toEqual([]);
     const broken = { ...assistantMessage('a2'), calls: [{ id: 'c2', name: 'plot', arguments: '{oops' }] };
     expect(artifactsOf([asked, broken])[0]).toMatchObject({ code: '', title: 'Chart' });
+  });
+});
+
+describe('pages', () => {
+  it('reads a page call as the code that builds it, title and all', () => {
+    const code = pageSource({ title: 'Two\nlines', html: '<h1>"x"</h1>', code: 'draw()' });
+    expect(code).toBe('// title: Two lines\nroot.innerHTML = "<h1>\\"x\\"</h1>";\ndraw()');
+    expect(titleOfCode(code ?? '')).toBe('Two lines');
+  });
+
+  it('refuses a page with no markup or the wrong types', () => {
+    expect(pageSource({ title: 't', html: '  ' })).toBeNull();
+    expect(pageSource({ title: 't', html: 1 })).toBeNull();
+    expect(pageSource({ html: '<p>' })).toBeNull();
   });
 });
