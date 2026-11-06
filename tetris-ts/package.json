@@ -1,0 +1,20 @@
+{
+  "name": "tetris-ts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tetris in pure TypeScript, built with TDD, no any types",
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "npm run typecheck && npm run test",
+    "play": "node src/main.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}

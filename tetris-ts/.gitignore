@@ -1,0 +1,2 @@
+# npm's install tree; package-lock.json is the shared part.
+node_modules/
