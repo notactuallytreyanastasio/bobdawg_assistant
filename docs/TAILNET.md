@@ -21,12 +21,34 @@ and no TLS: tailnet membership and Tailscale ACLs are the access control.
 It prints the base URL tailnet clients should use, including the MagicDNS name
 when Tailscale DNS answers. Flags are passed through to ds4-server, and defaults
 are added only when you omit them: `--ctx 100000`, `--kv-disk-dir ~/.ds4/server-kv`,
-`--kv-disk-space-mb 8192`. `DS4_TAILNET_HOST` forces the bind address if the
-discovery picks the wrong interface.
+`--kv-disk-space-mb 8192`, and `--ui-dir chat-web/dist` for the chat page below.
+`DS4_TAILNET_HOST` forces the bind address if the discovery picks the wrong
+interface.
 
 Exactly one ds4 process runs at a time (an exclusive lock on `/tmp/ds4.lock`,
 since the model maps tens of GiB). Stop `ds4-agent-poc`, `ds4-agent` or any other
 ds4 binary before starting the server, or it refuses to start.
+
+## The chat page
+
+The server that comes up can carry the repository's own chat page, so a peer
+needs nothing installed to chat. `serve-tailnet.sh` builds it when its output is
+missing or older than the page sources - `npm --prefix chat-web run build`, a
+few seconds, and `npm install` first if the page's dependencies are not there -
+and passes `--ui-dir chat-web/dist`. The startup lines then carry the URL to
+bookmark:
+
+```
+serve-tailnet: chat page: http://your-mac.your-tailnet.ts.net:8000/chat/
+```
+
+The page shares the port with the API and asks its own paths relative to that
+origin, so one bookmark covers page and API over any transport - Tailscale, an
+SSH port forward or a reverse proxy. `--cors` is not needed for it, and access
+control is the same as for the API: whoever can reach the port can chat and can
+load the page. The build needs Node 26 or newer; without `npm` the wrapper says
+so and the API comes up alone. Pass `--ui-dir` yourself to serve a build from
+somewhere else; see [server serving](SERVER.md#chat-page).
 
 ## Check the endpoint
 

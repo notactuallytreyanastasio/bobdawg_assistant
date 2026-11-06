@@ -17,6 +17,11 @@ Internet-facing deployment, put authentication and TLS in front of the server.
 `--cors` enables browser cross-origin headers. It does not change the listening
 address or provide access control.
 
+`--ui-dir DIR` serves the chat page from a built copy of it under `DIR`, at
+`http://host:port/chat/`, so the page and the API share one origin; see the
+[chat page](#chat-page) below. `./serve-tailnet.sh` builds and serves it by
+default.
+
 The selected build chooses the backend. Pass `-m FILE` for an explicit model.
 Use `--chdir /path/to/ds4` when starting outside the project directory so
 relative runtime files such as Metal kernels can be found.
@@ -52,6 +57,32 @@ For DeepSeek, thinking is on by default. `reasoning_effort=max` selects Think
 Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
+
+## Chat page
+
+The repository carries a browser chat page under [chat-web](../chat-web/README.md),
+and `--ui-dir DIR` serves a built copy of it from `DIR`:
+
+```sh
+npm --prefix chat-web run build                     # writes chat-web/dist
+./ds4-server --ui-dir chat-web/dist --ctx 32768     # http://127.0.0.1:8000/chat/
+```
+
+Served this way the page and the API share one origin, so the page needs no
+server address baked into its bundle and no cross-origin headers, and `--cors`
+stays off. Only `GET` is answered under the prefix: `/chat` redirects to `/chat/`
+so the path can be typed by hand, `/chat/` is the build's `index.html`, and any
+other URL below the prefix is one file from `DIR` - a path that reaches outside
+the directory is refused, and a path outside the prefix belongs to the API. The
+build is the page's own `npm run build`, which writes the asset URLs it asks for
+under the same prefix.
+
+`--ui-dir` says where the build lives; it does not build it, and a directory with
+no build in it is reported at startup rather than fatal - the API serves anyway.
+`./serve-tailnet.sh` builds the page when its output is missing or older than the
+page sources and passes the directory, then prints the URL to bookmark. The
+endpoint carries no authentication, so who can reach the page is who can reach
+the port; see [serving on the tailnet](TAILNET.md).
 
 ## Multiple sessions
 

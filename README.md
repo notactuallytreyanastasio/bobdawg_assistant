@@ -122,7 +122,9 @@ Pass `-m FILE` to choose explicitly. Commands normally run from the repository
 root; use `--chdir /path/to/ds4` when launching elsewhere.
 
 The server listens at `http://127.0.0.1:8000` by default; see [serving](docs/SERVER.md)
-for API access and multiple sessions.
+for API access and multiple sessions. `./ds4-server --ui-dir chat-web/dist`
+serves the chat page at `/chat/` beside the API, and `./serve-tailnet.sh` builds
+it and serves both to the tailnet; see [the chat page](chat-web/README.md).
 
 The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
 `/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
@@ -265,9 +267,9 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
-- [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
+- [Serving](docs/SERVER.md): APIs, images, batching, disk KV caches, and the chat page.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
-- [Tailnet serving](docs/TAILNET.md): share inference with tailnet peers, including LM Studio clients.
+- [Tailnet serving](docs/TAILNET.md): share inference with tailnet peers, including the chat page and LM Studio clients.
 - [Decision graph](docs/DECISION_GRAPH.md): workspace memory of why the work happened.
 - [Decision graph roadmap](docs/DECISION_GRAPH_ROADMAP.md): plan to make the graph required by the loop, not merely available.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.

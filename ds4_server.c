@@ -6,6 +6,7 @@
 #include "ds4_kvstore.h"
 #include "ds4_tp.h"
 #include "rax.h"
+#include "ds4_ui.h"
 
 /* OpenAI/Anthropic compatible local server.
  *
@@ -6923,14 +6924,19 @@ static void append_cors_headers(buf *h) {
         "Access-Control-Allow-Headers: *\r\n");
 }
 
-static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+/* Bytes, not a string: the built page is served from files whose length is
+ * theirs, and a font or an image holds NUL bytes that strlen would cut short. */
+static bool http_response_bytes(int fd, bool enable_cors, int code, const char *type,
+                                const char *body, size_t body_len) {
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
+                         code == 301 ? "Moved Permanently" :
+                         code == 302 ? "Found" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
+                         code == 405 ? "Method Not Allowed" :
                          code == 409 ? "Conflict" :
                          code == 500 ? "Internal Server Error" : "Error";
-    const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
         "HTTP/1.1 %d %s\r\n"
@@ -6945,6 +6951,25 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
     if (ok && body_len) ok = send_all(fd, body, body_len);
+    buf_free(&h);
+    return ok;
+}
+
+static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+    return http_response_bytes(fd, enable_cors, code, type, body ? body : "",
+                               body ? strlen(body) : 0);
+}
+
+/* The built page refers to its own assets relative to the page URL, so the URL
+ * the operator bookmarks carries a trailing slash. One redirect keeps /chat
+ * typing itself. */
+static bool http_redirect(int fd, bool enable_cors, int code, const char *location) {
+    const char *reason = code == 301 ? "Moved Permanently" : "Found";
+    buf h = {0};
+    buf_printf(&h, "HTTP/1.1 %d %s\r\nLocation: %s\r\n", code, reason, location);
+    if (enable_cors) append_cors_headers(&h);
+    buf_puts(&h, "Content-Length: 0\r\nConnection: close\r\n\r\n");
+    bool ok = send_all(fd, h.ptr, h.len);
     buf_free(&h);
     return ok;
 }
@@ -10173,6 +10198,7 @@ struct server {
     server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    const char *ui_dir;   /* built chat page directory, served at /chat */
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -15305,6 +15331,42 @@ static void wait_for_job_or_disconnect(server *s, job *j) {
     pthread_mutex_unlock(&j->mu);
 }
 
+/* Answer one page request from the built chat page directory: the redirect that
+ * gives /chat a directory of its own, the index file, or one file below the
+ * directory. Returns false when the URL is no page URL at all, which leaves the
+ * reply it would have had - an unknown endpoint for a POST to a page path, and
+ * the API's own 404 for anything outside the prefix. */
+static bool http_page_response(int fd, server *s, const http_request *hr) {
+    if (!s->ui_dir || strcmp(hr->method, "GET") != 0) return false;
+    char file_path[PATH_MAX];
+    char err[160];
+    err[0] = '\0';
+
+    if (!strcmp(hr->path, "/") || !strcmp(hr->path, DS4_UI_URL_PREFIX)) {
+        http_redirect(fd, s->enable_cors, 302, DS4_UI_URL_PREFIX "/");
+        return true;
+    }
+    ds4_ui_kind page = ds4_ui_classify(hr->path);
+    if (page == ds4_ui_none) return false;
+
+    if (page == ds4_ui_index) {
+        snprintf(file_path, sizeof(file_path), "%s/%s", s->ui_dir, DS4_UI_INDEX_FILE);
+    } else if (!ds4_ui_asset_path(hr->path, s->ui_dir, file_path, sizeof(file_path),
+                                  err, sizeof(err))) {
+        http_error(fd, s->enable_cors, 404, err);
+        return true;
+    }
+    char *data = NULL;
+    size_t size = 0;
+    if (!ds4_ui_read_file(file_path, &data, &size, err, sizeof(err))) {
+        http_error(fd, s->enable_cors, 404, err[0] ? err : "nothing built at this page path");
+        return true;
+    }
+    http_response_bytes(fd, s->enable_cors, 200, ds4_ui_content_type(file_path), data, size);
+    free(data);
+    return true;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -15335,6 +15397,14 @@ static void *client_main(void *arg) {
         server_model_alias_known(hr.path + model_path_prefix_len))
     {
         send_model(s, fd, hr.path + model_path_prefix_len);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    /* The built chat page answers from this origin when --ui-dir names it, so
+     * the page asks relative /v1 paths and needs no server address baked into
+     * its bundle and no cross-origin headers on the API. */
+    if (http_page_response(fd, s, &hr)) {
         http_request_free(&hr);
         goto done;
     }
@@ -15462,6 +15532,7 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    const char *ui_dir;   /* --ui-dir: built chat page directory */
     int batched_sessions;
     int mixed_prefill_quantum;
 } server_config;
@@ -15701,6 +15772,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--ui-dir")) {
+            c.ui_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -15984,6 +16057,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.ui_dir = cfg.ui_dir;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -16101,6 +16175,19 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    if (cfg.ui_dir) {
+        char page_index[PATH_MAX];
+        struct stat page_stat;
+        snprintf(page_index, sizeof(page_index), "%s/%s", cfg.ui_dir, DS4_UI_INDEX_FILE);
+        if (stat(page_index, &page_stat) == 0 && S_ISREG(page_stat.st_mode)) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: chat page at http://%s:%d%s/",
+                       cfg.host, cfg.port, DS4_UI_URL_PREFIX);
+        } else {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s holds no %s; run npm --prefix chat-web run build",
+                       cfg.ui_dir, DS4_UI_INDEX_FILE);
+        }
+    }
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
@@ -17224,6 +17311,145 @@ static void test_cors_sse_headers(void) {
     free(out);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* Ask the page handler what a browser would see for one URL, and report whether
+ * it answered at all. Nothing is written back when it did not, because a URL it
+ * leaves alone is answered by the caller's own routing, not here. */
+static char *page_reply(server *s, const char *method, const char *path, bool *served) {
+    int sv[2];
+    *served = false;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+
+    http_request hr = {0};
+    snprintf(hr.method, sizeof(hr.method), "%s", method);
+    snprintf(hr.path, sizeof(hr.path), "%s", path);
+    *served = http_page_response(sv[0], s, &hr);
+    shutdown(sv[0], SHUT_WR);
+    char *out = *served ? read_socket_text(sv[1]) : NULL;
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+/* The page shares an origin with the API and the endpoint carries no
+ * authentication, so these checks cover the reply a browser gets, and what the
+ * handler must never answer with: a file from outside the built directory, or
+ * a request that belongs to the API. */
+static void test_chat_page_serving(void) {
+    char dir[] = "/tmp/ds4-page-XXXXXX";
+    TEST_ASSERT(mkdtemp(dir) != NULL);
+
+    char outside[PATH_MAX];
+    snprintf(outside, sizeof(outside), "%s/../ds4-page-outside.txt", dir);
+    char assets[PATH_MAX];
+    snprintf(assets, sizeof(assets), "%s/assets", dir);
+    mkdir(assets, 0755);
+
+    static const char index_html[] = "<!doctype html>\n<title>ds4 chat</title>\n";
+    static const char app_js[] = "console.log('ds4');\n";
+    static const char font_bytes[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    static const char secret[] = "the answer outside the built directory\n";
+    struct {
+        const char *rel;
+        const void *data;
+        size_t len;
+    } files[] = {
+        {"index.html", index_html, sizeof(index_html) - 1},
+        {"assets/index-ab12cd.js", app_js, sizeof(app_js) - 1},
+        {"assets/font-ab12cd.woff2", font_bytes, sizeof(font_bytes)},
+        {"../ds4-page-outside.txt", secret, sizeof(secret) - 1}
+    };
+    char path[PATH_MAX];
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s/%s", dir, files[i].rel);
+        FILE *f = fopen(path, "wb");
+        TEST_ASSERT(f != NULL);
+        if (!f) continue;
+        TEST_ASSERT(fwrite(files[i].data, 1, files[i].len, f) == files[i].len);
+        fclose(f);
+    }
+
+    server s = {0};
+    s.ui_dir = dir;
+    bool served = false;
+    char *out;
+
+    out = page_reply(&s, "GET", "/chat", &served);
+    TEST_ASSERT(out != NULL && served);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 302") != NULL);
+    /* One redirect keeps /chat typing itself, and gives the page a directory of
+     * its own to resolve the bundle's relative asset paths against. */
+    TEST_ASSERT(strstr(out, "Location: /chat/") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Length: 0") != NULL);
+    free(out);
+
+    out = page_reply(&s, "GET", "/chat/", &served);
+    TEST_ASSERT(out != NULL && served);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Type: text/html") != NULL);
+    TEST_ASSERT(strstr(out, "ds4 chat") != NULL);
+    free(out);
+
+    out = page_reply(&s, "GET", "/chat/index.html", &served);
+    TEST_ASSERT(out != NULL && served);
+    TEST_ASSERT(strstr(out, "Content-Type: text/html") != NULL);
+    free(out);
+
+    out = page_reply(&s, "GET", "/chat/assets/index-ab12cd.js", &served);
+    TEST_ASSERT(out != NULL && served);
+    TEST_ASSERT(strstr(out, "Content-Type: application/javascript") != NULL);
+    TEST_ASSERT(strstr(out, "console.log") != NULL);
+    free(out);
+
+    /* A font is NUL bytes and no more, so this is where an answer built from a
+     * C string would show up as a short Content-Length. */
+    out = page_reply(&s, "GET", "/chat/assets/font-ab12cd.woff2", &served);
+    TEST_ASSERT(out != NULL && served);
+    TEST_ASSERT(strstr(out, "Content-Type: font/woff2") != NULL);
+    TEST_ASSERT(strstr(out, "Content-Length: 12") != NULL);
+    free(out);
+
+    /* The endpoint has no authentication. A path that reaches outside the
+     * directory must be refused by the handler itself. */
+    out = page_reply(&s, "GET", "/chat/../ds4-page-outside.txt", &served);
+    TEST_ASSERT(out != NULL && served);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 404") != NULL);
+    TEST_ASSERT(strstr(out, "the answer outside") == NULL);
+    free(out);
+
+    out = page_reply(&s, "GET", "/chat/%2e%2e/ds4-page-outside.txt", &served);
+    TEST_ASSERT(out != NULL && served);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 404") != NULL);
+    free(out);
+
+    out = page_reply(&s, "GET", "/chat/assets/missing-xyz.js", &served);
+    TEST_ASSERT(out != NULL && served);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 404") != NULL);
+    free(out);
+
+    out = page_reply(&s, "GET", "/v1/models", &served);
+    TEST_ASSERT(out == NULL && !served);
+    out = page_reply(&s, "GET", "/v1/chat/completions", &served);
+    TEST_ASSERT(out == NULL && !served);
+
+    /* A POST to a page path is not a page, and a server with no directory named
+     * for the page has no /chat at all. */
+    out = page_reply(&s, "POST", "/chat/", &served);
+    TEST_ASSERT(out == NULL && !served);
+    s.ui_dir = NULL;
+    out = page_reply(&s, "GET", "/chat/", &served);
+    TEST_ASSERT(out == NULL && !served);
+
+    snprintf(path, sizeof(path), "%s/index.html", dir);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/assets/index-ab12cd.js", dir);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/assets/font-ab12cd.woff2", dir);
+    unlink(path);
+    unlink(outside);
+    rmdir(assets);
+    rmdir(dir);
 }
 
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
@@ -23079,6 +23305,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
+    test_chat_page_serving();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();

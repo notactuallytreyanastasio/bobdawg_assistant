@@ -8,9 +8,9 @@ Vite.
 ```
 npm test      # the test suite
 npm run check # type check, then the test suite
-npm run dev   # the page, at http://localhost:5173
-npm run build # static page under dist/
-npm run preview # the built page
+npm run dev   # the page, at http://localhost:5173/chat/
+npm run build # the page for /chat/, under dist/
+npm run preview # the built page, at http://localhost:4173/chat/
 ```
 
 Developed against Node 26. The page needs `ds4-server` answering chat requests;
@@ -40,16 +40,29 @@ context.
 ## Reaching the server
 
 The page calls the relative path `/v1/chat/completions`, so a page served from
-the same origin as the server needs no configuration at all. `npm run dev`
-follows that rule from the other side: the page comes from Vite on port 5173 and
-the server sits on port 8000, so the development server proxies `/v1` across.
-`DS4_API_TARGET` moves the proxy when the server is elsewhere or on another
-port; it is read by `vite.config.ts` and never reaches the browser.
+the same origin as the server needs no configuration at all - and sharing the
+origin is how it is served. `ds4-server --ui-dir chat-web/dist` answers `/chat/`
+from the build on the same port as the API, so no server address is baked into
+the bundle and no cross-origin headers are needed. `./serve-tailnet.sh` builds
+the page and passes the directory when the server comes up for the tailnet; see
+[serving on the tailnet](../docs/TAILNET.md) and
+[the chat page in the server docs](../docs/SERVER.md#chat-page).
 
-A page built with `npm run build` holds no server address either. Point
-`VITE_API_BASE` at the server's origin when the two are not served together, as
-in `VITE_API_BASE=http://127.0.0.1:8000 npm run build`. The origin is read once
-at startup and every request goes to it after.
+The build is for that prefix: `base` in `vite.config.ts` is `/chat/`, which is
+the prefix `ds4-server` serves the page under, and the built index asks for its
+assets under the same prefix.
+
+`npm run dev` follows the same-origin rule from the other side: the page comes
+from Vite on port 5173 under `/chat/` and the server sits on port 8000, so the
+development server proxies `/v1` across. `DS4_API_TARGET` moves the proxy when
+the server is elsewhere or on another port; it is read by `vite.config.ts` and
+never reaches the browser.
+
+A page hosted somewhere other than the server itself - on another web server, or
+reached through `npm run preview` while the server runs elsewhere - does need the
+server's origin. Point `VITE_API_BASE` at it when building, as in
+`VITE_API_BASE=http://127.0.0.1:8000 npm run build`. The origin is read once at
+startup and every request goes to it after.
 
 Requests carry `stream: true` and are read from the byte stream as they arrive.
 The scanner works at byte level rather than line level because a data line can

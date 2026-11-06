@@ -12,10 +12,15 @@ It also records which checks were not completed. A smoke test is not full QA.
 Model-free checks include:
 
 ```sh
-make ds4_test ds4_agent_test test-session-state
+make ds4_test ds4_agent_test tests/test_ui test-session-state
 ./ds4_test --server
 ./ds4_agent_test
+./tests/test_ui
 ```
+
+`./ds4_test --server` covers the HTTP layer of `ds4-server`, the chat page paths
+included; `./tests/test_ui` covers the page's URL rules, asset safety and content
+types without a server running.
 
 On Metal, small GPU tensor tests are available without loading a full GGUF:
 
