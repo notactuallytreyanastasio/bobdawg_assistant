@@ -1,7 +1,9 @@
 #!/bin/bash
 # Run the coding tasks in tasks/ through ds4-agent and score them. Each task starts from a
 # fresh git repository holding repo/, and the model sees only prompt.txt. check.sh stays
-# outside its reach, runs in the result afterwards, and exit 0 is a pass.
+# outside its reach, runs in the result afterwards, and exit 0 is a pass. The agent runs with its
+# own defaults, so the score describes what a user gets. The last column counts tool calls the
+# agent could not parse, which keeps a harness fault from reading as the model failing the task.
 #
 # Usage: tests/agent_eval/run.sh [-n RUNS] [-o RESULTS.tsv] [task ...]
 # Needs the model, so nothing else may be holding it: stop ds4-server first.
@@ -27,7 +29,7 @@ fi
 work="$(mktemp -d "${TMPDIR:-/tmp}/ds4-eval-XXXXXX")"
 passed=0
 total=0
-[ -n "$out" ] && printf 'task\trun\tresult\tseconds\tnote\n' > "$out"
+[ -n "$out" ] && printf 'task\trun\tresult\tseconds\tinvalid\tnote\n' > "$out"
 for task in "$@"; do
   for run in $(seq 1 "$runs"); do
     dir="$work/$task-$run"
@@ -37,11 +39,12 @@ for task in "$@"; do
      git -c user.name=eval -c user.email=eval@example.com commit -q -m start)
     [ -f "$here/tasks/$task/setup.sh" ] && (cd "$dir" && sh "$here/tasks/$task/setup.sh")
     began=$(date +%s)
-    ${limit:+"$here/timeout.py" "$limit"} "$agent" --ctx 32768 --graph off --hooks off --instructions off \
+    ${limit:+"$here/timeout.py" "$limit"} "$agent" --graph off --hooks off --instructions off \
       --permissions all --chdir "$dir" --non-interactive --prompt-file "$here/tasks/$task/prompt.txt" \
       > "$dir.log" 2>&1
     status=$?
     seconds=$(( $(date +%s) - began ))
+    invalid="$(grep -c 'invalid tool call' "$dir.log")"
     note="$(cd "$dir" && sh -e "$here/tasks/$task/check.sh" 2>&1)"
     checked=$?
     note="$(printf '%s' "$note" | tail -1)"
@@ -54,8 +57,8 @@ for task in "$@"; do
     fi
     total=$((total + 1))
     [ "$result" = pass ] && passed=$((passed + 1))
-    printf '%-16s %d %-4s %4ss %s\n' "$task" "$run" "$result" "$seconds" "$note"
-    [ -n "$out" ] && printf '%s\t%d\t%s\t%d\t%s\n' "$task" "$run" "$result" "$seconds" "$note" >> "$out"
+    printf '%-16s %d %-4s %5ss %2s invalid %s\n' "$task" "$run" "$result" "$seconds" "$invalid" "$note"
+    [ -n "$out" ] && printf '%s\t%d\t%s\t%d\t%d\t%s\n' "$task" "$run" "$result" "$seconds" "$invalid" "$note" >> "$out"
   done
 done
 echo "passed $passed of $total; logs in $work"

@@ -1,4 +1,11 @@
-grep -qE '\b(eval|exec)\(' calc.py && grep -vE 'def evaluate|evaluate\(' calc.py | grep -qE '\b(eval|exec)\(' && { echo "used eval"; exit 1; }
+python3 - <<'P' || { echo "used eval"; exit 1; }
+import ast
+tree=ast.parse(open("calc.py").read())
+own={n.name for n in ast.walk(tree) if isinstance(n,(ast.FunctionDef,ast.ClassDef))}
+for n in ast.walk(tree):
+    if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id in("eval","exec") and n.func.id not in own:
+        raise SystemExit(1)
+P
 python3 - <<'P' || { echo "wrong result"; exit 1; }
 from calc import evaluate as e, CalcError
 for t,w in [("1+2*3",7),("(1+2)*3",9),("2^3^2",512),("-2^2",-4),("2^-1",0.5),(".5+.5",1.0),("7%3",1),("4/2",2.0),("  1 +  1 ",2),
