@@ -33,6 +33,7 @@ for task in "$@"; do
     cp -R "$here/tasks/$task/repo/." "$dir/"
     (cd "$dir" && git init -q -b main && git add -A &&
      git -c user.name=eval -c user.email=eval@example.com commit -q -m start)
+    [ -f "$here/tasks/$task/setup.sh" ] && (cd "$dir" && sh "$here/tasks/$task/setup.sh")
     began=$(date +%s)
     "$here/timeout.py" "$limit" "$agent" --ctx 32768 --graph off --hooks off --instructions off \
       --permissions all --chdir "$dir" --non-interactive --prompt-file "$here/tasks/$task/prompt.txt" \

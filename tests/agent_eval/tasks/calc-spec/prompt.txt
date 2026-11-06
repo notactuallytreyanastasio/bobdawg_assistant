@@ -1,0 +1,1 @@
+Implement SPEC.md in calc.py. Write your own tests as you go. The spec is exact, including its error cases.

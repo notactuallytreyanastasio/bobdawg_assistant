@@ -1,0 +1,1 @@
+total_price in shop.py gives the wrong answer for discounted orders, and it used to be right. Use the git history to find the commit that broke it, write that commit's full hash to ANSWER.txt, and fix the bug on top of the current code.

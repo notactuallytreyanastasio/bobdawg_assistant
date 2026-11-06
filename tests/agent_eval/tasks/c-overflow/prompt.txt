@@ -1,0 +1,1 @@
+join.c joins its arguments with commas. It works in the demo and crashes for real users. Find every memory bug and fix them, keeping its output the same. A check will build it with AddressSanitizer.

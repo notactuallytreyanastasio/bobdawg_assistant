@@ -1,0 +1,1 @@
+dedupe.py is far too slow on real data: dedupe_sessions takes minutes on 200,000 events. Make it fast without changing what it returns for any input.

@@ -1,0 +1,1 @@
+cache.py has an LRUCache that users say evicts the wrong entries, and sometimes grows past its capacity. Find and fix every bug. Keep the class's interface. Tests in test_cache.py pass today, so do not trust them to tell you it works.
