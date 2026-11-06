@@ -37,8 +37,8 @@ and the speed is all theirs. Everything here sits around the engine, and is most
 one question: what does a local model need around it to do real work over more than one
 sitting?</p>
 
-<p>Nineteen commits on top of upstream's <code>b3f5018</code> so far, about 28,000 lines
-added and 28 removed:</p>
+<p>Forty-two commits on top of upstream's <code>b3f5018</code> so far, about 35,500 lines
+added and 36 removed:</p>
 
 <ul>
   <li><strong>A memory for the agent.</strong> <code>ds4-agent</code> records goals, the
@@ -53,6 +53,10 @@ added and 28 removed:</p>
     conversations go into the same graph.</li>
   <li><strong>Artifacts.</strong> With Plot on, the model turns pasted data into a D3 chart
     or a whole page, which runs in a sandbox beside the chat and can be shared by link.</li>
+  <li><strong>A coding agent in the chat.</strong> With Workspace on, the model works in a
+    sandbox, and its thinking, its changes and the conversation sit side by side.</li>
+  <li><strong>A coding eval</strong>, with checks the model never sees, and a page for
+    walking the decision graph and asking the model about it.</li>
   <li><strong>Serving over a tailnet</strong>, so other machines can use the model
     without opening it to the local network.</li>
   <li><strong>A session recorder</strong>, and a Tetris written to give all of this
@@ -60,7 +64,7 @@ added and 28 removed:</p>
 </ul>
 
 <p>The only upstream code touched is <code>ds4_agent.c</code> and
-<code>ds4_server.c</code> (about 1,100 lines added between them), plus the agent's tests,
+<code>ds4_server.c</code> (about 2,100 lines added between them), plus the agent's tests,
 the Makefile, the help text and some docs.</p>
 
 <p>A note on who wrote this. A good part of the fork was written by the model running on
@@ -144,7 +148,84 @@ without one.</p>
     does not read it. The agent does, and the
     <a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/blob/main/docs/DECISION_GRAPH_ROADMAP.md">roadmap</a> says how far that has got.</li>
   <li><strong>A browsing tool</strong> for the chat is still only an idea.</li>
+  <li><strong>The graph page has not run against the real server yet.</strong> It needs a
+    restart that had not happened when this was written.</li>
+  <li><strong>Anyone who can reach the port can change the graph.</strong> The page asks before
+    a write, but the server has no login, so that protects people using the page and no one
+    else.</li>
+  <li><strong>The eval is one attempt per task.</strong> It shows what the model can do, not how
+    often.</li>
+  <li><strong>A long tool call still freezes the chat.</strong> It arrives whole, so nothing moves
+    until the model has finished writing it. Notes pinned to code also go away on reload, and
+    the changes pane does not show what a shell command changed.</li>
 </ul>
+
+<h2 id="2026-11-06-graph-page">A page for walking the graph</h2>
+<p><time datetime="2026-11-06">2026-11-06</time></p>
+
+<p>The graph now holds nearly seven hundred nodes on this fork, and it was only readable through
+tools. <code>/chat/graph.html</code> lists every goal with a timeline and a search, opens a goal
+into a tree that pans, zooms and folds, and reads any node with the person's own words, its commit
+and what it led to.</p>
+
+<p>Beside the tree, the local model answers questions about the history. It gets every tool the
+deciduous server offers, read from the server's own list rather than the eight the agent uses. The
+token stays in <code>ds4-server</code>, which keeps calls inside this repository's workspace.
+Known reads run by themselves. Anything else shows the exact call and waits for Allow, and that
+includes any tool added later.</p>
+
+<p>Be clear about the state of this one. It passes its tests and the layout was checked against
+real nodes, but it has not yet run against the real server, because that needs a restart. The
+question panel has not answered a real question. A new entry will say when it has.</p>
+
+<h2 id="2026-11-06-panes">Thinking, changes and chat, side by side</h2>
+<p><time datetime="2026-11-06">2026-11-06</time></p>
+
+<p>With Workspace on, a wide window now shows the model's thinking, each change it made and the
+conversation in three panes, and the bars between them drag. A dashed line joins a change to the
+thought behind it. Nothing guesses at that link: an edit arrives in the same message as the
+reasoning that led to it, so the page reads it straight from the transcript.</p>
+
+<p>Review works the way review usually does. Code counts as accepted, and you only speak up when
+something is wrong. Highlight some lines and a box opens under them, for a question, a comment or
+a Reject. The note goes into the normal chat with the code quoted, and the model answers it like
+any other message. In a test with real mouse input, Qwen answered a note about two lines, then
+reverted a rejected line and ran the file to show it was gone.</p>
+
+<p>The first version used a right-click menu with Accept and Reject buttons. The buttons were
+dropped because nearly everything is accepted, and the menu because it did not work for the person
+using it. Why it failed was never found, and the test that passed it was too simple to notice.</p>
+
+<h2 id="2026-11-06-fair-eval">The eval was holding the model back</h2>
+<p><time datetime="2026-11-06">2026-11-06</time></p>
+
+<p>The harder eval went badly, and the easy reading was that the tasks had found the limit of the
+model. The person directing this work said the tests were kneecapping it. They were right, and it
+was worse than bad test design.</p>
+
+<p><strong>The agent had a bug.</strong> Saved runs held 25 tool calls the agent could not parse,
+mostly the first call of a run. The server had 0 in 31 calls on the same model, which pointed away
+from the model. A token trace showed why: a good call opens with one special token, and the bad
+ones spelled <code>&lt;tool_call&gt;</code> out in ordinary text. The agent had been showing the
+model its tool prompt in plain text, where the server uses the real tokens, and the model sometimes
+copied what it saw. If its next reply held no call, the run simply ended, and that was scored as
+the model failing a task it had barely started. One task died that way in three seconds.</p>
+
+<p><strong>The eval was unfair too.</strong> It capped context at 32,768 tokens when real use allows
+100,000. One check failed any parser with its own method called <code>eval</code>, and another
+failed the model for the bytecode left by running the code. Two checks held the model to things the
+prompt never said, and one prompt said "for any input", which sent it into 18 minutes of cases the
+check never tested.</p>
+
+<p>With those fixed, Qwen passed <strong>14 of 14 tasks with no invalid tool calls</strong>, in 43
+minutes with no time limit. That is one attempt each, which shows what it can do rather than how
+reliably, and it is no comparison with any other model. Some prompts changed along the way, so it
+is not like for like with the earlier runs either.</p>
+
+<p>The same habit turned up on the web. Every tool result in the chat was cut to the 4,000 characters
+a chart needs, including file reads, with nothing to tell the model. It now gets 32,000 and is told
+when anything is left out. The lesson is written down for next time: before scoring a failure
+against the model, check the harness.</p>
 
 <h2 id="2026-11-06-workspace">A coding agent in the browser</h2>
 <p><time datetime="2026-11-06">2026-11-06</time></p>
