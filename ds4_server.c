@@ -7,6 +7,7 @@
 #include "ds4_tp.h"
 #include "rax.h"
 #include "ds4_ui.h"
+#include "ds4_share.h"
 #include "ds4_deciduous.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -10200,6 +10201,7 @@ struct server {
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     const char *ui_dir;   /* built chat page directory, served at /chat */
+    const char *share_dir; /* --share-dir: pages kept for links; NULL shares nothing */
     bool chat_graph_off;  /* --chat-graph off: the page's turns are not recorded */
     pthread_mutex_t chat_graph_mu; /* one graph handle, shared by client threads */
     ds4_dec *chat_graph;  /* opened by the first turn, and again until one opens */
@@ -15518,6 +15520,113 @@ static bool http_chat_record(int fd, server *s, const http_request *hr) {
     return true;
 }
 
+/* A page from the chat, kept so a link can open it. ds4_share.h says why it is held
+ * the way it is. Keeping one asks for application/json for the reason /chat/record
+ * does, and a page cannot ask at all: its policy gives it no connection to make.
+ *
+ * The reply never carries CORS headers, whatever --cors says. Nothing else needs to
+ * read a shared page, and the policy has to be on every copy of it. */
+typedef struct {
+    char *title;
+    char *page;
+} share_upload;
+
+static bool share_upload_parse(const char *body, share_upload *u) {
+    const char *p = body;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        json_ws(&p);
+        char **into = !strcmp(key, "title") ? &u->title : !strcmp(key, "page") ? &u->page : NULL;
+        free(key);
+        bool ok = into ? json_string_replace(&p, into) : json_skip_value(&p);
+        if (!ok) return false;
+        json_ws(&p);
+        if (*p == ',') {
+            p++;
+            json_ws(&p);
+        }
+    }
+    return *p == '}' && u->page && u->page[0];
+}
+
+static bool http_shared_reply(int fd, const char *body, size_t size) {
+    buf h = {0};
+    buf_printf(&h, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n", size);
+    buf_puts(&h, "Content-Type: text/html; charset=utf-8\r\n"
+                 "Content-Security-Policy: " DS4_SHARE_POLICY "\r\n"
+                 "X-Content-Type-Options: nosniff\r\n"
+                 "Referrer-Policy: no-referrer\r\n"
+                 "Cache-Control: no-store\r\n"
+                 "Connection: close\r\n\r\n");
+    bool ok = send_all(fd, h.ptr, h.len) && send_all(fd, body, size);
+    buf_free(&h);
+    return ok;
+}
+
+static void http_shared_keep(int fd, server *s, const http_request *hr) {
+    if (!hr->json_body) {
+        http_error(fd, s->enable_cors, 415, "a page is sent as application/json");
+        return;
+    }
+    share_upload u = {0};
+    if (!share_upload_parse(hr->body ? hr->body : "", &u)) {
+        free(u.title);
+        free(u.page);
+        http_error(fd, s->enable_cors, 400, "sharing needs a page");
+        return;
+    }
+    char id[DS4_SHARE_ID_CHARS + 1];
+    char err[160] = {0};
+    ds4_share_result kept = ds4_share_store(s->share_dir, u.title, u.page, id, err, sizeof(err));
+    free(u.title);
+    free(u.page);
+    if (kept != ds4_share_stored) {
+        int code = kept == ds4_share_too_large ? 413 : kept == ds4_share_full ? 507 : 500;
+        if (code == 500) server_log(DS4_LOG_DEFAULT, "ds4-server: page not shared: %s", err);
+        http_error(fd, s->enable_cors, code, err);
+        return;
+    }
+    buf b = {0};
+    buf_puts(&b, "{\"path\":");
+    char path[sizeof(DS4_SHARE_URL_PATH) + DS4_SHARE_ID_CHARS + 1];
+    snprintf(path, sizeof(path), "%s/%s", DS4_SHARE_URL_PATH, id);
+    json_escape(&b, path);
+    buf_puts(&b, "}");
+    http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+}
+
+static bool http_shared_page(int fd, server *s, const http_request *hr) {
+    if (!s->share_dir) return false;
+    if (!strcmp(hr->method, "POST") && !strcmp(hr->path, DS4_SHARE_URL_PATH)) {
+        http_shared_keep(fd, s, hr);
+        return true;
+    }
+    if (strcmp(hr->method, "GET") != 0 || strncmp(hr->path, DS4_SHARE_URL_PATH "/", sizeof(DS4_SHARE_URL_PATH)) != 0)
+        return false;
+    char id[DS4_SHARE_ID_CHARS + 1];
+    size_t size = 0;
+    char *reply = ds4_share_id_of_path(hr->path, id) ? ds4_share_load(s->share_dir, id, &size) : NULL;
+    if (!reply) {
+        http_error(fd, s->enable_cors, 404, "no page is shared at this address");
+        return true;
+    }
+    http_shared_reply(fd, reply, size);
+    free(reply);
+    return true;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -15555,7 +15664,7 @@ static void *client_main(void *arg) {
     /* The built chat page answers from this origin when --ui-dir names it, so
      * the page asks relative /v1 paths and needs no server address baked into
      * its bundle and no cross-origin headers on the API. */
-    if (http_page_response(fd, s, &hr) || http_chat_record(fd, s, &hr)) {
+    if (http_shared_page(fd, s, &hr) || http_page_response(fd, s, &hr) || http_chat_record(fd, s, &hr)) {
         http_request_free(&hr);
         goto done;
     }
@@ -15684,6 +15793,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     const char *ui_dir;   /* --ui-dir: built chat page directory */
+    const char *share_dir; /* --share-dir */
     bool chat_graph_off;  /* --chat-graph off */
     int batched_sessions;
     int mixed_prefill_quantum;
@@ -15926,6 +16036,8 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--ui-dir")) {
             c.ui_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--share-dir")) {
+            c.share_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-graph")) {
             const char *mode = need_arg(&i, argc, argv, arg);
             if (strcmp(mode, "on") != 0 && strcmp(mode, "off") != 0) {
@@ -16217,6 +16329,7 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     s.ui_dir = cfg.ui_dir;
+    s.share_dir = cfg.share_dir;
     s.chat_graph_off = cfg.chat_graph_off;
     pthread_mutex_init(&s.chat_graph_mu, NULL);
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
@@ -16347,6 +16460,15 @@ int main(int argc, char **argv) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: %s holds no %s; run npm --prefix chat-web run build",
                        cfg.ui_dir, DS4_UI_INDEX_FILE);
+        }
+    }
+    if (s.share_dir) {
+        char share_err[160] = {0};
+        if (ds4_share_prepare(s.share_dir, share_err, sizeof(share_err))) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: shared pages kept in %s", s.share_dir);
+        } else {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: sharing is off: %s: %s", s.share_dir, share_err);
+            s.share_dir = NULL;
         }
     }
 
@@ -17564,6 +17686,98 @@ static void test_chat_record_route(void) {
     TEST_ASSERT(!strcmp(r.answer, "line\none") && !strcmp(r.ending, "length"));
     chat_record_free(&r);
     pthread_mutex_destroy(&s.chat_graph_mu);
+}
+
+static char *shared_reply(server *s, const char *method, const char *path, bool json, const char *body) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+    http_request hr = {0};
+    snprintf(hr.method, sizeof(hr.method), "%s", method);
+    snprintf(hr.path, sizeof(hr.path), "%s", path);
+    hr.body = (char *)body;
+    hr.json_body = json;
+    bool served = http_shared_page(sv[0], s, &hr);
+    shutdown(sv[0], SHUT_WR);
+    char *out = served ? read_socket_text(sv[1]) : NULL;
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+/* The upload is written to break out of the shell, so what is checked is that it
+ * arrives as text inside the attribute, under the server's policy and no other. */
+static void test_shared_pages(void) {
+    char dir[] = "/tmp/ds4-share-test-XXXXXX";
+    TEST_ASSERT(mkdtemp(dir) != NULL);
+    server s = {0};
+
+    char *out = shared_reply(&s, "POST", DS4_SHARE_URL_PATH, true, "{\"page\":\"x\"}");
+    TEST_ASSERT(out == NULL);
+    free(out);
+
+    s.share_dir = dir;
+    s.enable_cors = true;
+    out = shared_reply(&s, "POST", DS4_SHARE_URL_PATH, false, "{\"page\":\"x\"}");
+    TEST_ASSERT(out && strstr(out, "HTTP/1.1 415") != NULL);
+    free(out);
+    out = shared_reply(&s, "POST", DS4_SHARE_URL_PATH, true, "{\"title\":\"no page\"}");
+    TEST_ASSERT(out && strstr(out, "HTTP/1.1 400") != NULL);
+    free(out);
+
+    const char *hostile = "{\"title\":\"a</title><script>t()</script>\\r\\nInjected: 1\","
+                          "\"page\":\"\\\"></iframe><script>p()</script>&amp;\"}";
+    out = shared_reply(&s, "POST", DS4_SHARE_URL_PATH, true, hostile);
+    TEST_ASSERT(out && strstr(out, "HTTP/1.1 200") != NULL);
+    const char *at = out ? strstr(out, "\"path\":\"") : NULL;
+    TEST_ASSERT(at != NULL);
+    char path[128] = {0};
+    if (at) sscanf(at + 8, "%127[^\"]", path);
+    free(out);
+    char id[DS4_SHARE_ID_CHARS + 1];
+    TEST_ASSERT(ds4_share_id_of_path(path, id));
+
+    out = shared_reply(&s, "GET", path, false, NULL);
+    TEST_ASSERT(out && strstr(out, "HTTP/1.1 200") != NULL);
+    TEST_ASSERT(out && strstr(out, "Content-Security-Policy: " DS4_SHARE_POLICY "\r\n") != NULL);
+    TEST_ASSERT(out && strstr(out, "X-Content-Type-Options: nosniff") != NULL);
+    TEST_ASSERT(out && strstr(out, "Access-Control-Allow") == NULL);
+    TEST_ASSERT(out && strstr(out, "<iframe sandbox=\"allow-scripts\"") != NULL);
+    TEST_ASSERT(out && strstr(out, "<script") == NULL);
+    TEST_ASSERT(out && strstr(out, "Injected: 1\r\n") == NULL);
+    TEST_ASSERT(out && strstr(out, "&quot;&gt;&lt;/iframe&gt;&lt;script&gt;p()&lt;/script&gt;&amp;amp;\"></iframe>") != NULL);
+    free(out);
+
+    const char *refused[] = {
+        DS4_SHARE_URL_PATH "/0123456789abcdef0123456789abcdef",  /* well formed, not there */
+        DS4_SHARE_URL_PATH "/../../etc/passwd",
+        DS4_SHARE_URL_PATH "/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+        DS4_SHARE_URL_PATH "/0123456789ABCDEF0123456789ABCDEF",
+        DS4_SHARE_URL_PATH "/0123456789abcdef0123456789abcdef.page",
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        out = shared_reply(&s, "GET", refused[i], false, NULL);
+        TEST_ASSERT(out && strstr(out, "HTTP/1.1 404") != NULL);
+        free(out);
+    }
+
+    /* Too large is refused whole, and the cap on pages holds. */
+    char *big = malloc(DS4_SHARE_MAX_PAGE + 2);
+    TEST_ASSERT(big != NULL);
+    char kept[DS4_SHARE_ID_CHARS + 1];
+    char err[160];
+    if (big) {
+        memset(big, 'x', DS4_SHARE_MAX_PAGE + 1);
+        big[DS4_SHARE_MAX_PAGE + 1] = '\0';
+        TEST_ASSERT(ds4_share_store(dir, "t", big, kept, err, sizeof(err)) == ds4_share_too_large);
+        free(big);
+    }
+    for (int i = 1; i < DS4_SHARE_MAX_PAGES; i++)
+        TEST_ASSERT(ds4_share_store(dir, "t", "p", kept, err, sizeof(err)) == ds4_share_stored);
+    TEST_ASSERT(ds4_share_store(dir, "t", "p", kept, err, sizeof(err)) == ds4_share_full);
+
+    char command[128];
+    snprintf(command, sizeof(command), "rm -rf %s", dir);
+    TEST_ASSERT(system(command) == 0);
 }
 
 static void test_chat_page_serving(void) {
@@ -23537,6 +23751,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_sse_headers();
     test_chat_page_serving();
     test_chat_record_route();
+    test_shared_pages();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();

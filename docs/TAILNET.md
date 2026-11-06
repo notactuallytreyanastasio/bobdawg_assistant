@@ -21,7 +21,8 @@ and no TLS: tailnet membership and Tailscale ACLs are the access control.
 It prints the base URL tailnet clients should use, including the MagicDNS name
 when Tailscale DNS answers. Flags are passed through to ds4-server, and defaults
 are added only when you omit them: `--ctx 100000`, `--kv-disk-dir ~/.ds4/server-kv`,
-`--kv-disk-space-mb 8192`, and `--ui-dir chat-web/dist` for the chat page below.
+`--kv-disk-space-mb 8192`, and `--share-dir ~/.ds4/shared` for pages shared from the chat, and `--ui-dir
+chat-web/dist` for the chat page below.
 `DS4_TAILNET_HOST` forces the bind address if the discovery picks the wrong
 interface.
 

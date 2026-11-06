@@ -14,9 +14,10 @@
 #   DS4_TAILNET_HOST=100.123.0.9 ./serve-tailnet.sh
 #
 # Defaults added only when you do not pass them: --ctx 100000,
-# --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192, and --ui-dir for the
-# chat page, which is built here when its output is missing or older than the
-# page sources. Pass --ui-dir yourself to serve a build from somewhere else.
+# --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 8192, --share-dir
+# ~/.ds4/shared for pages shared from the chat, and --ui-dir for the chat page,
+# which is built here when its output is missing or older than the page sources.
+# Pass --ui-dir yourself to serve a build from somewhere else.
 #
 # Only one ds4 process runs at a time (flock on /tmp/ds4.lock); stop
 # ds4-agent-poc or any other ds4 binary before starting the server.
@@ -61,6 +62,7 @@ has_host=0
 has_ctx=0
 has_kv=0
 has_ui=0
+has_share=0
 port=8000
 prev=""
 for a in "$@"; do
@@ -69,6 +71,7 @@ for a in "$@"; do
     --ctx) has_ctx=1 ;;
     --kv-disk-dir) has_kv=1 ;;
     --ui-dir) has_ui=1 ;;
+    --share-dir) has_share=1 ;;
   esac
   if [ "$prev" = "--port" ]; then port="$a"; fi
   prev="$a"
@@ -127,6 +130,7 @@ final=()
 if [ "$has_host" = 0 ]; then final+=(--host "$tailnet_ip"); fi
 if [ "$has_ctx" = 0 ]; then final+=(--ctx 100000); fi
 if [ "$has_kv" = 0 ]; then final+=(--kv-disk-dir "$HOME/.ds4/server-kv" --kv-disk-space-mb 8192); fi
+if [ "$has_share" = 0 ]; then final+=(--share-dir "$HOME/.ds4/shared"); fi
 if [ "$page_status" = served ]; then
   final+=(--ui-dir "$repo/$page")
 fi

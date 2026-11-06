@@ -84,6 +84,19 @@ repository's workspace; a server with no deciduous configured answers `503` and 
 says the turn was not recorded. `--chat-graph off` turns it off. See
 [the chat page in the decision graph docs](DECISION_GRAPH.md#the-chat-page).
 
+`--share-dir DIR` lets the page keep a finished chart or page for a link. `POST
+/chat/shared` takes `application/json` holding `title` and `page`, and answers with
+a `path`; `GET /chat/shared/<id>` opens it. The directory is made for this user
+alone, and holds at most 256 pages of 4 MiB. There is no way to delete one over
+HTTP: remove `<id>.page` from the directory. Without the flag nothing is kept.
+
+The upload is not trusted. A reader gets a shell with no script in it, holding the
+page in a sandboxed `srcdoc` frame, under a policy the server sends on every reply
+and the frame inherits, so a page cannot reach the API or navigate away. Anyone who
+can reach the port can upload, and the policy does not cover WebRTC or DNS: a page
+made by hand can send out what it holds and learn that it was opened, as any website
+can. It gets nothing of the reader's.
+
 `--ui-dir` says where the build lives; it does not build it, and a directory with
 no build in it is reported at startup rather than fatal - the API serves anyway.
 `./serve-tailnet.sh` builds the page when its output is missing or older than the
