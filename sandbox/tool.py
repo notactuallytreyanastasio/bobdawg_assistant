@@ -6,6 +6,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -16,6 +17,10 @@ SEARCH_RESULTS = 100
 BASH_SECONDS = 60
 BASH_SECONDS_MAX = 280
 SKIPPED_DIRS = {".git", "node_modules", "__pycache__", ".venv"}
+TREE_FILES = 500
+SNAPSHOTS = "/snapshots"
+SNAPSHOTS_KEPT = 5
+SNAPSHOT_BYTES = 200 * 1024 * 1024
 
 
 def clip(text):
@@ -57,6 +62,8 @@ def read(args):
         lines = source.readlines()
     start = max(int(args.get("start_line") or 1), 1)
     count = min(int(args.get("max_lines") or READ_LINES), READ_LINES)
+    if args.get("raw"):
+        return True, clip("".join(lines))
     shown = lines[start - 1:start - 1 + count]
     body = "".join(f"{start + i}\t{line}" for i, line in enumerate(shown))
     rest = len(lines) - (start - 1 + len(shown))
@@ -121,7 +128,61 @@ def search(args):
     return True, "\n".join(found) or "no matches"
 
 
-TOOLS = {"bash": bash, "read": read, "write": write, "edit": edit, "list": listing, "search": search}
+def tree(args):
+    rows = []
+    for folder, dirs, files in os.walk("/work"):
+        dirs[:] = sorted(d for d in dirs if d not in SKIPPED_DIRS)
+        for name in sorted(files):
+            full = os.path.join(folder, name)
+            if os.path.isfile(full) and len(rows) < TREE_FILES:
+                rows.append(f"{os.path.relpath(full, '/work')}\t{os.path.getsize(full)}")
+    return True, "\n".join(rows)
+
+
+def held():
+    return sorted((int(name) for name in os.listdir(SNAPSHOTS) if name.isdigit()))
+
+
+def bytes_in(path):
+    return sum(os.path.getsize(os.path.join(folder, name)) for folder, _, files in os.walk(path)
+               for name in files if os.path.isfile(os.path.join(folder, name)))
+
+
+def snapshot(args):
+    """The whole directory as a turn found it. A copy of everything, so it answers for what
+    bash did as well as the file tools, and it lives on a volume of its own so that it is
+    never in the model's way or in a git add."""
+    if bytes_in("/work") > SNAPSHOT_BYTES:
+        return False, "the workspace is too large to keep a copy of"
+    taken = held()
+    number = (taken[-1] + 1) if taken else 1
+    target = f"{SNAPSHOTS}/{number}"
+    os.makedirs(f"{target}.part", exist_ok=True)
+    subprocess.run(["cp", "-a", "/work/.", f"{target}.part/"], check=True)
+    os.rename(f"{target}.part", target)
+    for old in held()[:-SNAPSHOTS_KEPT]:
+        shutil.rmtree(f"{SNAPSHOTS}/{old}", ignore_errors=True)
+    return True, f"kept {number}"
+
+
+def restore(args):
+    taken = held()
+    if not taken:
+        return False, "nothing to undo"
+    source = f"{SNAPSHOTS}/{taken[-1]}"
+    for name in os.listdir("/work"):
+        full = os.path.join("/work", name)
+        if os.path.isdir(full) and not os.path.islink(full):
+            shutil.rmtree(full)
+        else:
+            os.remove(full)
+    subprocess.run(["cp", "-a", f"{source}/.", "/work/"], check=True)
+    shutil.rmtree(source)
+    return True, "the workspace is back as it was before the last turn"
+
+
+TOOLS = {"bash": bash, "read": read, "write": write, "edit": edit, "list": listing, "search": search,
+         "tree": tree, "snapshot": snapshot, "restore": restore}
 
 
 def main():
@@ -130,7 +191,7 @@ def main():
         ok, text = TOOLS[request["tool"]](request.get("args") or {})
     except KeyError as missing:
         ok, text = False, f"missing or unknown: {missing}"
-    except (OSError, ValueError, re.error, TypeError) as reason:
+    except (OSError, ValueError, re.error, TypeError, subprocess.CalledProcessError) as reason:
         ok, text = False, str(reason)
     json.dump({"ok": ok, "text": text}, sys.stdout)
 

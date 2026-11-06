@@ -12,6 +12,7 @@ import { sharePage } from './api/sharePage';
 import { NO_WORKSPACES, createWorkspace, isWorkspaceId, runInWorkspace } from './api/workspace';
 import type { RecordResult } from './api/recordTurn';
 import { artifactsOf } from './chat/artifact';
+import { expandCommand } from './chat/commands';
 import type { Conversation } from './chat/conversation';
 import { contextPercent } from './chat/format';
 import {
@@ -27,6 +28,7 @@ import {
 } from './chat/storage';
 import type { StoreLike } from './chat/storage';
 import { ArtifactPanel } from './components/ArtifactPanel';
+import { WorkspacePanel } from './components/WorkspacePanel';
 import type { PanelTab } from './components/ArtifactPanel';
 import { Composer } from './components/Composer';
 import { MenuIcon, RetryIcon } from './components/icons';
@@ -73,6 +75,7 @@ export function App({
   const [graph, setGraph] = useState<RecordResult | null>(null);
   const [plot, setPlot] = useState(() => loadPlot(store));
   const [workspace, setWorkspace] = useState(() => loadWorkspaceOn(store));
+  const [filesOpen, setFilesOpen] = useState(false);
   // The chart in the panel, by its key, or by call id for one the turn has only just made.
   const [openArtifact, setOpenArtifact] = useState<string | null>(null);
   const [panelTab, setPanelTab] = useState<PanelTab>('preview');
@@ -222,6 +225,18 @@ export function App({
     saveThinking(store, next);
   }
 
+  const askSandbox = (tool: string, args: Readonly<Record<string, unknown>>) =>
+    runInSandbox(tool, args, new AbortController().signal);
+
+  // A command is only a shorter way to say something, so it is said in full before it is sent.
+  function sendTyped(text: string): void {
+    if (!workspace) {
+      chat.send(text);
+      return;
+    }
+    void expandCommand(text, (path) => askSandbox('read', { path, raw: true })).then(chat.send);
+  }
+
   function choosePlot(next: boolean): void {
     setPlot(next);
     savePlot(store, next);
@@ -268,6 +283,11 @@ export function App({
             <span className={ready ? 'dot up' : unreachable ? 'dot down' : 'dot'} aria-hidden="true" />
             {model?.name ?? 'ds4-server'}
           </p>
+          {workspace ? (
+            <button className="tool" type="button" aria-pressed={filesOpen} onClick={() => setFilesOpen(!filesOpen)}>
+              <span>Files</span>
+            </button>
+          ) : null}
           {graph === 'recorded' ? (
             <span className="graph" title="Each finished turn is written to the deciduous decision graph">
               In the decision graph
@@ -281,7 +301,7 @@ export function App({
         </header>
 
         {messages.length === 0 && !streaming ? (
-          <Welcome ready={ready} onPick={chat.send} />
+          <Welcome ready={ready} onPick={sendTyped} />
         ) : (
           <Transcript
             conversation={chat.conversation}
@@ -315,7 +335,7 @@ export function App({
           onPlot={choosePlot}
           workspace={workspace}
           onWorkspace={chooseWorkspace}
-          onSend={chat.send}
+          onSend={sendTyped}
           onStop={chat.stop}
           {...(notice === undefined ? {} : { notice })}
         />
@@ -339,6 +359,14 @@ export function App({
         onFull={setFullView}
         onStep={step}
         onShare={async () => (current === null ? { kind: 'failed' } : sharePage({ origin, artifact: current, fetchImpl: send }))}
+      />
+      <WorkspacePanel
+        open={workspace && filesOpen}
+        // A turn ending is when the files have something new to show.
+        version={`${messages.length}:${streaming}`}
+        busy={streaming}
+        run={askSandbox}
+        onClose={() => setFilesOpen(false)}
       />
     </div>
   );

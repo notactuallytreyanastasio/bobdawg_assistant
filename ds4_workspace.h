@@ -33,10 +33,11 @@
 
 bool ds4_workspace_id_is_valid(const char *id);
 
-/* The argument list for one call, NULL-terminated. The strings it builds go in
- * volume and name, which must outlive it. */
+/* The argument list for one call, NULL-terminated. The strings it builds go in volume,
+ * snapshots and name, which must outlive it. */
 void ds4_workspace_argv(const char *docker, const char *id, char *volume, size_t volume_len,
-                        char *name, size_t name_len, const char *argv[DS4_WORKSPACE_ARGV_MAX]);
+                        char *snapshots, size_t snapshots_len, char *name, size_t name_len,
+                        const char *argv[DS4_WORKSPACE_ARGV_MAX]);
 
 /* True when docker answers and the image is there. */
 bool ds4_workspace_ready(const char *docker, char *err, size_t err_len);

@@ -1155,3 +1155,47 @@ button:disabled {
     font-size: 16px;
   }
 }
+
+.files {
+  flex: none;
+  max-height: 40%;
+  margin: 0;
+  padding: 6px 12px;
+  overflow: auto;
+  list-style: none;
+  border-bottom: 1px solid var(--line);
+}
+
+.files button {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.files button:hover,
+.files button[aria-pressed='true'] {
+  background: var(--line);
+}
+
+.files .size {
+  flex: none;
+  color: var(--dim);
+}
+
+.file-view {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  padding: 6px 12px;
+}

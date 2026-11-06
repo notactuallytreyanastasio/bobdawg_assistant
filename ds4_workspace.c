@@ -24,9 +24,11 @@ bool ds4_workspace_id_is_valid(const char *id) {
 }
 
 void ds4_workspace_argv(const char *docker, const char *id, char *volume, size_t volume_len,
-                        char *name, size_t name_len, const char *argv[DS4_WORKSPACE_ARGV_MAX]) {
+                        char *snapshots, size_t snapshots_len, char *name, size_t name_len,
+                        const char *argv[DS4_WORKSPACE_ARGV_MAX]) {
     static unsigned serial;
     snprintf(volume, volume_len, "ds4ws-%s:/work", id);
+    snprintf(snapshots, snapshots_len, "ds4ws-%s-undo:/snapshots", id);
     snprintf(name, name_len, "ds4run-%d-%u", (int)getpid(), __atomic_add_fetch(&serial, 1, __ATOMIC_RELAXED));
     const char *fixed[] = {
         docker, "run", "--rm", "-i",
@@ -41,6 +43,7 @@ void ds4_workspace_argv(const char *docker, const char *id, char *volume, size_t
         "--user", "1000:1000",
         "--name", name,
         "-v", volume,
+        "-v", snapshots,
         DS4_WORKSPACE_IMAGE,
         NULL,
     };
@@ -114,9 +117,10 @@ char *ds4_workspace_run(const char *docker, const char *id, const char *request,
     fcntl(from_child[0], F_SETFD, FD_CLOEXEC);
 
     char volume[DS4_WORKSPACE_ID_CHARS + 16];
+    char snapshots[DS4_WORKSPACE_ID_CHARS + 32];
     char name[64];
     const char *argv[DS4_WORKSPACE_ARGV_MAX];
-    ds4_workspace_argv(docker, id, volume, sizeof(volume), name, sizeof(name), argv);
+    ds4_workspace_argv(docker, id, volume, sizeof(volume), snapshots, sizeof(snapshots), name, sizeof(name), argv);
     pid_t pid;
     bool spawned = spawn_quiet(docker, argv, to_child[0], from_child[1], &pid);
     close(to_child[0]);

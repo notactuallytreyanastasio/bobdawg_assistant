@@ -17987,6 +17987,7 @@ static void test_workspaces(void) {
     static const char *const locks[] = {
         "--network\nnone\n", "--read-only\n", "--cap-drop\nALL\n", "no-new-privileges\n", "--pids-limit\n",
         "--memory\n1g\n", "--memory-swap\n1g\n", "--user\n1000:1000\n", "ds4ws-0123456789abcdef0123456789abcdef:/work\n",
+        "ds4ws-0123456789abcdef0123456789abcdef-undo:/snapshots\n",
         DS4_WORKSPACE_IMAGE "\n",
     };
     for (size_t i = 0; i < sizeof(locks) / sizeof(locks[0]); i++) TEST_ASSERT(strstr(args, locks[i]) != NULL);

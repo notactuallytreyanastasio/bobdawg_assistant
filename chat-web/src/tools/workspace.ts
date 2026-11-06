@@ -16,7 +16,7 @@ export type WorkspaceRunner = (
   signal: AbortSignal,
 ) => Promise<ToolResult>;
 
-export const WORKSPACE_SYSTEM = `You are a coding agent working in a sandbox, in the directory /work. It is yours and it persists between chats: look at what is already there before assuming it is empty. If it holds an AGENT.md, read it and follow it.
+export const WORKSPACE_SYSTEM = `You are a coding agent working in a sandbox, in the directory /work. It is yours and it persists between chats: look at what is already there before assuming it is empty. If it holds an AGENT.md, read it and follow it. The person can undo a turn or change files between turns, so check a file again rather than trusting what you remember of it.
 
 You have a shell with python3, node, gcc, make, git, sqlite3, ripgrep and jq. There is no network at all, so nothing can be installed: use what is here. Commands run one per call, each in a fresh process starting in /work, so cd and exported variables do not carry over. Anything left running is stopped when the call ends.
 
@@ -100,6 +100,10 @@ export function workspaceAssistant(run: WorkspaceRunner): Assistant {
     label: 'Workspace',
     system: WORKSPACE_SYSTEM,
     rounds: WORKSPACE_ROUNDS,
+    // A copy of the directory as this turn found it, which is what Undo goes back to.
+    prepare: async (signal) => {
+      await run('snapshot', {}, signal);
+    },
     tools: [
       ...DEFINITIONS.map((tool) => ({
         ...tool,

@@ -145,6 +145,8 @@ export function useChat(config: ChatConfig): Chat {
 
   async function answer(myTurn: number, signal: AbortSignal, assistant: Assistant | null): Promise<void> {
     try {
+      await assistant?.prepare?.(signal).catch(() => undefined);
+      if (myTurn !== turn.current) return;
       let previous: ToolResult | null = null;
       for (let round = 1; ; round += 1) {
         const { outcome, stats } = await stream(myTurn, signal, assistant);

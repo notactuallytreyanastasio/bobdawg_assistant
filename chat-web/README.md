@@ -213,6 +213,12 @@ volume in Docker's VM, so no directory of the host is mounted, and the file tool
 well, so a symlink has nothing on the host to lead to. Build the image once with
 `docker build -t ds4-sandbox sandbox`. `ds4_workspace.h` has the reasoning.
 
+**Files** beside the chat lists the workspace and shows any file as text. **Undo last turn** puts
+everything back as that turn found it. Each turn starts by copying the whole directory, so this
+answers for what bash did too, which the terminal agent's `/undo` cannot. It keeps five, on a
+volume of their own, and a workspace over 200 MB gets no copy. `/init`, `/review` and
+`.ds4/commands/<name>.md` in the workspace work as they do in `ds4-agent`.
+
 What holds it apart from another person's workspace is a random id kept in this browser, so
 clearing the browser's storage loses the way back to it. Nothing limits disk but the VM's own
 size, and this has been tested by us and not independently.

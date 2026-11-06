@@ -18,6 +18,8 @@ export type Assistant = {
   readonly clip?: (text: string) => string;
   // Calls a turn may make. Without this it is MAX_ROUNDS.
   readonly rounds?: number;
+  // Done before a turn's first request. It may fail, and the turn goes on without it.
+  readonly prepare?: (signal: AbortSignal) => Promise<void>;
 };
 
 export const PLOT_SYSTEM = `You turn the data a person pastes into one striking, correct D3 chart. Look at the data, pick the form that shows what is most interesting in it, then call the plot tool. The tool takes exactly one argument, code. The first line of code is a comment naming the chart: // title: ... After the tool answers ok, say in one or two sentences what the chart shows. Do not call it again to polish wording or layout.
