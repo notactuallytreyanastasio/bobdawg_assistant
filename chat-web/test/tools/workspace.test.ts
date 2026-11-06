@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { WORKSPACE_ROUNDS, WORKSPACE_TOOLS, workspaceAssistant } from '../../src/tools/workspace';
+import { WORKSPACE_RESULT_CHARS, WORKSPACE_ROUNDS, WORKSPACE_TOOLS, workspaceAssistant } from '../../src/tools/workspace';
 import type { WorkspaceRunner } from '../../src/tools/workspace';
 import { runToolCall } from '../../src/tools/tool';
 
@@ -23,6 +23,14 @@ describe('workspaceAssistant', () => {
     const result = await runToolCall(tools, call('bash', { command: 'ls' }), context);
     expect(result.text).toBe('out');
     expect(run).toHaveBeenCalledWith('bash', { command: 'ls' }, context.signal);
+  });
+
+  it('lets the model read far more than a chart result, and says where it was cut', async () => {
+    const run = vi.fn<WorkspaceRunner>(async () => ({ ok: true, text: 'x'.repeat(WORKSPACE_RESULT_CHARS + 5) }));
+    const { tools } = workspaceAssistant(run);
+    const result = await runToolCall(tools, call('read', { path: 'big' }), context);
+    expect(result.text.startsWith('x'.repeat(WORKSPACE_RESULT_CHARS))).toBe(true);
+    expect(result.text.endsWith('[cut here: 5 more characters not shown]')).toBe(true);
   });
 
   it('keeps a task list without the sandbox, and refuses a bad one', async () => {

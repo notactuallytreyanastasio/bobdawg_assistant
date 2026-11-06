@@ -10,6 +10,9 @@ import type { ToolDefinition, ToolResult } from './tool';
 // many times over, and a person can press Stop.
 export const WORKSPACE_ROUNDS = 40;
 
+// A file or a build log is what the model works from, and it is told where anything was cut.
+export const WORKSPACE_RESULT_CHARS = 32000;
+
 export type WorkspaceRunner = (
   tool: string,
   args: Readonly<Record<string, unknown>>,
@@ -107,6 +110,7 @@ export function workspaceAssistant(run: WorkspaceRunner): Assistant {
     tools: [
       ...DEFINITIONS.map((tool) => ({
         ...tool,
+        resultChars: WORKSPACE_RESULT_CHARS,
         run: (args: Readonly<Record<string, unknown>>, context: { readonly signal: AbortSignal }) =>
           run(tool.name, args, context.signal),
       })),

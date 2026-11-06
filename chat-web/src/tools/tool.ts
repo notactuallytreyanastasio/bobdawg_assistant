@@ -23,6 +23,8 @@ export type ToolDefinition = {
   readonly name: string;
   readonly description: string;
   readonly parameters: Readonly<Record<string, unknown>>;
+  // How much of an answer the model gets, when that is not TOOL_RESULT_CHARS.
+  readonly resultChars?: number;
   readonly run: (args: Readonly<Record<string, unknown>>, context: ToolContext) => Promise<ToolResult>;
 };
 
@@ -105,5 +107,9 @@ export async function runToolCall(
   context: ToolContext,
 ): Promise<ToolResult> {
   const result = await attempt(tools, call, context);
-  return { ...result, text: result.text.slice(0, TOOL_RESULT_CHARS) };
+  const limit = tools.find((tool) => tool.name === call.name)?.resultChars ?? TOOL_RESULT_CHARS;
+  if (result.text.length <= limit) return result;
+  // The model has to know it did not see everything, or it reasons from half a file.
+  const hidden = result.text.length - limit;
+  return { ...result, text: `${result.text.slice(0, limit)}\n[cut here: ${hidden} more characters not shown]` };
 }

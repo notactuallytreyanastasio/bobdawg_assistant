@@ -95,13 +95,14 @@ describe('runToolCall', () => {
   it('holds every result to the limit', async () => {
     const long = tool(async () => ({ ok: true, text: 'x'.repeat(TOOL_RESULT_CHARS * 2) }));
     const result = await runToolCall([long], call('{}'), context());
-    expect(result.text).toHaveLength(TOOL_RESULT_CHARS);
+    const held = (text: string) => text.length < TOOL_RESULT_CHARS + 60 && text.includes('[cut here: ');
+    expect(held(result.text)).toBe(true);
     const thrower = tool(async () => {
       throw new Error('y'.repeat(TOOL_RESULT_CHARS * 2));
     });
-    expect((await runToolCall([thrower], call('{}'), context())).text).toHaveLength(TOOL_RESULT_CHARS);
+    expect(held((await runToolCall([thrower], call('{}'), context())).text)).toBe(true);
     const name = 'n'.repeat(TOOL_RESULT_CHARS * 2);
-    expect((await runToolCall([], call('{}', name), context())).text).toHaveLength(TOOL_RESULT_CHARS);
+    expect(held((await runToolCall([], call('{}', name), context())).text)).toBe(true);
   });
 });
 
