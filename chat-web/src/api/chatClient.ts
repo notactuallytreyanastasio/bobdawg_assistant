@@ -18,6 +18,21 @@ export type ChatRequest = {
   readonly model: string;
   readonly messages: readonly WireMessage[];
   readonly stream: true;
+  readonly stream_options: { readonly include_usage: true };
+  readonly chat_template_kwargs?: { readonly enable_thinking: boolean };
+};
+
+export type Usage = {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+};
+
+// How a stream ended. finish is the server's finish_reason, and stays null when the reader
+// stopped before the server said one.
+export type StreamOutcome = {
+  readonly finish: string | null;
+  readonly usage: Usage | null;
+  readonly stopped: boolean;
 };
 
 export type ChatStreamOptions = {
@@ -26,6 +41,7 @@ export type ChatStreamOptions = {
   readonly origin: string;
   readonly signal?: AbortSignal;
   readonly fetchImpl?: FetchLike;
+  readonly thinking?: boolean;
   readonly onDelta: (delta: Delta) => void;
 };
 
@@ -53,14 +69,31 @@ type Chunk = {
       readonly content?: unknown;
       readonly reasoning_content?: unknown;
     };
+    readonly finish_reason?: unknown;
   }[];
+  readonly usage?: {
+    readonly prompt_tokens?: unknown;
+    readonly completion_tokens?: unknown;
+  };
 };
 
 // The request for one turn: the transcript as the server expects it, with stream turned
-// on so the text arrives while it is produced. Thinking stays on the server's default -
-// the UI neither asks for it nor away.
-export function buildChatRequest(model: string, messages: readonly ChatMessage[]): ChatRequest {
-  return { model, messages: toWireMessages(messages), stream: true };
+// on so the text arrives while it is produced, and usage asked for so the page can say
+// what the turn cost. Thinking stays on the server's default unless the caller chooses.
+export function buildChatRequest(
+  model: string,
+  messages: readonly ChatMessage[],
+  thinking?: boolean,
+): ChatRequest {
+  const request: ChatRequest = {
+    model,
+    messages: toWireMessages(messages),
+    stream: true,
+    stream_options: { include_usage: true },
+  };
+  return thinking === undefined
+    ? request
+    : { ...request, chat_template_kwargs: { enable_thinking: thinking } };
 }
 
 // Stop is the user's, not the stream's. The button aborts the caller's signal, and the
@@ -94,14 +127,19 @@ function deltaOf(chunk: Chunk): Delta | null {
   return null;
 }
 
-function payloadDelta(payload: string): Delta | null {
-  let chunk: Chunk;
+function chunkOf(payload: string): Chunk | null {
   try {
-    chunk = JSON.parse(payload) as Chunk;
+    return JSON.parse(payload) as Chunk;
   } catch {
     return null;
   }
-  return deltaOf(chunk);
+}
+
+function usageOf(chunk: Chunk): Usage | null {
+  const prompt = chunk.usage?.prompt_tokens;
+  const completion = chunk.usage?.completion_tokens;
+  if (typeof prompt !== 'number' || typeof completion !== 'number') return null;
+  return { promptTokens: prompt, completionTokens: completion };
 }
 
 async function apiErrorOf(response: Response): Promise<ApiError> {
@@ -128,9 +166,13 @@ function serverMessageOf(body: string): string | null {
   return textOf((error as { readonly message?: unknown }).message);
 }
 
-export async function streamChat(options: ChatStreamOptions): Promise<void> {
+export async function streamChat(options: ChatStreamOptions): Promise<StreamOutcome> {
   const send = options.fetchImpl ?? platformFetch;
-  const request = buildChatRequest(options.model, options.messages);
+  const request = buildChatRequest(options.model, options.messages, options.thinking);
+  let finish: string | null = null;
+  let usage: Usage | null = null;
+  const outcome = (stopped: boolean): StreamOutcome => ({ finish, usage, stopped });
+
   let response: Response;
   try {
     // One origin, one request shape: the page's origin (or VITE_API_BASE) plus the
@@ -143,22 +185,30 @@ export async function streamChat(options: ChatStreamOptions): Promise<void> {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
   } catch (reason) {
-    if (stoppedHere(options.signal)) return;
+    if (stoppedHere(options.signal)) return outcome(true);
     throw reason;
   }
 
   if (!response.ok) throw await apiErrorOf(response);
 
   const body = response.body;
-  if (body === null) return;
+  if (body === null) return outcome(false);
 
   const scanner = createSseScanner();
   const reader = body.getReader();
+  let sawDone = false;
   const report = (payload: string): boolean => {
     // [DONE] is the server's last word; anything after it is not our turn.
-    if (payload === '[DONE]') return false;
-    const delta = payloadDelta(payload);
+    if (payload === '[DONE]') {
+      sawDone = true;
+      return false;
+    }
+    const chunk = chunkOf(payload);
+    if (chunk === null) return true;
+    const delta = deltaOf(chunk);
     if (delta !== null) options.onDelta(delta);
+    finish = textOf(chunk.choices?.[0]?.finish_reason) ?? finish;
+    usage = usageOf(chunk) ?? usage;
     return true;
   };
 
@@ -180,10 +230,15 @@ export async function streamChat(options: ChatStreamOptions): Promise<void> {
       }
     }
   } catch (reason) {
-    if (stoppedHere(options.signal)) return;
+    if (stoppedHere(options.signal)) return outcome(true);
     throw reason;
   } finally {
     // Even after a stop mid-stream, the socket still wants closing.
     void reader.cancel().catch(() => undefined);
   }
+
+  // Both of these used to read as a finished answer: the words simply ended.
+  if (finish === 'error') throw new Error('the server ended this answer with an error');
+  if (finish === null && !sawDone) throw new Error('the connection closed before the answer finished');
+  return outcome(false);
 }

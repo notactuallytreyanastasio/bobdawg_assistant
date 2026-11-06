@@ -1,21 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { userEvent } from '@testing-library/user-event';
+import { describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { Transcript } from '../../src/components/Transcript';
 import { assistantMessage, userMessage } from '../../src/chat/message';
 import type { ChatMessage } from '../../src/chat/message';
 import type { Conversation } from '../../src/chat/conversation';
-import { emptyConversation } from '../../src/chat/conversation';
 
 function finished(messages: readonly ChatMessage[]): Conversation {
   return { messages, streaming: false, error: null };
 }
 
 describe('Transcript', () => {
-  it('says so when nothing has been asked', () => {
-    render(<Transcript conversation={emptyConversation} />);
-    expect(screen.getByText('Nothing asked yet')).toBeTruthy();
-  });
-
   it('shows the question and the answer as separate entries', () => {
     render(
       <Transcript
@@ -83,12 +78,98 @@ describe('Transcript', () => {
     expect(screen.queryByRole('status')).toBeNull();
   });
 
-  it('keeps the text readable when it holds line breaks', () => {
+  it('keeps a line break from the model as a line break', () => {
     const { container } = render(
       <Transcript conversation={finished([{ ...assistantMessage('a1'), text: 'one\ntwo' }])} />,
     );
-    const entry = container.querySelector('p.pre');
-    expect(entry?.textContent).toBe('one\ntwo');
-    expect(entry?.getAttribute('class')).toContain('pre');
+    expect(container.querySelector('.markdown br')).not.toBeNull();
+  });
+
+  it('shows a question as written, never as markdown', () => {
+    render(<Transcript conversation={finished([userMessage('u1', '**not bold**')])} />);
+    expect(screen.getByText('**not bold**')).toBeTruthy();
+  });
+
+  it('says thinking while only the reasoning channel has spoken', () => {
+    render(
+      <Transcript
+        conversation={{
+          messages: [{ ...assistantMessage('a1'), reasoning: 'hm' }],
+          streaming: true,
+          error: null,
+        }}
+      />,
+    );
+    expect(screen.getByRole('status').textContent).toContain('thinking');
+    expect(screen.getByText('Thinking…')).toBeTruthy();
+  });
+
+  it('says how long the model thought', () => {
+    const stats = { outputTokens: null, contextTokens: null, tokensPerSecond: null, thoughtMs: 14000 };
+    render(
+      <Transcript
+        conversation={finished([{ ...assistantMessage('a1'), reasoning: 'hm', text: 'yes', stats }])}
+      />,
+    );
+    expect(screen.getByText('Thought for 14s')).toBeTruthy();
+  });
+
+  it('marks an answer that was stopped or cut off', () => {
+    render(
+      <Transcript
+        conversation={finished([
+          { ...assistantMessage('a1'), text: 'half', ending: 'stopped' },
+          { ...assistantMessage('a2'), text: 'long', ending: 'length' },
+        ])}
+      />,
+    );
+    expect(screen.getByText('Stopped')).toBeTruthy();
+    expect(screen.getByText('Cut off at the length limit')).toBeTruthy();
+  });
+
+  it('shows what a finished turn cost', () => {
+    const stats = { outputTokens: 1200, contextTokens: 2000, tokensPerSecond: 18.25, thoughtMs: null };
+    render(<Transcript conversation={finished([{ ...assistantMessage('a1'), text: 'a', stats }])} />);
+    expect(screen.getByText('1,200 tokens · 18.3 tok/s')).toBeTruthy();
+  });
+
+  it('offers retry on the newest answer only', async () => {
+    const user = userEvent.setup();
+    const onRetry = vi.fn();
+    render(
+      <Transcript
+        onRetry={onRetry}
+        conversation={finished([
+          userMessage('u1', 'q'),
+          { ...assistantMessage('a1'), text: 'first' },
+          userMessage('u2', 'q2'),
+          { ...assistantMessage('a2'), text: 'second' },
+        ])}
+      />,
+    );
+    const buttons = screen.getAllByRole('button', { name: 'Retry' });
+    expect(buttons).toHaveLength(1);
+    await user.click(buttons[0] as HTMLElement);
+    expect(onRetry).toBeCalled();
+  });
+
+  it('offers retry for a question left with no answer', () => {
+    render(<Transcript onRetry={() => undefined} conversation={finished([userMessage('u1', 'q')])} />);
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
+  });
+
+  it('offers no tools on an answer still arriving', () => {
+    render(
+      <Transcript
+        onRetry={() => undefined}
+        conversation={{
+          messages: [userMessage('u1', 'q'), { ...assistantMessage('a1'), text: 'some' }],
+          streaming: true,
+          error: null,
+        }}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Copy' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
   });
 });

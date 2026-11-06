@@ -46,6 +46,7 @@ describe('buildChatRequest', () => {
     expect(buildChatRequest('deepseek-v4-flash', conversation)).toEqual({
       model: 'deepseek-v4-flash',
       stream: true,
+      stream_options: { include_usage: true },
       messages: [
         { role: 'user', content: 'Explain Redis streams.' },
         { role: 'assistant', content: 'earlier answer' },
@@ -70,6 +71,7 @@ describe('streamChat request', () => {
     expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
       model: 'deepseek-v4-flash',
       stream: true,
+      stream_options: { include_usage: true },
       messages: [],
     });
   });
@@ -324,7 +326,7 @@ describe('streamChat failures', () => {
     });
 
     streamController.enqueue(chunkOf(contentChunk('partial ')));
-    await expect(promise).resolves.toBeUndefined();
+    await expect(promise).resolves.toEqual({ finish: null, usage: null, stopped: true });
     expect(texts).toEqual(['partial ']);
   });
 
@@ -347,5 +349,45 @@ describe('streamChat failures', () => {
     }).catch((reason: unknown) => reason);
 
     expect(describeFailure(failure)).toBe('socket closed');
+  });
+});
+
+describe('streamChat outcome', () => {
+  const run = (payloads: readonly string[], thinking?: boolean) =>
+    streamChat({
+      model: 'alias',
+      messages: [],
+      origin: '',
+      fetchImpl: async () => sseResponse(payloads),
+      onDelta: () => undefined,
+      ...(thinking === undefined ? {} : { thinking }),
+    });
+  const finishing = (reason: string) =>
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: reason }] })}\n\n`;
+  const usage = `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 30 } })}\n\n`;
+
+  it('reports the finish reason and the usage the server sent', async () => {
+    const outcome = await run([finishing('length'), usage, 'data: [DONE]\n\n']);
+    expect(outcome).toEqual({
+      finish: 'length',
+      usage: { promptTokens: 12, completionTokens: 30 },
+      stopped: false,
+    });
+  });
+
+  it('treats a finish reason of error as a failure, not a finished answer', async () => {
+    await expect(run([finishing('error'), 'data: [DONE]\n\n'])).rejects.toThrow('ended this answer with an error');
+  });
+
+  it('treats a stream that closes with no ending as a failure', async () => {
+    await expect(
+      run([`data: ${JSON.stringify({ choices: [{ delta: { content: 'half a' } }] })}\n\n`]),
+    ).rejects.toThrow('closed before the answer finished');
+  });
+
+  it('asks for thinking on or off only when told to', () => {
+    expect(buildChatRequest('m', [], false).chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(buildChatRequest('m', [], true).chat_template_kwargs).toEqual({ enable_thinking: true });
+    expect(buildChatRequest('m', []).chat_template_kwargs).toBeUndefined();
   });
 });

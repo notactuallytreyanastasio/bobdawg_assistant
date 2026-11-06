@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import { Composer } from '../../src/components/Composer';
 import { emptyConversation } from '../../src/chat/conversation';
@@ -86,6 +86,73 @@ describe('Composer', () => {
     render(<Composer conversation={emptyConversation} ready={false} onSend={() => undefined} onStop={() => undefined} />);
     expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true);
     expect(button('Send').disabled).toBe(true);
-    expect(screen.getByText('waiting for the model name').textContent).toBe('waiting for the model name');
+  });
+
+  it('says why the box is closed', () => {
+    render(
+      <Composer
+        conversation={emptyConversation}
+        ready={false}
+        notice="Connecting to ds4-server"
+        onSend={() => undefined}
+        onStop={() => undefined}
+      />,
+    );
+    expect(screen.getByText('Connecting to ds4-server')).toBeTruthy();
+  });
+
+  it('leaves enter alone while an input method is composing', () => {
+    const onSend = vi.fn();
+    render(<Composer conversation={emptyConversation} ready onSend={onSend} onStop={() => undefined} />);
+    const box = screen.getByRole('textbox');
+
+    fireEvent.change(box, { target: { value: 'にほん' } });
+    fireEvent.keyDown(box, { key: 'Enter', isComposing: true });
+    expect(onSend).not.toBeCalled();
+
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(onSend).toBeCalledWith('にほん');
+  });
+
+  it('stops the answer on escape', async () => {
+    const user = userEvent.setup();
+    const onStop = vi.fn();
+    render(<Composer conversation={answering()} ready onSend={() => undefined} onStop={onStop} />);
+
+    await user.type(screen.getByRole('textbox'), '{Escape}');
+    expect(onStop).toBeCalled();
+  });
+
+  it('turns thinking on and off', async () => {
+    const user = userEvent.setup();
+    const onThinking = vi.fn();
+    render(
+      <Composer
+        conversation={emptyConversation}
+        ready
+        thinking
+        onThinking={onThinking}
+        onSend={() => undefined}
+        onStop={() => undefined}
+      />,
+    );
+
+    const toggle = button('Thinking');
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+    await user.click(toggle);
+    expect(onThinking).toBeCalledWith(false);
+  });
+
+  it('shows how much of the context is used, once that is known', () => {
+    render(
+      <Composer
+        conversation={emptyConversation}
+        ready
+        contextPercent={12}
+        onSend={() => undefined}
+        onStop={() => undefined}
+      />,
+    );
+    expect(screen.getByText('12% of context')).toBeTruthy();
   });
 });

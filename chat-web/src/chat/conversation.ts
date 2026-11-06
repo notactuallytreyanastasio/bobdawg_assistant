@@ -3,7 +3,7 @@
 // transcript, so the components below it stay presentational.
 
 import { assistantMessage, userMessage } from './message';
-import type { ChatMessage } from './message';
+import type { ChatMessage, Ending, TurnStats } from './message';
 
 export type Conversation = {
   readonly messages: readonly ChatMessage[];
@@ -21,8 +21,14 @@ export type ConversationEvent =
       readonly text: string;
     }
   | { readonly type: 'delta'; readonly channel: DeltaChannel; readonly text: string }
-  | { readonly type: 'end' }
+  | {
+      readonly type: 'end';
+      readonly ending?: Ending | null;
+      readonly stats?: TurnStats | null;
+    }
   | { readonly type: 'fail'; readonly text: string }
+  | { readonly type: 'retry'; readonly assistantId: string }
+  | { readonly type: 'load'; readonly messages: readonly ChatMessage[] }
   | { readonly type: 'reset' };
 
 export const emptyConversation: Conversation = {
@@ -35,6 +41,28 @@ export const emptyConversation: Conversation = {
 // actually asked. Both halves are here so the composer and the turn loop agree.
 export function canSend(conversation: Conversation, text: string): boolean {
   return !conversation.streaming && text.trim() !== '';
+}
+
+// A question can be asked again once nothing is in flight, as long as there is one.
+export function canRetry(conversation: Conversation): boolean {
+  return !conversation.streaming && conversation.messages.some((message) => message.role === 'user');
+}
+
+function endTurn(
+  conversation: Conversation,
+  ending: Ending | null,
+  stats: TurnStats | null,
+): Conversation {
+  const index = conversation.messages.length - 1;
+  const target = conversation.messages[index];
+  if (target === undefined || target.role !== 'assistant') {
+    return { ...conversation, streaming: false };
+  }
+  const messages = conversation.messages.slice(0, index);
+  // Stopped before a word arrived: there is no answer to mark, only a question.
+  const nothing = target.text === '' && target.reasoning === '';
+  if (!(ending === 'stopped' && nothing)) messages.push({ ...target, ending, stats });
+  return { ...conversation, messages, streaming: false };
 }
 
 export function reduceConversation(
@@ -68,7 +96,23 @@ export function reduceConversation(
       return { ...conversation, messages };
     }
     case 'end':
-      return conversation.streaming ? { ...conversation, streaming: false } : conversation;
+      return conversation.streaming
+        ? endTurn(conversation, event.ending ?? null, event.stats ?? null)
+        : conversation;
+    case 'retry': {
+      if (!canRetry(conversation)) return conversation;
+      // The last answer goes, whatever it was; the question before it stands.
+      const last = conversation.messages.at(-1);
+      const kept =
+        last?.role === 'assistant' ? conversation.messages.slice(0, -1) : conversation.messages;
+      return {
+        messages: [...kept, assistantMessage(event.assistantId)],
+        streaming: true,
+        error: null,
+      };
+    }
+    case 'load':
+      return { messages: event.messages, streaming: false, error: null };
     case 'fail': {
       const index = conversation.messages.length - 1;
       const target = conversation.messages[index];

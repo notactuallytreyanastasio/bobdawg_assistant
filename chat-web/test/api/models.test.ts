@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fetchModelIds } from '../../src/api/models';
+import { fetchModels } from '../../src/api/models';
+import type { ModelListingOptions } from '../../src/api/models';
 import type { FetchLike } from '../../src/api/chatClient';
+
+const idsOf = async (options: ModelListingOptions) => (await fetchModels(options)).map((model) => model.id);
 
 function jsonListing(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -9,30 +12,39 @@ function jsonListing(body: unknown, status = 200): Response {
   });
 }
 
-describe('fetchModelIds', () => {
+describe('fetchModels', () => {
   it('keeps the loaded models in the order the server listed them', async () => {
     const fetchImpl: FetchLike = async () => jsonListing({ data: [{ id: 'deepseek-v4-flash' }, { id: 'other' }] });
-    expect(await fetchModelIds({ origin: '', fetchImpl })).toEqual(['deepseek-v4-flash', 'other']);
+    expect(await idsOf({ origin: '', fetchImpl })).toEqual(['deepseek-v4-flash', 'other']);
+  });
+
+  it('reads the display name and context size, and makes do without them', async () => {
+    const fetchImpl: FetchLike = async () =>
+      jsonListing({ data: [{ id: 'q', name: 'Qwen', context_length: 100000 }, { id: 'bare', context_length: 0 }] });
+    expect(await fetchModels({ origin: '', fetchImpl })).toEqual([
+      { id: 'q', name: 'Qwen', contextLength: 100000 },
+      { id: 'bare', name: 'bare', contextLength: null },
+    ]);
   });
 
   it('skips entries that carry no usable id', async () => {
     const fetchImpl: FetchLike = async () =>
       jsonListing({ data: [{ id: 'good' }, { id: 7 }, { id: undefined }, {}, { object: 'model' }] });
-    expect(await fetchModelIds({ origin: '', fetchImpl })).toEqual(['good']);
+    expect(await idsOf({ origin: '', fetchImpl })).toEqual(['good']);
   });
 
   it('gives nothing when the listing is empty or malformed', async () => {
     const empty: FetchLike = async () => jsonListing({ data: [] });
     const noData: FetchLike = async () => jsonListing({});
     const broken: FetchLike = async () => new Response('not json', { status: 200 });
-    expect(await fetchModelIds({ origin: '', fetchImpl: empty })).toEqual([]);
-    expect(await fetchModelIds({ origin: '', fetchImpl: noData })).toEqual([]);
-    expect(await fetchModelIds({ origin: '', fetchImpl: broken })).toEqual([]);
+    expect(await idsOf({ origin: '', fetchImpl: empty })).toEqual([]);
+    expect(await idsOf({ origin: '', fetchImpl: noData })).toEqual([]);
+    expect(await idsOf({ origin: '', fetchImpl: broken })).toEqual([]);
   });
 
   it('gives nothing when the server refuses the request, without throwing', async () => {
     const fetchImpl: FetchLike = async () => new Response('unavailable', { status: 500 });
-    expect(await fetchModelIds({ origin: '', fetchImpl })).toEqual([]);
+    expect(await idsOf({ origin: '', fetchImpl })).toEqual([]);
   });
 
   it('asks the models endpoint with a plain GET, on the configured origin', async () => {
@@ -42,11 +54,11 @@ describe('fetchModelIds', () => {
       return jsonListing({ data: [{ id: 'alias' }] });
     };
 
-    expect(await fetchModelIds({ origin: 'http://127.0.0.1:9000', fetchImpl })).toEqual(['alias']);
+    expect(await idsOf({ origin: 'http://127.0.0.1:9000', fetchImpl })).toEqual(['alias']);
     expect(calls).toEqual([{ input: 'http://127.0.0.1:9000/v1/models', method: undefined }]);
 
     calls.length = 0;
-    expect(await fetchModelIds({ origin: '', fetchImpl })).toEqual(['alias']);
+    expect(await idsOf({ origin: '', fetchImpl })).toEqual(['alias']);
     expect(calls).toEqual([{ input: '/v1/models', method: undefined }]);
   });
 
@@ -60,7 +72,7 @@ describe('fetchModelIds', () => {
       },
     );
 
-    expect(await fetchModelIds({ origin: '' })).toEqual(['alias']);
+    expect(await idsOf({ origin: '' })).toEqual(['alias']);
     expect(seen).toEqual(['/v1/models']);
     vi.unstubAllGlobals();
   });

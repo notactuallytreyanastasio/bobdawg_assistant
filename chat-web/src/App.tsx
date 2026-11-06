@@ -1,62 +1,177 @@
-// The page: the model name as the server reports it, the transcript, the question box,
-// and whatever the server complained about last. Nothing here decides any rule - the
-// reducer does, and the hook runs the turn.
+// The page: the saved chats, the model as the server reports it, the transcript, the
+// question box, and whatever the server complained about last. Nothing here decides any
+// rule - the reducer does, and the hook runs the turn.
 
 import { useEffect, useState } from 'react';
 import { platformFetch } from './api/chatClient';
 import type { FetchLike } from './api/chatClient';
-import { fetchModelIds } from './api/models';
+import { fetchModels } from './api/models';
+import type { ModelInfo } from './api/models';
+import { contextPercent } from './chat/format';
+import { loadThinking, platformStore, saveThinking } from './chat/storage';
+import type { StoreLike } from './chat/storage';
+import { Composer } from './components/Composer';
+import { MenuIcon, RetryIcon } from './components/icons';
+import { Sidebar } from './components/Sidebar';
+import { Transcript } from './components/Transcript';
+import { Welcome } from './components/Welcome';
 import { apiOrigin } from './env';
 import { useChat } from './hooks/useChat';
-import { Composer } from './components/Composer';
-import { Transcript } from './components/Transcript';
+import { useLibrary } from './hooks/useLibrary';
 
 export type AppProps = {
   readonly origin?: string;
   readonly fetchImpl?: FetchLike;
+  readonly store?: StoreLike | null;
+  readonly retryMs?: number;
 };
 
-export function App({ origin = apiOrigin(), fetchImpl }: AppProps) {
-  const send = fetchImpl ?? platformFetch;
-  const [model, setModel] = useState('');
-  const chat = useChat({ model, origin, fetchImpl: send });
+// crypto.randomUUID needs a secure context, and the tailnet page is plain http. These ids
+// only have to differ inside one browser's list.
+function newChatId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
-  // The listing answers once with the models this server holds. The first is the one to
-  // ask for, and its name is what the header shows.
+export function App({ origin = apiOrigin(), fetchImpl, store = platformStore(), retryMs = 3000 }: AppProps) {
+  const send = fetchImpl ?? platformFetch;
+  const library = useLibrary(store);
+  const [model, setModel] = useState<ModelInfo | null>(null);
+  const [unreachable, setUnreachable] = useState(false);
+  const [activeId, setActiveId] = useState(() => library.initial?.id ?? newChatId());
+  const [drawer, setDrawer] = useState(false);
+  const [thinking, setThinking] = useState(() => loadThinking(store));
+  const chat = useChat({
+    model: model?.id ?? '',
+    origin,
+    fetchImpl: send,
+    thinking,
+    initialMessages: library.initial?.messages ?? [],
+  });
+  const { messages, streaming } = chat.conversation;
+
+  // The server may still be loading the model, or not started yet: the page keeps asking
+  // until it answers, so opening the page early costs nothing.
   useEffect(() => {
     let settled = false;
-    fetchModelIds({ origin, fetchImpl: send }).then((ids) => {
-      if (!settled) setModel(ids[0] ?? '');
-    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ask = async (): Promise<void> => {
+      const models = await fetchModels({ origin, fetchImpl: send });
+      if (settled) return;
+      const first = models[0];
+      if (first !== undefined) {
+        setModel(first);
+        setUnreachable(false);
+      } else {
+        setUnreachable(true);
+        timer = setTimeout(() => void ask(), retryMs);
+      }
+    };
+    void ask();
     return () => {
       settled = true;
+      clearTimeout(timer);
     };
-  }, [origin, send]);
+  }, [origin, send, retryMs]);
+
+  // Saved when a question goes out and when its answer ends, not on every word. An answer
+  // cut short by a closed tab is lost, but its question is there to ask again.
+  useEffect(() => {
+    if (messages.length > 0) library.save(activeId, messages);
+  }, [messages.length, streaming, activeId]);
+
+  function startNew(): void {
+    library.save(activeId, messages);
+    library.select(null);
+    chat.reset();
+    setActiveId(newChatId());
+    setDrawer(false);
+  }
+
+  function open(id: string): void {
+    setDrawer(false);
+    if (id === activeId) return;
+    const saved = library.chats.find((entry) => entry.id === id);
+    if (saved === undefined) return;
+    library.save(activeId, messages);
+    library.select(id);
+    chat.load(saved.messages);
+    setActiveId(id);
+  }
+
+  function remove(id: string): void {
+    library.remove(id);
+    if (id === activeId) {
+      chat.reset();
+      setActiveId(newChatId());
+    }
+  }
+
+  function chooseThinking(next: boolean): void {
+    setThinking(next);
+    saveThinking(store, next);
+  }
+
+  const ready = model !== null;
+  // Asking again needs a model to ask, which a restored chat may be ahead of.
+  const retry = ready ? chat.retry : undefined;
+  const notice = ready
+    ? undefined
+    : unreachable
+      ? "Can't reach ds4-server yet, still trying"
+      : 'Connecting to ds4-server';
+  const lastStats = messages.findLast((message) => message.stats !== null)?.stats ?? null;
 
   return (
-    <main className="page">
-      <header className="header">
-        <h1>ds4 chat</h1>
-        <p className="model">{model === '' ? 'ds4-server' : model}</p>
-        <button className="reset" type="button" onClick={chat.reset}>
-          New chat
-        </button>
-      </header>
-
-      {chat.conversation.error === null ? null : (
-        <p className="error" role="alert">
-          {chat.conversation.error}
-        </p>
-      )}
-
-      <Transcript conversation={chat.conversation} />
-
-      <Composer
-        conversation={chat.conversation}
-        ready={model !== ''}
-        onSend={chat.send}
-        onStop={chat.stop}
+    <div className="app">
+      <Sidebar
+        chats={library.chats}
+        activeId={activeId}
+        open={drawer}
+        onNew={startNew}
+        onOpen={open}
+        onDelete={remove}
+        onClose={() => setDrawer(false)}
       />
-    </main>
+      <main className="page">
+        <header className="header">
+          <button className="menu" type="button" aria-label="Open chats" onClick={() => setDrawer(true)}>
+            <MenuIcon />
+          </button>
+          <p className="model">
+            <span className={ready ? 'dot up' : unreachable ? 'dot down' : 'dot'} aria-hidden="true" />
+            {model?.name ?? 'ds4-server'}
+          </p>
+        </header>
+
+        {messages.length === 0 && !streaming ? (
+          <Welcome ready={ready} onPick={chat.send} />
+        ) : (
+          <Transcript conversation={chat.conversation} {...(retry === undefined ? {} : { onRetry: retry })} />
+        )}
+
+        {chat.conversation.error === null ? null : (
+          <div className="error" role="alert">
+            <span>{chat.conversation.error}</span>
+            {retry === undefined ? null : (
+              <button className="tool" type="button" onClick={retry}>
+                <RetryIcon />
+                <span>Try again</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        <Composer
+          conversation={chat.conversation}
+          ready={ready}
+          thinking={thinking}
+          contextPercent={contextPercent(lastStats?.contextTokens ?? null, model?.contextLength ?? null)}
+          onThinking={chooseThinking}
+          onSend={chat.send}
+          onStop={chat.stop}
+          {...(notice === undefined ? {} : { notice })}
+        />
+      </main>
+    </div>
   );
 }

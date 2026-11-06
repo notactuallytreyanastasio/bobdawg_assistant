@@ -5,34 +5,57 @@
 import { useEffect, useRef, useState } from 'react';
 import { describeFailure, streamChat } from '../api/chatClient';
 import type { FetchLike } from '../api/chatClient';
-import { canSend, emptyConversation, reduceConversation } from '../chat/conversation';
+import { canRetry, canSend, emptyConversation, reduceConversation } from '../chat/conversation';
 import type { Conversation, ConversationEvent } from '../chat/conversation';
 import { idSequence } from '../chat/message';
 import type { ChatMessage } from '../chat/message';
+import { createTurnClock } from '../chat/turnClock';
 
 export type ChatConfig = {
   readonly model: string;
   readonly origin: string;
   readonly fetchImpl: FetchLike;
+  readonly thinking?: boolean;
+  readonly initialMessages?: readonly ChatMessage[];
+  readonly now?: () => number;
 };
+
+type Ids = {
+  readonly user: () => string;
+  readonly assistant: () => string;
+};
+
+// Saved messages take ids from this page's sequence, or the next question could arrive
+// with an id an old message already holds.
+function withFreshIds(messages: readonly ChatMessage[], ids: Ids): ChatMessage[] {
+  return messages.map((message) => ({
+    ...message,
+    id: message.role === 'user' ? ids.user() : ids.assistant(),
+  }));
+}
 
 export type Chat = {
   readonly conversation: Conversation;
   readonly send: (text: string) => void;
   readonly stop: () => void;
+  readonly retry: () => void;
   readonly reset: () => void;
+  readonly load: (messages: readonly ChatMessage[]) => void;
 };
 
 export function useChat(config: ChatConfig): Chat {
-  const [conversation, setConversation] = useState<Conversation>(emptyConversation);
+  const [ids] = useState<Ids>(() => ({ user: idSequence('u'), assistant: idSequence('a') }));
+  const [conversation, setConversation] = useState<Conversation>(() => ({
+    ...emptyConversation,
+    messages: withFreshIds(config.initialMessages ?? [], ids),
+  }));
   // The same transcript, kept where an asynchronous callback can read the current
   // version instead of the one its render saw.
-  const transcript = useRef<Conversation>(emptyConversation);
+  const transcript = useRef<Conversation>(conversation);
   const aborts = useRef<AbortController | null>(null);
   // A turn number, so text arriving after a reset is dropped rather than added to the
   // next conversation. A stop keeps its turn: that answer is finished, not discarded.
   const turn = useRef(0);
-  const ids = useRef({ user: idSequence('u'), assistant: idSequence('a') }).current;
 
   function update(next: Conversation): void {
     transcript.current = next;
@@ -45,32 +68,29 @@ export function useChat(config: ChatConfig): Chat {
   }
 
   async function answer(messages: readonly ChatMessage[], myTurn: number, signal: AbortSignal): Promise<void> {
+    const clock = createTurnClock(config.now ?? Date.now);
     try {
-      await streamChat({
+      const outcome = await streamChat({
         model: config.model,
         origin: config.origin,
         messages,
         fetchImpl: config.fetchImpl,
         signal,
+        ...(config.thinking === undefined ? {} : { thinking: config.thinking }),
         onDelta: (delta) => {
+          clock.mark(delta.channel);
           apply(myTurn, { type: 'delta', channel: delta.channel, text: delta.text });
         },
       });
       // A stopped stream resolved quietly, which is still the end of the turn.
-      apply(myTurn, { type: 'end' });
+      const ending = outcome.stopped ? 'stopped' : outcome.finish === 'length' ? 'length' : null;
+      apply(myTurn, { type: 'end', ending, stats: clock.finish(outcome.usage) });
     } catch (reason) {
       apply(myTurn, { type: 'fail', text: describeFailure(reason) });
     }
   }
 
-  function send(text: string): void {
-    if (!canSend(transcript.current, text)) return;
-    const next = reduceConversation(transcript.current, {
-      type: 'send',
-      text: text.trim(),
-      userId: ids.user(),
-      assistantId: ids.assistant(),
-    });
+  function begin(next: Conversation): void {
     turn.current += 1;
     update(next);
 
@@ -79,6 +99,23 @@ export function useChat(config: ChatConfig): Chat {
     void answer(next.messages, turn.current, controller.signal).finally(() => {
       if (aborts.current === controller) aborts.current = null;
     });
+  }
+
+  function send(text: string): void {
+    if (!canSend(transcript.current, text)) return;
+    begin(
+      reduceConversation(transcript.current, {
+        type: 'send',
+        text: text.trim(),
+        userId: ids.user(),
+        assistantId: ids.assistant(),
+      }),
+    );
+  }
+
+  function retry(): void {
+    if (!canRetry(transcript.current)) return;
+    begin(reduceConversation(transcript.current, { type: 'retry', assistantId: ids.assistant() }));
   }
 
   function stop(): void {
@@ -92,6 +129,13 @@ export function useChat(config: ChatConfig): Chat {
     update(emptyConversation);
   }
 
+  // Another conversation takes the page over, and whatever this one was bringing stops.
+  function load(messages: readonly ChatMessage[]): void {
+    turn.current += 1;
+    aborts.current?.abort();
+    update(reduceConversation(transcript.current, { type: 'load', messages: withFreshIds(messages, ids) }));
+  }
+
   // The page going away ends the turn: there is nothing left to show the answer in.
   useEffect(
     () => () => {
@@ -100,5 +144,5 @@ export function useChat(config: ChatConfig): Chat {
     [],
   );
 
-  return { conversation, send, stop, reset };
+  return { conversation, send, stop, retry, reset, load };
 }

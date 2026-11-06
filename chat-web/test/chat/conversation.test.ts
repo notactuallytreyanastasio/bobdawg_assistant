@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  canRetry,
   canSend,
   emptyConversation,
   reduceConversation,
@@ -141,5 +142,60 @@ describe('canSend', () => {
   it('is false for a question with nothing in it', () => {
     expect(canSend(emptyConversation, '')).toBe(false);
     expect(canSend(emptyConversation, '   ')).toBe(false);
+  });
+});
+
+describe('how a turn ends', () => {
+  const stats = { outputTokens: 3, contextTokens: 9, tokensPerSecond: 2, thoughtMs: null };
+
+  it('keeps the ending and the numbers on the answer', () => {
+    const ended = reduceConversation(streaming(), { type: 'end', ending: 'length', stats });
+    expect(ended.messages.at(-1)?.ending).toBe('length');
+    expect(ended.messages.at(-1)?.stats).toEqual(stats);
+    expect(ended.streaming).toBe(false);
+  });
+
+  it('marks a stopped answer and keeps its words', () => {
+    const ended = reduceConversation(streaming(), { type: 'end', ending: 'stopped' });
+    expect(ended.messages.at(-1)?.ending).toBe('stopped');
+    expect(ended.messages.at(-1)?.text).toBe('A stream ');
+  });
+
+  it('leaves no empty answer behind when stopped before a word arrived', () => {
+    const ended = reduceConversation(send(), { type: 'end', ending: 'stopped' });
+    expect(ended.messages.map((message) => message.role)).toEqual(['user']);
+  });
+});
+
+describe('retry', () => {
+  const finished = () => reduceConversation(streaming(), { type: 'end' });
+
+  it('replaces the last answer and keeps the question', () => {
+    const again = reduceConversation(finished(), { type: 'retry', assistantId: 'a2' });
+    expect(again.messages.map((message) => message.id)).toEqual(['u1', 'a2']);
+    expect(again.messages.at(-1)?.text).toBe('');
+    expect(again.streaming).toBe(true);
+  });
+
+  it('answers a question whose answer failed, clearing the failure', () => {
+    const failed = reduceConversation(send(), { type: 'fail', text: 'no' });
+    const again = reduceConversation(failed, { type: 'retry', assistantId: 'a2' });
+    expect(again.messages.map((message) => message.id)).toEqual(['u1', 'a2']);
+    expect(again.error).toBeNull();
+  });
+
+  it('does nothing mid-turn or with no question', () => {
+    expect(canRetry(streaming())).toBe(false);
+    expect(canRetry(emptyConversation)).toBe(false);
+    const turn = streaming();
+    expect(reduceConversation(turn, { type: 'retry', assistantId: 'a2' })).toBe(turn);
+  });
+});
+
+describe('load', () => {
+  it('takes over the transcript and forgets the failure', () => {
+    const failed = reduceConversation(send(), { type: 'fail', text: 'no' });
+    const loaded = reduceConversation(failed, { type: 'load', messages: [userMessage('u9', 'old')] });
+    expect(loaded).toEqual({ messages: [userMessage('u9', 'old')], streaming: false, error: null });
   });
 });

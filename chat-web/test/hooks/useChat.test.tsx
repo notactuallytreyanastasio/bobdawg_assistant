@@ -3,6 +3,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { useChat } from '../../src/hooks/useChat';
 import type { FetchLike } from '../../src/api/chatClient';
 import { emptyConversation } from '../../src/chat/conversation';
+import { userMessage } from '../../src/chat/message';
 
 const encoder = new TextEncoder();
 
@@ -200,7 +201,62 @@ describe('useChat', () => {
       expect(view.result.current.conversation.streaming).toBe(false);
     });
     expect(view.result.current.conversation.messages[1]?.text).toBe('partial ');
+    expect(view.result.current.conversation.messages[1]?.ending).toBe('stopped');
     expect(view.result.current.conversation.error).toBeNull();
+  });
+
+  it('asks again on retry, sending the question and not the old answer', async () => {
+    const bodies: string[] = [];
+    const fetchImpl: FetchLike = async (_input, init) => {
+      bodies.push(String(init?.body));
+      return sseResponse([contentChunk(`answer ${bodies.length}`), 'data: [DONE]\n\n']);
+    };
+    const view = ask(fetchImpl);
+
+    await act(async () => view.result.current.send('question'));
+    await waitFor(() => expect(view.result.current.conversation.streaming).toBe(false));
+    await act(async () => view.result.current.retry());
+    await waitFor(() => expect(view.result.current.conversation.messages[1]?.text).toBe('answer 2'));
+
+    expect(JSON.parse(bodies[1] ?? '').messages).toEqual([{ role: 'user', content: 'question' }]);
+    expect(view.result.current.conversation.messages).toHaveLength(2);
+  });
+
+  it('notes when the server cut the answer at its length limit', async () => {
+    const finishing = `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'length' }] })}\n\n`;
+    const view = ask(async () => sseResponse([contentChunk('cut'), finishing, 'data: [DONE]\n\n']));
+
+    await act(async () => view.result.current.send('question'));
+    await waitFor(() => expect(view.result.current.conversation.messages[1]?.ending).toBe('length'));
+  });
+
+  it('gives loaded messages ids that the next question cannot collide with', async () => {
+    const view = ask(async () => sseResponse([contentChunk('new'), 'data: [DONE]\n\n']));
+
+    act(() => view.result.current.load([{ ...userMessage('u1', 'old'), id: 'u1' }]));
+    await act(async () => view.result.current.send('next'));
+    await waitFor(() => expect(view.result.current.conversation.streaming).toBe(false));
+
+    const ids = view.result.current.conversation.messages.map((message) => message.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(view.result.current.conversation.messages[0]?.text).toBe('old');
+  });
+
+  it('drops text from a turn that another chat replaced', async () => {
+    let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        stream = c;
+      },
+    });
+    const view = ask(async () => new Response(body));
+
+    await act(async () => view.result.current.send('first'));
+    act(() => view.result.current.load([userMessage('u1', 'other chat')]));
+    stream?.enqueue(encoder.encode(contentChunk('late')));
+
+    await waitFor(() => expect(view.result.current.conversation.streaming).toBe(false));
+    expect(view.result.current.conversation.messages.map((message) => message.text)).toEqual(['other chat']);
   });
 
   it('drops text from a turn the user reset', async () => {

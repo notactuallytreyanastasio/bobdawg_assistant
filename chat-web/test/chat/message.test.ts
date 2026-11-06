@@ -25,6 +25,8 @@ describe('userMessage', () => {
       role: 'user',
       text: 'hello there',
       reasoning: '',
+      ending: null,
+      stats: null,
     });
   });
 });
@@ -37,6 +39,8 @@ describe('assistantMessage', () => {
       role: 'assistant',
       text: '',
       reasoning: '',
+      ending: null,
+      stats: null,
     });
   });
 });
