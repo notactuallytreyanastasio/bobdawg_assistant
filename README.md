@@ -267,6 +267,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
 - [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
+- [Tailnet serving](docs/TAILNET.md): share inference with tailnet peers, including LM Studio clients.
 - [Decision graph](docs/DECISION_GRAPH.md): workspace memory of why the work happened.
 - [Decision graph roadmap](docs/DECISION_GRAPH_ROADMAP.md): plan to make the graph required by the loop, not merely available.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
