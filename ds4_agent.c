@@ -14,6 +14,7 @@
 #include "ds4_hooks.h"
 #include "ds4_input.h"
 #include "ds4_permit.h"
+#include "ds4_undo.h"
 #include "linenoise.h"
 
 #include <errno.h>
@@ -199,6 +200,7 @@ typedef struct {
     char tool_approval_answer;   /* y, n or a */
     char tool_approval_message[512];
     ds4_permit *permit;
+    ds4_undo *undo;
     char *next_note;  /* said to the model ahead of the next prompt; owned */
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
@@ -666,6 +668,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
+           !strcmp(cmd, "/undo") ||
            !strcmp(cmd, "/commands") ||
            agent_slash_command_with_args(cmd, "/permissions") ||
            agent_slash_command_with_args(cmd, "/power") ||
@@ -9815,6 +9818,8 @@ static void agent_note_graph_moments(agent_worker *w, const agent_tool_call *cal
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
+    if (w->undo && call->name && (!strcmp(call->name, "write") || !strcmp(call->name, "edit")))
+        ds4_undo_note(w->undo, agent_tool_arg_value(call, "path"));
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
 
@@ -11715,6 +11720,7 @@ static bool worker_submit(agent_worker *w, const char *text) {
               !w->cmd_text && !w->think_requested;
     if (ok) {
         w->cmd_text = agent_prepare_prompt(w, text);
+        if (w->undo) ds4_undo_begin_turn(w->undo);
         /* A submitted turn is no longer idle, even if the worker thread has
          * not yet reached its real prefill accounting.  Non-interactive mode
          * depends on this to avoid exiting in the small handoff window between
@@ -13168,6 +13174,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     /* A session with nobody at the keyboard has nobody to ask. */
     w->permit = ds4_permit_new(cfg->permissions_set ? cfg->permissions :
                                cfg->non_interactive ? DS4_PERMIT_ALL : DS4_PERMIT_ASK);
+    w->undo = ds4_undo_new();
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {
@@ -13208,6 +13215,7 @@ static void agent_worker_free(agent_worker *w) {
     free(w->cache_dir);
     free(w->sysprompt_path);
     ds4_permit_free(w->permit);
+    ds4_undo_free(w->undo);
     free(w->next_note);
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
@@ -14018,6 +14026,19 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     restore_line = xstrdup(cmd);
                 } else if (cmd[0] == '/' && busy) {
                     printf("command requires the model to be idle: %s\n", cmd);
+                } else if (!strcmp(cmd, "/undo")) {
+                    char *undone = ds4_undo_last(worker.undo);
+                    if (!undone) {
+                        printf("nothing to undo: no turn changed a file with the file tools\n");
+                    } else {
+                        printf("%sbash commands are not undone; git can answer for those\n", undone);
+                        char *note = xmalloc(strlen(undone) + 96);
+                        sprintf(note, "[The user undid your last file changes, so these are back "
+                                      "as they were:\n%s]", undone);
+                        agent_note_for_model(&worker, note);
+                        free(note);
+                        free(undone);
+                    }
                 } else if (agent_slash_command_with_args(cmd, "/permissions")) {
                     char *arg = cmd + strlen("/permissions");
                     while (*arg == ' ' || *arg == '\t') arg++;

@@ -1164,6 +1164,58 @@ static void test_permissions_refuse_a_tool(void) {
     ds4_permit_free(w.permit);
 }
 
+static void test_undo(void) {
+    char dir[] = "/tmp/ds4-undo-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    char a[PATH_MAX], b[PATH_MAX];
+    snprintf(a, sizeof(a), "%s/a.txt", dir);
+    snprintf(b, sizeof(b), "%s/new.txt", dir);
+    test_put_file(a, "one\n", 4);
+    chmod(a, 0750);
+
+    ds4_undo *u = ds4_undo_new();
+    AGENT_TEST_ASSERT(ds4_undo_last(u) == NULL);
+
+    /* Two edits in a turn come back to what the turn began with. */
+    ds4_undo_begin_turn(u);
+    ds4_undo_note(u, a);
+    test_put_file(a, "two\n", 4);
+    ds4_undo_note(u, a);
+    test_put_file(a, "three\n", 6);
+    ds4_undo_note(u, b);
+    test_put_file(b, "made\n", 5);
+
+    /* A later turn that changed nothing is passed over. */
+    ds4_undo_begin_turn(u);
+    ds4_undo_begin_turn(u);
+    ds4_undo_note(u, a);
+    test_put_file(a, "four\n", 5);
+    AGENT_TEST_ASSERT(ds4_undo_depth(u) == 2);
+
+    char *said = ds4_undo_last(u);
+    AGENT_TEST_ASSERT(said && strstr(said, "restored") && strstr(said, "a.txt"));
+    free(said);
+    FILE *fp = fopen(a, "r");
+    char line[16] = {0};
+    AGENT_TEST_ASSERT(fp && fgets(line, sizeof(line), fp) && !strcmp(line, "three\n"));
+    if (fp) fclose(fp);
+
+    said = ds4_undo_last(u);
+    AGENT_TEST_ASSERT(said && strstr(said, "removed") && strstr(said, "new.txt"));
+    free(said);
+    AGENT_TEST_ASSERT(access(b, F_OK) != 0);
+    fp = fopen(a, "r");
+    AGENT_TEST_ASSERT(fp && fgets(line, sizeof(line), fp) && !strcmp(line, "one\n"));
+    if (fp) fclose(fp);
+    struct stat st;
+    AGENT_TEST_ASSERT(stat(a, &st) == 0 && (st.st_mode & 07777) == 0750);
+    AGENT_TEST_ASSERT(ds4_undo_depth(u) == 0);
+    AGENT_TEST_ASSERT(ds4_undo_last(u) == NULL);
+    ds4_undo_free(u);
+    unlink(a);
+    rmdir(dir);
+}
+
 static void test_prompt_input(void) {
     char dir[] = "/tmp/ds4-input-XXXXXX";
     AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
@@ -2194,6 +2246,7 @@ int main(int argc, char **argv) {
     test_hooks_engine();
     test_permissions();
     test_permissions_refuse_a_tool();
+    test_undo();
     test_prompt_input();
     test_output_descriptions();
     test_deciduous_git();

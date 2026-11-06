@@ -344,6 +344,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/think [N]", "V4.1: set effort 0..100 (default 75) after this turn; rebuilds the prefix.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
+    opt(fp, c, "/undo", "Put back the files the last turn changed with the file tools.");
     opt(fp, c, "/permissions [MODE]", "Show or set what runs without asking: ask, edits or all.");
     opt(fp, c, "/commands", "List /init, /review and the commands in .ds4/commands.");
     opt(fp, c, "!COMMAND", "Run COMMAND; the model sees its output with your next prompt.");
