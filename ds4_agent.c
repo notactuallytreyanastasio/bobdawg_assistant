@@ -1709,6 +1709,44 @@ static void agent_append_trusted_system(ds4_engine *engine, ds4_tokens *tokens,
     }
 }
 
+/* How many times one stretch of work may be asked to retry a call that never ran. */
+#define AGENT_CALL_RETRIES 2
+
+/* True when the reply ends on a line imitating a tool call, such as [Tool: list].
+ * Only the visible answer counts, and only its last line, so a sentence that
+ * mentions the form is left alone. */
+static bool agent_reply_fakes_tool_call(const char *text) {
+    if (!text) return false;
+    const char *think_end = NULL;
+    for (const char *p = strstr(text, "</think>"); p; p = strstr(p + 1, "</think>"))
+        think_end = p + strlen("</think>");
+    if (think_end) text = think_end;
+
+    /* The reply is rendered from the transcript, so it carries the turn's end marker. */
+    static const char turn_end[] = "<|im_end|>";
+    const size_t turn_end_len = sizeof(turn_end) - 1;
+    const char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) end--;
+    if ((size_t)(end - text) >= turn_end_len &&
+        !memcmp(end - turn_end_len, turn_end, turn_end_len))
+        end -= turn_end_len;
+    while (end > text && isspace((unsigned char)end[-1])) end--;
+    const char *line = end;
+    while (line > text && line[-1] != '\n') line--;
+    while (line < end && isspace((unsigned char)*line)) line++;
+    return (size_t)(end - line) > strlen("[Tool:]") &&
+           !strncmp(line, "[Tool:", strlen("[Tool:")) && end[-1] == ']';
+}
+
+/* A reply with no call ends the turn, so a model that just had a call rejected, or
+ * that wrote one out as prose, would stop with the work undone. Returns what to
+ * tell it, or NULL when the turn should end. It may still answer that it is done. */
+static const char *agent_call_retry_note(bool call_rejected, bool fake_call, int retries) {
+    if (retries >= AGENT_CALL_RETRIES || (!call_rejected && !fake_call)) return NULL;
+    return "No tool ran on your last step. If the work is unfinished, make the call "
+           "now in the tool-call format. If it is finished, say so.\n";
+}
+
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
                                        const char *extra, bool edit_upto) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
@@ -8005,6 +8043,26 @@ static void test_agent_qwen_trusted_system_is_rendered_chat(void) {
     free(out);
 }
 
+static void test_agent_reply_fakes_tool_call(void) {
+    AGENT_TEST_ASSERT(agent_reply_fakes_tool_call("I'll read both files.\n\n[Tool: list]\n"));
+    AGENT_TEST_ASSERT(agent_reply_fakes_tool_call("<think>\nhm\n</think>\n\n[Tool: read]"));
+    AGENT_TEST_ASSERT(agent_reply_fakes_tool_call("Reading.\n\n[Tool: list]<|im_end|>\n"));
+    AGENT_TEST_ASSERT(!agent_reply_fakes_tool_call("Done.<|im_end|>\n"));
+    AGENT_TEST_ASSERT(!agent_reply_fakes_tool_call("Done. All tests pass.\n"));
+    AGENT_TEST_ASSERT(!agent_reply_fakes_tool_call("It printed [Tool: list] once.\n"));
+    AGENT_TEST_ASSERT(!agent_reply_fakes_tool_call("[Tool: list]\nThat line was noise; all done.\n"));
+    AGENT_TEST_ASSERT(!agent_reply_fakes_tool_call("<think>\n[Tool: list]\n</think>\nDone.\n"));
+    AGENT_TEST_ASSERT(!agent_reply_fakes_tool_call(""));
+    AGENT_TEST_ASSERT(!agent_reply_fakes_tool_call(NULL));
+}
+
+static void test_agent_call_retry_note_is_bounded(void) {
+    AGENT_TEST_ASSERT(agent_call_retry_note(true, false, 0) != NULL);
+    AGENT_TEST_ASSERT(agent_call_retry_note(false, true, 1) != NULL);
+    AGENT_TEST_ASSERT(agent_call_retry_note(false, false, 0) == NULL);
+    AGENT_TEST_ASSERT(agent_call_retry_note(true, true, AGENT_CALL_RETRIES) == NULL);
+}
+
 static void test_agent_qwen_tool_parser_chunked_multi_arg(void) {
     const char *a = "<tool_call>\n<function=bash>\n<parameter=command>\nprintf hi\n";
     const char *b = "</param";
@@ -8583,6 +8641,8 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_stream_tool_call_chunked();
     test_agent_tool_argument_literal_markup();
     test_agent_qwen_trusted_system_is_rendered_chat();
+    test_agent_reply_fakes_tool_call();
+    test_agent_call_retry_note_is_bounded();
     test_agent_qwen_tool_parser_chunked_multi_arg();
     test_agent_qwen_tool_parser_two_calls_and_error();
     test_agent_qwen_stream_tool_call_chunked();
@@ -11009,6 +11069,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * after a DSML stanza completes we terminate that assistant message, append
      * the tool result as a tool message, then ask the model to continue. */
     int carried_generation = 0;
+    bool call_rejected = false;
+    int call_retries = 0;
     bool resume_assistant = false, resume_in_think = false;
     int resume_start = 0;
     for (int tool_round = 0; ; tool_round++) {
@@ -11376,9 +11438,28 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
+            ds4_tokens reply = {
+                .v = w->transcript.v + assistant_start,
+                .len = w->transcript.len - assistant_start,
+            };
+            size_t reply_len = 0;
+            char *said = ds4_kvstore_render_tokens_text(w->engine, &reply, &reply_len);
+            const char *note = agent_call_retry_note(
+                call_rejected, agent_reply_fakes_tool_call(said), call_retries);
+            free(said);
+            if (note) {
+                agent_trace(w, "call retry %d rejected=%d", call_retries + 1, call_rejected);
+                call_retries++;
+                call_rejected = false;
+                carried_generation = 0;
+                ds4_chat_append_message(w->engine, &w->transcript, "user", note);
+                continue;
+            }
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
         }
+        call_rejected = malformed_tool;
+        if (got_tool) call_retries = 0;
 
         agent_tool_observation observation;
         agent_tool_observation_init(&observation);
