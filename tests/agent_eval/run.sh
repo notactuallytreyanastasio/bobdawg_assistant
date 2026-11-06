@@ -10,7 +10,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 agent="$here/../../ds4-agent"
 runs=1
 out=""
-limit="${DS4_EVAL_SECONDS:-360}"
+# No clock by default: a local model takes as long as it takes, and it is the work being judged.
+# Set DS4_EVAL_SECONDS to give up on a run that has stopped making progress.
+limit="${DS4_EVAL_SECONDS:-}"
 while getopts "n:o:" flag; do
   case "$flag" in
     n) runs="$OPTARG" ;;
@@ -35,7 +37,7 @@ for task in "$@"; do
      git -c user.name=eval -c user.email=eval@example.com commit -q -m start)
     [ -f "$here/tasks/$task/setup.sh" ] && (cd "$dir" && sh "$here/tasks/$task/setup.sh")
     began=$(date +%s)
-    "$here/timeout.py" "$limit" "$agent" --ctx 32768 --graph off --hooks off --instructions off \
+    ${limit:+"$here/timeout.py" "$limit"} "$agent" --ctx 32768 --graph off --hooks off --instructions off \
       --permissions all --chdir "$dir" --non-interactive --prompt-file "$here/tasks/$task/prompt.txt" \
       > "$dir.log" 2>&1
     status=$?
