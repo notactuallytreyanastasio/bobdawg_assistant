@@ -128,6 +128,14 @@
   background: var(--raised);
 }
 
+.g-goals span {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+
 .g-goals small {
   display: block;
   color: var(--dim);
@@ -170,7 +178,8 @@
 
 .g-canvas path {
   fill: none;
-  stroke: var(--line);
+  stroke: var(--dim);
+  stroke-opacity: 0.55;
   stroke-width: 1.5;
 }
 

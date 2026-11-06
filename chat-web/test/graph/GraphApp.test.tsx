@@ -33,7 +33,6 @@ describe('GraphApp', () => {
 
   it('opens a goal into its tree, and reads a node from it', async () => {
     render(<GraphApp origin="" fetchImpl={server()} />);
-    await userEvent.click(await screen.findByRole('button', { name: /Fix the tool calls.*2 nodes/ }));
     expect((await screen.findByRole('heading', { name: 'Fix the tool calls' })).textContent).toContain('Fix');
     expect(screen.getByText('make it work').textContent).toBe('make it work');
     await userEvent.click(screen.getByRole('button', { name: /^action\s*Render the prompt/ }));
@@ -44,7 +43,8 @@ describe('GraphApp', () => {
     render(<GraphApp origin="" fetchImpl={server()} />);
     await screen.findByRole('button', { name: /Fix the tool calls.*2 nodes/ });
     await userEvent.type(screen.getByRole('searchbox', { name: 'Search the graph' }), 'render');
-    await userEvent.click(await screen.findByRole('button', { name: /^Render the prompt/ }));
+    const hit = await screen.findByRole('button', { name: /^Render the prompt\s*action$/ });
+    await userEvent.click(hit);
     expect((await screen.findByRole('heading', { name: 'Render the prompt' })).textContent).toContain('Render');
   });
 

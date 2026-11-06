@@ -312,7 +312,9 @@ export function GraphApp({ origin = apiOrigin(), fetchImpl }: GraphAppProps) {
   const listed = goals.filter((goal) => day === null || dayOf(goal.node.createdAt) === day);
   const found = useMemo(() => searchNodes(shownNodes, query), [shownNodes, query]);
   const shownRoot = root ?? goals[0]?.node.id ?? null;
-  const node = selected === null ? null : (index?.byId.get(selected) ?? null);
+  // The goal in view is what is being read, until the reader picks something else.
+  const reading = selected ?? shownRoot;
+  const node = reading === null ? null : (index?.byId.get(reading) ?? null);
 
   function open(id: string): void {
     if (index === null) return;
@@ -391,7 +393,7 @@ export function GraphApp({ origin = apiOrigin(), fetchImpl }: GraphAppProps) {
           {index === null || shownRoot === null ? (
             <p className="g-empty">{failure === null ? 'Loading the graph' : 'No graph to show'}</p>
           ) : (
-            <Tree index={index} root={shownRoot} selected={selected} onSelect={setSelected} />
+            <Tree index={index} root={shownRoot} selected={reading} onSelect={setSelected} />
           )}
         </main>
         <aside className="g-right" aria-label="Details and questions">
