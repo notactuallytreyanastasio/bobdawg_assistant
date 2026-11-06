@@ -103,6 +103,7 @@ typedef struct {
     bool hooks_off;        /* --hooks off: run no .ds4/hooks */
     bool instructions_off; /* --instructions off: read no AGENT.md */
     bool permissions_set;  /* --permissions was given */
+    bool resume_latest;    /* --continue: open the newest saved session */
     ds4_permit_mode permissions;
     bool non_interactive;
     bool edit_upto;
@@ -132,6 +133,8 @@ typedef struct {
     int ctx_size;
     int power_percent;
     char error[256];
+    int todo_done;
+    int todo_total;
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
@@ -202,6 +205,7 @@ typedef struct {
     ds4_permit *permit;
     ds4_undo *undo;
     char *next_note;  /* said to the model ahead of the next prompt; owned */
+    char *todo;       /* the model's task list; owned */
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -670,6 +674,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/new") ||
            !strcmp(cmd, "/undo") ||
            !strcmp(cmd, "/commands") ||
+           !strcmp(cmd, "/todo") ||
            agent_slash_command_with_args(cmd, "/permissions") ||
            agent_slash_command_with_args(cmd, "/power") ||
            agent_slash_command_with_args(cmd, "/think") ||
@@ -996,6 +1001,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.goal = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--label")) {
             c.dec_label = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--continue")) {
+            c.resume_latest = true;
         } else if (!strcmp(arg, "--permissions")) {
             const char *mode = need_arg(&i, argc, argv, arg);
             if (!ds4_permit_parse_mode(mode, &c.permissions)) {
@@ -1128,9 +1135,13 @@ static const char agent_tools_prompt_intro[] =
 
 #define AGENT_EDIT_TARGET_RULE \
     "When editing files, state the target filename before the edit; for the edit tool, put path first."
+#define AGENT_TODO_RULE \
+    "For work of three steps or more, keep a todo list: send the whole list again as each step starts and ends, " \
+    "and finish the list before saying you are done."
 
 static const char agent_tools_prompt_edit_exact[] =
     "## Editing files\n\n"
+    AGENT_TODO_RULE "\n"
     AGENT_EDIT_TARGET_RULE "\n"
     "Use edit with path, old, and new for changes. The old text must match exactly once in the current file; "
     "otherwise edit fails for safety. Read enough of the file to provide the exact old text being replaced.\n"
@@ -1139,6 +1150,7 @@ static const char agent_tools_prompt_edit_exact[] =
 
 static const char agent_tools_prompt_edit_upto[] =
     "## Editing files\n\n"
+    AGENT_TODO_RULE "\n"
     AGENT_EDIT_TARGET_RULE "\n"
     "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
     "The old text must match exactly once in the current file; otherwise edit fails for safety.\n"
@@ -1300,15 +1312,30 @@ static const char agent_tools_prompt_after_edit[] =
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
     "    \"name\": \"edit\",\n"
-    "    \"description\": \"Replace exactly one old text match.\",\n"
+    "    \"description\": \"Replace exactly one old text match, or every match with all=true.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
     "        \"path\": {\"type\": \"string\"},\n"
     "        \"old\": {\"type\": \"string\"},\n"
-    "        \"new\": {\"type\": \"string\"}\n"
+    "        \"new\": {\"type\": \"string\"},\n"
+    "        \"all\": {\"type\": \"boolean\"}\n"
     "      },\n"
     "      \"required\": [\"path\", \"old\", \"new\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"todo\",\n"
+    "    \"description\": \"Replace your task list. One task per line, starting [ ] waiting, [>] under way or [x] done.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"items\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"items\"]\n"
     "    }\n"
     "  }\n"
     "}\n\n"
@@ -1436,6 +1463,7 @@ static const char agent_glm_tools_prompt_after_schemas[] =
     "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
     "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
     "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.\n"
+    "- " AGENT_TODO_RULE "\n"
     "- " AGENT_EDIT_TARGET_RULE "\n";
 
 static const char agent_glm_tools_prompt_edit_exact[] =
@@ -1457,7 +1485,8 @@ static const char agent_glm_tool_schemas[] =
     "{\"name\":\"read\",\"description\":\"Read a text file/range.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"start_line\":{\"type\":\"integer\"},\"max_lines\":{\"type\":\"integer\"},\"whole\":{\"type\":\"boolean\"},\"raw\":{\"type\":\"boolean\"}},\"required\":[\"path\"]}}\n"
     "{\"name\":\"more\",\"description\":\"Continue previous read-like output.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"count\":{\"type\":\"integer\"}}}}\n"
     "{\"name\":\"write\",\"description\":\"Create or overwrite a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}\n"
-    "{\"name\":\"edit\",\"description\":\"Replace one exact old text match.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},\"required\":[\"path\",\"old\",\"new\"]}}\n"
+    "{\"name\":\"edit\",\"description\":\"Replace one exact old text match, or every match with all=true.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"old\",\"new\"]}}\n"
+    "{\"name\":\"todo\",\"description\":\"Replace your task list. One task per line, starting [ ] waiting, [>] under way or [x] done.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"items\":{\"type\":\"string\"}},\"required\":[\"items\"]}}\n"
     "{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\",\"enum\":[\"literal\",\"regex\"]},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"integer\"},\"max_results\":{\"type\":\"integer\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}\n"
     "{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n"
     "{\"name\":\"deciduous\",\"description\":\"Record and read this workspace's decision graph on the deciduous server: op decide|turn|note|graph|board|goal|status|audit.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"enum\":[\"decide\",\"turn\",\"note\",\"graph\",\"board\",\"goal\",\"status\",\"audit\"]},\"title\":{\"type\":\"string\",\"description\":\"op=decide and op=note: what the record is about\"},\"chosen_option\":{\"type\":\"string\",\"description\":\"op=decide: the option taken\"},\"rejected_option\":{\"type\":\"string\",\"description\":\"op=decide: an option closed off; repeat once per option\"},\"rationale\":{\"type\":\"string\",\"description\":\"op=decide: why the chosen option won\"},\"summary\":{\"type\":\"string\",\"description\":\"op=turn: the step in one line\"},\"observation\":{\"type\":\"string\",\"description\":\"op=turn: what a tool result showed; repeat as needed\"},\"decision\":{\"type\":\"string\",\"description\":\"op=turn: the choice the step settled\"},\"action\":{\"type\":\"string\",\"description\":\"op=turn: what was done\"},\"outcome\":{\"type\":\"string\",\"description\":\"op=turn: how it ended\"},\"description\":{\"type\":\"string\",\"description\":\"op=note: the fact, in full\"},\"why\":{\"type\":\"string\",\"description\":\"op=note: why it matters; op=board: why the message is being sent\"},\"question\":{\"type\":\"string\",\"description\":\"op=graph: what to ask the graph\"},\"subject\":{\"type\":\"string\",\"description\":\"op=board: headline of the message to post\"},\"body\":{\"type\":\"string\",\"description\":\"op=board: the message to post; subject and body together post, neither alone reads\"},\"reply_to\":{\"type\":\"string\",\"description\":\"op=board: message id being answered\"},\"all\":{\"type\":\"string\",\"description\":\"op=board: read every recent message, not only those waiting for this session\"},\"prompt\":{\"type\":\"string\",\"description\":\"op=goal: the request, verbatim\"},\"node_id\":{\"type\":\"string\",\"description\":\"op=status: the node to move\"},\"status\":{\"type\":\"string\",\"description\":\"op=status: the state to move it to\"},\"range\":{\"type\":\"string\",\"description\":\"op=audit: git revision range; default what is unpushed\"}},\"required\":[\"op\"]}}\n";
@@ -1512,6 +1541,7 @@ static const char agent_qwen_tools_prompt_after_schemas[] =
     "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
     "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
     "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.\n"
+    "- " AGENT_TODO_RULE "\n"
     "- " AGENT_EDIT_TARGET_RULE "\n";
 
 /* the GLM schema list, each line wrapped as {"type": "function", "function": ...} */
@@ -5430,6 +5460,8 @@ static int agent_web_confirm(void *privdata, const char *message,
     return ok ? 1 : 0;
 }
 
+static void agent_todo_clear(agent_worker *w);
+
 /* Blocks the tool until a person answers. Nobody answering, by interrupt or by there
  * being nobody, is a no. */
 static char agent_tool_confirm(agent_worker *w, const char *message) {
@@ -5635,6 +5667,7 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
  * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
  * model families rebuilds this cache instead of restoring incompatible KV. */
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
+    agent_todo_clear(w);
     char *closing;
 
     agent_worker_images_clear(w);
@@ -6483,6 +6516,37 @@ static void agent_session_list_push(agent_session_list_item **v, int *len,
 
 /* Print resumable sessions from ~/.ds4/kvcache.  sysprompt.kv is intentionally
  * ignored because it is an implementation cache, not a user session. */
+/* The newest saved session for this model. Sessions do not record where they ran, so
+ * this can be one from another project: it is shown as it opens. */
+static bool agent_worker_latest_session(agent_worker *w, char sha_out[41]) {
+    DIR *d = opendir(w->cache_dir);
+    if (!d) return false;
+    const uint8_t model_id = (uint8_t)ds4_engine_model_id(w->engine);
+    agent_session_list_item best = {0};
+    bool found = false;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        char sha[41];
+        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        char *path = ds4_kvstore_path_join(w->cache_dir, de->d_name);
+        agent_session_list_item item = {0};
+        if (ds4_kvstore_read_entry_file(path, sha, &item.entry)) {
+            if (item.entry.model_id == model_id &&
+                (!found || agent_session_list_cmp_recent(&item, &best) < 0)) {
+                memcpy(sha_out, item.entry.sha, 41);
+                best.entry.last_used = item.entry.last_used;
+                best.entry.created_at = item.entry.created_at;
+                memcpy(best.entry.sha, item.entry.sha, 41);
+                found = true;
+            }
+            ds4_kvstore_entry_free(&item.entry);
+        }
+        free(path);
+    }
+    closedir(d);
+    return found;
+}
+
 static void agent_worker_list_sessions(agent_worker *w) {
     DIR *d = opendir(w->cache_dir);
     if (!d) {
@@ -6839,6 +6903,7 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
                                         int history_turns,
                                         char *err, size_t err_len) {
+    agent_todo_clear(w);
     if (!worker_is_idle(w)) {
         snprintf(err, err_len, "model is busy");
         return false;
@@ -8552,6 +8617,44 @@ static char *agent_apply_file_splice(const char *path,
  * For large replacements, old may contain one [upto] marker: the head must be
  * unique, and the tail must be unique after that head before the whole span is
  * replaced. */
+/* Every match, as one change from the first to the last, so a file cannot be left with
+ * some of them done. NULL when old occurs fewer than twice: one match is an ordinary
+ * edit, and none gets the ordinary edit's error. */
+static char *agent_edit_replace_all(const char *path, const char *data, size_t len,
+                                    const char *old, const char *new_text) {
+    size_t old_len = strlen(old);
+    size_t first = 0, last_end = 0;
+    int count = 0;
+    for (size_t i = 0; i + old_len <= len;) {
+        if (memcmp(data + i, old, old_len) != 0) {
+            i++;
+            continue;
+        }
+        if (!count++) first = i;
+        i += old_len;
+        last_end = i;
+    }
+    if (count < 2) return NULL;
+    agent_buf middle = {0};
+    size_t new_len = strlen(new_text);
+    for (size_t i = first; i < last_end;) {
+        if (i + old_len <= last_end && !memcmp(data + i, old, old_len)) {
+            if (new_len) agent_buf_append(&middle, new_text, new_len);
+            i += old_len;
+        } else {
+            agent_buf_append(&middle, data + i, 1);
+            i++;
+        }
+    }
+    char *text = agent_buf_take(&middle);
+    char label[64];
+    snprintf(label, sizeof(label), "replaced all %d matches", count);
+    char *result = agent_apply_file_splice(path, data, len, first, last_end - first,
+                                           text ? text : "", label);
+    free(text);
+    return result;
+}
+
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
@@ -8569,6 +8672,15 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
         agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
+    }
+
+    const char *all = agent_tool_arg_value(call, "all");
+    if (all && !strcmp(all, "true")) {
+        char *replaced = agent_edit_replace_all(path, data, len, old, new_text);
+        if (replaced) {
+            free(data);
+            return replaced;
+        }
     }
 
     const char *match = NULL;
@@ -9817,7 +9929,33 @@ static void agent_note_graph_moments(agent_worker *w, const agent_tool_call *cal
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
+static void agent_todo_clear(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    free(w->todo);
+    w->todo = NULL;
+    w->status.todo_done = w->status.todo_total = 0;
+    pthread_mutex_unlock(&w->mu);
+}
+
+static char *agent_tool_todo(agent_worker *w, const agent_tool_call *call) {
+    const char *items = agent_tool_arg_value(call, "items");
+    int done = 0, total = 0;
+    if (!ds4_input_todo_counts(items, &done, &total))
+        return xstrdup("Tool error: todo takes items, one task per line, each starting "
+                       "[ ] , [>] or [x] \n");
+    pthread_mutex_lock(&w->mu);
+    free(w->todo);
+    w->todo = xstrdup(items);
+    w->status.todo_done = done;
+    w->status.todo_total = total;
+    pthread_mutex_unlock(&w->mu);
+    char said[64];
+    snprintf(said, sizeof(said), "Task list kept: %d of %d done\n", done, total);
+    return xstrdup(said);
+}
+
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
+    if (call->name && !strcmp(call->name, "todo")) return agent_tool_todo(w, call);
     if (w->undo && call->name && (!strcmp(call->name, "write") || !strcmp(call->name, "edit")))
         ds4_undo_note(w->undo, agent_tool_arg_value(call, "path"));
     agent_buf result = {0};
@@ -9918,9 +10056,16 @@ static bool agent_tool_refused_by_person(agent_worker *w, const agent_tool_call 
     if (!w->permit || !call->name) return false;
     const char *arg = agent_hook_arg(call);
     if (!ds4_permit_needs_asking(w->permit, call->name, arg)) return false;
+    /* The content has just been shown, and whether it lands on something has not. */
+    char replaces[64] = "";
+    if (!strcmp(call->name, "write")) {
+        struct stat st;
+        if (stat(arg, &st) == 0) snprintf(replaces, sizeof(replaces), " (replaces %lld bytes)", (long long)st.st_size);
+        else snprintf(replaces, sizeof(replaces), " (new file)");
+    }
     char message[512];
-    snprintf(message, sizeof(message), "Allow %s: %.300s\n  y yes, n no, a always allow %.120s: ",
-             call->name, arg ? arg : "", ds4_permit_always_covers(w->permit, call->name, arg));
+    snprintf(message, sizeof(message), "Allow %s: %.300s%s\n  y yes, n no, a always allow %.120s: ",
+             call->name, arg ? arg : "", replaces, ds4_permit_always_covers(w->permit, call->name, arg));
     char answer = agent_tool_confirm(w, message);
     if (answer == 'a') ds4_permit_allow_always(w->permit, call->name, arg);
     if (answer != 'n') return false;
@@ -10089,8 +10234,15 @@ static bool agent_tool_observation_commit(agent_worker *w,
  * preserve the user's task but lose the fact that an external process still
  * needs status/wait/stop handling. */
 static char *agent_bash_jobs_compaction_observation(agent_worker *w) {
-    if (!w->bash_jobs) return NULL;
+    if (!w->bash_jobs && !w->todo) return NULL;
     agent_buf out = {0};
+    if (w->todo) {
+        /* A summary keeps the gist of a plan and can lose its place in it. */
+        agent_buf_puts(&out, "Your task list, as it stood before compaction:\n");
+        agent_buf_puts(&out, w->todo);
+        agent_buf_puts(&out, "\n");
+    }
+    if (!w->bash_jobs) return agent_buf_take(&out);
     agent_buf_puts(&out,
         "Bash job update after context compaction. Running jobs still need explicit bash_status or bash_stop if relevant.\n");
     for (agent_bash_job *job = w->bash_jobs, *next = NULL; job; job = next) {
@@ -11990,6 +12142,11 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
         snprintf(buf, len, "ctx %s/%s | idle%s", used, total_ctx, power);
         break;
     }
+    if (st->todo_total) {
+        size_t used_len = strlen(buf);
+        if (used_len < len)
+            snprintf(buf + used_len, len - used_len, " | tasks %d/%d", st->todo_done, st->todo_total);
+    }
 }
 
 typedef struct {
@@ -13217,6 +13374,7 @@ static void agent_worker_free(agent_worker *w) {
     ds4_permit_free(w->permit);
     ds4_undo_free(w->undo);
     free(w->next_note);
+    free(w->todo);
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
@@ -13663,6 +13821,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     bool force_status_redraw_after_restart = false;
     char *restore_line = NULL;
     char *custom = NULL;
+    bool resume_pending = cfg->resume_latest;
     while (running) {
         /* If a bash child process changed the terminal mode (e.g., from raw
          * to cooked), restore raw mode so linenoise continues to work. */
@@ -13794,7 +13953,29 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             continue;
         }
 
-        if (initial_pending && worker_is_idle(&worker)) {
+        if (resume_pending && worker_is_idle(&worker)) {
+            resume_pending = false;
+            char sha[41];
+            char *saved_input = NULL;
+            if (editor.active && editor.edit.buf && editor.edit.len)
+                saved_input = xstrndup(editor.edit.buf, editor.edit.len);
+            editor_stop(&editor);
+            editor_restore_terminal_layout(&editor);
+            char err[160] = {0};
+            if (!agent_worker_latest_session(&worker, sha))
+                printf("no saved session to continue\n");
+            else if (!agent_worker_switch_session(&worker, sha, AGENT_HISTORY_DEFAULT_TURNS, err, sizeof(err)))
+                printf("could not continue: %s\n", err);
+            worker_get_status(&worker, &st);
+            build_prompt_text(&st, prompt, sizeof(prompt));
+            int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
+            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            editor_start(&editor, prompt, statusline, saved_input);
+            free(saved_input);
+            continue;
+        }
+
+        if (initial_pending && !resume_pending && worker_is_idle(&worker)) {
             if (worker_submit(&worker, initial_pending)) {
                 free(initial_pending);
                 initial_pending = NULL;
@@ -14008,6 +14189,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             }
                         }
                     }
+                } else if (!strcmp(cmd, "/todo")) {
+                    /* Works mid-turn: that is when anyone wants to know. */
+                    pthread_mutex_lock(&worker.mu);
+                    printf("%s\n", worker.todo ? worker.todo : "no task list yet");
+                    pthread_mutex_unlock(&worker.mu);
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd) &&
                            (custom = agent_command_prompt(cmd)) != NULL) {
                     if (busy) {

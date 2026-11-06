@@ -329,3 +329,26 @@ char *ds4_input_run_shell(const char *command) {
     put(&b, tail);
     return b.text;
 }
+
+bool ds4_input_todo_counts(const char *items, int *done, int *total) {
+    int finished = 0, lines = 0;
+    for (const char *p = items ? items : ""; *p;) {
+        const char *end = strchr(p, '\n');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        size_t blank = 0;
+        while (blank < n && isspace((unsigned char)p[blank])) blank++;
+        if (blank < n) {
+            const char *line = p + blank;
+            size_t left = n - blank;
+            bool shaped = left > 4 && line[0] == '[' && line[2] == ']' && line[3] == ' ' &&
+                          strchr(" >x", line[1]);
+            if (!shaped || ++lines > DS4_INPUT_TODO_LINES) return false;
+            if (line[1] == 'x') finished++;
+        }
+        p += n + (end ? 1 : 0);
+    }
+    if (!lines) return false;
+    *done = finished;
+    *total = lines;
+    return true;
+}

@@ -1343,6 +1343,77 @@ static void test_output_descriptions(void) {
     AGENT_TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static void test_todo_and_edit_all(void) {
+    int done = 0, total = 0;
+    AGENT_TEST_ASSERT(ds4_input_todo_counts("[x] one\n[>] two\n[ ] three\n", &done, &total));
+    AGENT_TEST_ASSERT(done == 1 && total == 3);
+    AGENT_TEST_ASSERT(ds4_input_todo_counts("  [ ] indented\n\n[x] after a gap", &done, &total));
+    AGENT_TEST_ASSERT(done == 1 && total == 2);
+    AGENT_TEST_ASSERT(!ds4_input_todo_counts("", &done, &total));
+    AGENT_TEST_ASSERT(!ds4_input_todo_counts(NULL, &done, &total));
+    AGENT_TEST_ASSERT(!ds4_input_todo_counts("- not a task", &done, &total));
+    AGENT_TEST_ASSERT(!ds4_input_todo_counts("[ ] ok\nnot one", &done, &total));
+
+    agent_config cfg = {0};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    pthread_mutex_init(&w.mu, NULL);
+    agent_tool_call call = {0};
+    call.name = xstrdup("todo");
+    test_tool_arg(&call, "items", "[x] a\n[ ] b");
+    char *res = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(strstr(res, "1 of 2"));
+    free(res);
+    AGENT_TEST_ASSERT(w.todo && w.status.todo_total == 2 && w.status.todo_done == 1);
+    char status[256];
+    build_status_text(&w.status, status, sizeof(status));
+    AGENT_TEST_ASSERT(strstr(status, "tasks 1/2"));
+
+    /* The list comes back after compaction, with or without bash jobs. */
+    char *back = agent_bash_jobs_compaction_observation(&w);
+    AGENT_TEST_ASSERT(back && strstr(back, "[ ] b"));
+    free(back);
+
+    agent_tool_call_free(&call);
+    memset(&call, 0, sizeof(call));
+    call.name = xstrdup("todo");
+    test_tool_arg(&call, "items", "not a list");
+    res = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(strstr(res, "Tool error"));
+    free(res);
+    AGENT_TEST_ASSERT(w.status.todo_total == 2);  /* a bad list changes nothing */
+    agent_tool_call_free(&call);
+    agent_todo_clear(&w);
+    AGENT_TEST_ASSERT(!w.todo && w.status.todo_total == 0);
+
+    char dir[] = "/tmp/ds4-editall-XXXXXX";
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/a.txt", dir);
+    test_put_file(path, "foo bar foo\nkeep\nfoo", 20);
+    memset(&call, 0, sizeof(call));
+    call.name = xstrdup("edit");
+    test_tool_arg(&call, "path", path);
+    test_tool_arg(&call, "old", "foo");
+    test_tool_arg(&call, "new", "x");
+    res = agent_tool_edit(&w, &call);  /* without all, three matches are an error */
+    AGENT_TEST_ASSERT(strstr(res, "Tool error"));
+    free(res);
+    test_tool_arg(&call, "all", "true");
+    res = agent_tool_edit(&w, &call);
+    AGENT_TEST_ASSERT(!strstr(res, "Tool error"));
+    free(res);
+    char body[64] = {0};
+    FILE *fp = fopen(path, "r");
+    AGENT_TEST_ASSERT(fp && fread(body, 1, sizeof(body) - 1, fp) > 0);
+    if (fp) fclose(fp);
+    AGENT_TEST_ASSERT(!strcmp(body, "x bar x\nkeep\nx"));
+    agent_tool_call_free(&call);
+    unlink(path);
+    rmdir(dir);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void test_hooks_engine(void) {
     char dir[] = "/tmp/ds4-hooks-XXXXXX", cmd[128], err[PATH_MAX + 80];
     ds4_hooks *h;
@@ -2249,6 +2320,7 @@ int main(int argc, char **argv) {
     test_undo();
     test_prompt_input();
     test_output_descriptions();
+    test_todo_and_edit_all();
     test_deciduous_git();
     test_deciduous_seam_failures();
     test_deciduous_graph();

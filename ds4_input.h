@@ -43,4 +43,10 @@ char *ds4_input_command_list(const char *dir, const char *home);
  * never NULL. A command past DS4_INPUT_SHELL_SECONDS is killed. */
 char *ds4_input_run_shell(const char *command);
 
+/* A task list as the todo tool takes it: one task to a line, each starting "[ ] ", "[>] "
+ * or "[x] ", for waiting, under way and done. False for anything else, or past
+ * DS4_INPUT_TODO_LINES tasks. */
+#define DS4_INPUT_TODO_LINES 64
+bool ds4_input_todo_counts(const char *items, int *done, int *total);
+
 #endif /* DS4_INPUT_H */

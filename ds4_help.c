@@ -325,6 +325,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--goal TEXT", "Record TEXT as this workspace's goal node on the deciduous server; the opening prompt becomes the goal otherwise.");
     opt(fp, c, "--label LABEL", "Who this session is when it writes decisions or posts to the board. Default: DECIDUOUS_AGENT_LABEL or ds4.");
     opt(fp, c, "--hooks on|off", "Run the repository's .ds4/hooks at session and tool events. Default: on");
+    opt(fp, c, "--continue", "Open the newest saved session for this model.");
     opt(fp, c, "--permissions MODE", "What runs without asking: ask, edits or all. Default: ask; all with --non-interactive");
     opt(fp, c, "--instructions on|off", "Read AGENT.md, AGENTS.md or CLAUDE.md into the system prompt. Default: on");
     opt(fp, c, "--graph on|off", "Talk to the deciduous server for this workspace, found by walking up from it. ds4 keeps no local graph. Default: on");
@@ -346,6 +347,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
     opt(fp, c, "/undo", "Put back the files the last turn changed with the file tools.");
     opt(fp, c, "/permissions [MODE]", "Show or set what runs without asking: ask, edits or all.");
+    opt(fp, c, "/todo", "Show the model's task list.");
     opt(fp, c, "/commands", "List /init, /review and the commands in .ds4/commands.");
     opt(fp, c, "!COMMAND", "Run COMMAND; the model sees its output with your next prompt.");
     opt(fp, c, "@PATH", "In a prompt, add that file to it.");
