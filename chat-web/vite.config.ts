@@ -12,6 +12,11 @@ const apiTarget = process.env['DS4_API_TARGET'] ?? 'http://127.0.0.1:8000';
 export default defineConfig({
   base: '/chat/',
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      input: { main: 'index.html', graph: 'graph.html' },
+    },
+  },
   server: {
     proxy: {
       '/v1': {
@@ -19,6 +24,10 @@ export default defineConfig({
         changeOrigin: false,
       },
       '/chat/record': {
+        target: apiTarget,
+        changeOrigin: false,
+      },
+      '/chat/graph/': {
         target: apiTarget,
         changeOrigin: false,
       },

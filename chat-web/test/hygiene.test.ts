@@ -37,7 +37,7 @@ const NON_PURE: readonly string[] = [];
 // The entry point has no test behind it: it reads index.html's #root and mounts the app,
 // and the app behind it is tested through its own props. The ambient declaration for the
 // build tool's import.meta.env holds no code to test either.
-const NON_MIRRORED_SRC: readonly string[] = ['src/main.tsx', 'src/vite-env.d.ts'];
+const NON_MIRRORED_SRC: readonly string[] = ['src/main.tsx', 'src/graph/main.tsx', 'src/vite-env.d.ts'];
 
 // This suite checks the package instead of a runtime module, so it has no mirror.
 const NON_MIRRORED_TEST: readonly string[] = ['test/hygiene.test.ts'];

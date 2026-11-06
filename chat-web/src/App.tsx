@@ -337,6 +337,9 @@ export function App({
               <span>Files</span>
             </button>
           ) : null}
+          <a className="tool" href="graph.html">
+            <span>Graph</span>
+          </a>
           {graph === 'recorded' ? (
             <span className="graph" title="Each finished turn is written to the deciduous decision graph">
               In the decision graph
