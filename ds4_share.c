@@ -71,7 +71,7 @@ bool ds4_share_prepare(const char *dir, char *err, size_t err_len) {
 
 /* An id is the only thing standing between a stranger and a page, so it comes from
  * the system's own random source or not at all. */
-static bool new_id(char id[DS4_SHARE_ID_CHARS + 1]) {
+bool ds4_share_new_id(char id[DS4_SHARE_ID_CHARS + 1]) {
     unsigned char bytes[DS4_SHARE_ID_CHARS / 2];
     int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
@@ -145,7 +145,7 @@ ds4_share_result ds4_share_store(const char *dir, const char *title, const char 
     }
     char final_path[PATH_MAX];
     char temp_path[PATH_MAX];
-    if (!new_id(id) || !page_path(dir, id, final_path, sizeof(final_path)) ||
+    if (!ds4_share_new_id(id) || !page_path(dir, id, final_path, sizeof(final_path)) ||
         (size_t)snprintf(temp_path, sizeof(temp_path), "%s/.upload-XXXXXX", dir) >= sizeof(temp_path)) {
         say(err, err_len, "cannot name the page");
         return ds4_share_failed;

@@ -8,6 +8,7 @@
 #include "rax.h"
 #include "ds4_ui.h"
 #include "ds4_share.h"
+#include "ds4_workspace.h"
 #include "ds4_deciduous.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -10202,6 +10203,8 @@ struct server {
     bool enable_cors;
     const char *ui_dir;   /* built chat page directory, served at /chat */
     const char *share_dir; /* --share-dir: pages kept for links; NULL shares nothing */
+    const char *docker;   /* what runs a workspace; NULL means no workspaces */
+    int workspace_runs;   /* calls in flight, held to DS4_WORKSPACE_MAX_RUNS */
     bool chat_graph_off;  /* --chat-graph off: the page's turns are not recorded */
     pthread_mutex_t chat_graph_mu; /* one graph handle, shared by client threads */
     ds4_dec *chat_graph;  /* opened by the first turn, and again until one opens */
@@ -15627,6 +15630,104 @@ static bool http_shared_page(int fd, server *s, const http_request *hr) {
     return true;
 }
 
+/* A workspace for the chat page: ds4_workspace.h says how one is held. Everything here
+ * asks for application/json, so that a page on another site cannot post at this port, and
+ * the routes do not exist under --cors, which would let one. A frame running model code
+ * has no connection to make. */
+#define DS4_WORKSPACE_PATH DS4_UI_URL_PREFIX "/workspace"
+
+static bool workspace_id_of(const char *body, char id[DS4_WORKSPACE_ID_CHARS + 1]) {
+    const char *p = body;
+    bool found = false;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        json_ws(&p);
+        char *value = NULL;
+        bool wanted = !strcmp(key, "id");
+        free(key);
+        if (!(wanted ? json_string_replace(&p, &value) : json_skip_value(&p))) {
+            free(value);
+            return false;
+        }
+        if (value) {
+            found = ds4_workspace_id_is_valid(value);
+            if (found) memcpy(id, value, DS4_WORKSPACE_ID_CHARS + 1);
+            free(value);
+        }
+        json_ws(&p);
+        if (*p == ',') {
+            p++;
+            json_ws(&p);
+        }
+    }
+    return found;
+}
+
+static void http_workspace_reply(int fd, const char *body, size_t size) {
+    buf h = {0};
+    buf_printf(&h, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n", size);
+    buf_puts(&h, "Content-Type: application/json\r\n"
+                 "X-Content-Type-Options: nosniff\r\n"
+                 "Cache-Control: no-store\r\n"
+                 "Connection: close\r\n\r\n");
+    if (send_all(fd, h.ptr, h.len)) send_all(fd, body, size);
+    buf_free(&h);
+}
+
+static bool http_workspace(int fd, server *s, const http_request *hr) {
+    if (!s->docker || s->enable_cors || strcmp(hr->method, "POST") != 0) return false;
+    bool create = !strcmp(hr->path, DS4_WORKSPACE_PATH);
+    bool run = !strcmp(hr->path, DS4_WORKSPACE_PATH "/run");
+    if (!create && !run) return false;
+    if (!hr->json_body) {
+        http_error(fd, false, 415, "a workspace call is sent as application/json");
+        return true;
+    }
+    char id[DS4_WORKSPACE_ID_CHARS + 1];
+    if (create) {
+        if (!ds4_share_new_id(id)) {
+            http_error(fd, false, 500, "could not make a workspace id");
+            return true;
+        }
+        char body[DS4_WORKSPACE_ID_CHARS + 16];
+        int n = snprintf(body, sizeof(body), "{\"id\":\"%s\"}", id);
+        http_workspace_reply(fd, body, (size_t)n);
+        return true;
+    }
+    const char *request = hr->body ? hr->body : "";
+    if (strlen(request) > DS4_WORKSPACE_MAX_REQUEST) {
+        http_error(fd, false, 413, "the call is too large");
+        return true;
+    }
+    if (!workspace_id_of(request, id)) {
+        http_error(fd, false, 400, "a workspace call needs a workspace id");
+        return true;
+    }
+    if (__atomic_add_fetch(&s->workspace_runs, 1, __ATOMIC_RELAXED) > DS4_WORKSPACE_MAX_RUNS) {
+        __atomic_sub_fetch(&s->workspace_runs, 1, __ATOMIC_RELAXED);
+        http_error(fd, false, 429, "too many workspace calls at once");
+        return true;
+    }
+    size_t size = 0;
+    char *reply = ds4_workspace_run(s->docker, id, request, 0, &size);
+    __atomic_sub_fetch(&s->workspace_runs, 1, __ATOMIC_RELAXED);
+    if (reply) http_workspace_reply(fd, reply, size);
+    else http_error(fd, false, 500, "the workspace call failed");
+    free(reply);
+    return true;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -15664,7 +15765,7 @@ static void *client_main(void *arg) {
     /* The built chat page answers from this origin when --ui-dir names it, so
      * the page asks relative /v1 paths and needs no server address baked into
      * its bundle and no cross-origin headers on the API. */
-    if (http_shared_page(fd, s, &hr) || http_page_response(fd, s, &hr) || http_chat_record(fd, s, &hr)) {
+    if (http_workspace(fd, s, &hr) || http_shared_page(fd, s, &hr) || http_page_response(fd, s, &hr) || http_chat_record(fd, s, &hr)) {
         http_request_free(&hr);
         goto done;
     }
@@ -15794,6 +15895,7 @@ typedef struct {
     bool enable_cors;
     const char *ui_dir;   /* --ui-dir: built chat page directory */
     const char *share_dir; /* --share-dir */
+    bool workspaces;      /* --workspaces on */
     bool chat_graph_off;  /* --chat-graph off */
     int batched_sessions;
     int mixed_prefill_quantum;
@@ -16036,6 +16138,13 @@ static server_config parse_options(int argc, char **argv) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--ui-dir")) {
             c.ui_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--workspaces")) {
+            const char *mode = need_arg(&i, argc, argv, arg);
+            if (strcmp(mode, "on") != 0 && strcmp(mode, "off") != 0) {
+                fprintf(stderr, "ds4-server: --workspaces takes on or off\n");
+                exit(2);
+            }
+            c.workspaces = !strcmp(mode, "on");
         } else if (!strcmp(arg, "--share-dir")) {
             c.share_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-graph")) {
@@ -16460,6 +16569,19 @@ int main(int argc, char **argv) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: %s holds no %s; run npm --prefix chat-web run build",
                        cfg.ui_dir, DS4_UI_INDEX_FILE);
+        }
+    }
+    if (cfg.workspaces) {
+        char workspace_err[160] = {0};
+        if (cfg.enable_cors) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: workspaces are off: --cors would let any website use them");
+        } else if (!cfg.ui_dir) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: workspaces are off: they belong to the chat page, and --ui-dir is not set");
+        } else if (ds4_workspace_ready("docker", workspace_err, sizeof(workspace_err))) {
+            s.docker = "docker";
+            server_log(DS4_LOG_DEFAULT, "ds4-server: chat workspaces on, in %s containers", DS4_WORKSPACE_IMAGE);
+        } else {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: workspaces are off: %s", workspace_err);
         }
     }
     if (s.share_dir) {
@@ -17776,6 +17898,138 @@ static void test_shared_pages(void) {
     TEST_ASSERT(ds4_share_store(dir, "t", "p", kept, err, sizeof(err)) == ds4_share_full);
 
     char command[128];
+    snprintf(command, sizeof(command), "rm -rf %s", dir);
+    TEST_ASSERT(system(command) == 0);
+}
+
+static char *workspace_reply(server *s, const char *path, bool json, const char *body) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+    http_request hr = {0};
+    snprintf(hr.method, sizeof(hr.method), "POST");
+    snprintf(hr.path, sizeof(hr.path), "%s", path);
+    hr.body = (char *)body;
+    hr.json_body = json;
+    bool served = http_workspace(sv[0], s, &hr);
+    shutdown(sv[0], SHUT_WR);
+    char *out = served ? read_socket_text(sv[1]) : NULL;
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+static void test_write_script(const char *path, const char *text) {
+    FILE *fp = fopen(path, "w");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        fputs(text, fp);
+        fclose(fp);
+    }
+    chmod(path, 0755);
+}
+
+/* A stand-in for docker, so that what is tested is the host's part: which arguments go
+ * out, what is refused before anything runs, and what happens when the sandbox misbehaves. */
+static void test_workspaces(void) {
+    char dir[] = "/tmp/ds4-workspace-test-XXXXXX";
+    TEST_ASSERT(mkdtemp(dir) != NULL);
+    char docker[PATH_MAX], seen[PATH_MAX], script[PATH_MAX * 2];
+    snprintf(docker, sizeof(docker), "%s/docker", dir);
+    snprintf(seen, sizeof(seen), "%s/args", dir);
+    snprintf(script, sizeof(script), "#!/bin/sh\nprintf '%%s\\n' \"$@\" > %s\ncat >/dev/null\necho '{\"ok\":true,\"text\":\"ran\"}'\n", seen);
+    test_write_script(docker, script);
+
+    server s = {0};
+    const char *id = "0123456789abcdef0123456789abcdef";
+    char body[256];
+    snprintf(body, sizeof(body), "{\"id\":\"%s\",\"tool\":\"bash\",\"args\":{\"command\":\"ls\"}}", id);
+
+    /* Off unless turned on, and never under --cors. */
+    TEST_ASSERT(workspace_reply(&s, DS4_WORKSPACE_PATH, true, "{}") == NULL);
+    s.docker = docker;
+    s.enable_cors = true;
+    TEST_ASSERT(workspace_reply(&s, DS4_WORKSPACE_PATH, true, "{}") == NULL);
+    s.enable_cors = false;
+
+    char *out = workspace_reply(&s, DS4_WORKSPACE_PATH, false, "{}");
+    TEST_ASSERT(out && strstr(out, "HTTP/1.1 415"));
+    free(out);
+    out = workspace_reply(&s, DS4_WORKSPACE_PATH, true, "{}");
+    TEST_ASSERT(out && strstr(out, "HTTP/1.1 200") && strstr(out, "\"id\":\""));
+    TEST_ASSERT(out && !strstr(out, "Access-Control-Allow"));
+    free(out);
+
+    static const char *const refused[] = {
+        "{}", "{\"id\":\"../../etc\"}", "{\"id\":\"0123456789ABCDEF0123456789ABCDEF\"}",
+        "{\"id\":\"0123456789abcdef0123456789abcde\"}", "{\"id\":\"x; rm -rf /\"}", "{\"id\":1}", "not json",
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        out = workspace_reply(&s, DS4_WORKSPACE_PATH "/run", true, refused[i]);
+        TEST_ASSERT(out && strstr(out, "HTTP/1.1 400"));
+        free(out);
+    }
+    TEST_ASSERT(access(seen, F_OK) != 0);  /* none of those started anything */
+
+    out = workspace_reply(&s, DS4_WORKSPACE_PATH "/run", true, body);
+    TEST_ASSERT(out && strstr(out, "\"text\":\"ran\""));
+    TEST_ASSERT(out && strstr(out, "X-Content-Type-Options: nosniff"));
+    free(out);
+
+    /* Every lock is on the command line. */
+    FILE *fp = fopen(seen, "r");
+    TEST_ASSERT(fp != NULL);
+    char args[2048] = {0};
+    if (fp) {
+        size_t n = fread(args, 1, sizeof(args) - 1, fp);
+        args[n] = '\0';
+        fclose(fp);
+    }
+    static const char *const locks[] = {
+        "--network\nnone\n", "--read-only\n", "--cap-drop\nALL\n", "no-new-privileges\n", "--pids-limit\n",
+        "--memory\n1g\n", "--memory-swap\n1g\n", "--user\n1000:1000\n", "ds4ws-0123456789abcdef0123456789abcdef:/work\n",
+        DS4_WORKSPACE_IMAGE "\n",
+    };
+    for (size_t i = 0; i < sizeof(locks) / sizeof(locks[0]); i++) TEST_ASSERT(strstr(args, locks[i]) != NULL);
+    TEST_ASSERT(strstr(args, "--privileged") == NULL && strstr(args, "docker.sock") == NULL);
+
+    /* A sandbox that hangs is stopped, one that dies says so, and a flood is cut off. */
+    size_t size = 0;
+    test_write_script(docker, "#!/bin/sh\n[ \"$1\" = kill ] && exit 0\nexec sleep 30\n");
+    time_t began = time(NULL);
+    out = ds4_workspace_run(docker, id, "{}", 1, &size);
+    TEST_ASSERT(out && strstr(out, "ran out of time") && time(NULL) - began < 10);
+    free(out);
+    test_write_script(docker, "#!/bin/sh\ncat >/dev/null\nexit 137\n");
+    out = ds4_workspace_run(docker, id, "{}", 5, &size);
+    TEST_ASSERT(out && strstr(out, "without answering"));
+    free(out);
+    test_write_script(docker, "#!/bin/sh\ncat >/dev/null\nhead -c 3000000 /dev/zero | tr '\\0' x\n");
+    out = ds4_workspace_run(docker, id, "{}", 10, &size);
+    TEST_ASSERT(out && strstr(out, "too large"));
+    free(out);
+
+    /* A request larger than a pipe, with the child answering only at the end. */
+    size_t big = 512 * 1024;
+    char *request = malloc(big + 1);
+    TEST_ASSERT(request != NULL);
+    if (request) {
+        memset(request, 'r', big);
+        request[big] = '\0';
+        test_write_script(docker, "#!/bin/sh\nwc -c | tr -d ' '\n");
+        out = ds4_workspace_run(docker, id, request, 10, &size);
+        TEST_ASSERT(out && atol(out) == (long)big);
+        free(out);
+        free(request);
+    }
+
+    TEST_ASSERT(!ds4_workspace_id_is_valid("short"));
+    s.workspace_runs = DS4_WORKSPACE_MAX_RUNS;
+    test_write_script(docker, "#!/bin/sh\ncat >/dev/null\necho '{}'\n");
+    out = workspace_reply(&s, DS4_WORKSPACE_PATH "/run", true, body);
+    TEST_ASSERT(out && strstr(out, "429") != NULL);
+    free(out);
+
+    char command[PATH_MAX];
     snprintf(command, sizeof(command), "rm -rf %s", dir);
     TEST_ASSERT(system(command) == 0);
 }
@@ -23752,6 +24006,7 @@ static void ds4_server_unit_tests_run(void) {
     test_chat_page_serving();
     test_chat_record_route();
     test_shared_pages();
+    test_workspaces();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();

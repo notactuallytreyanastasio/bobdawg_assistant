@@ -48,6 +48,9 @@ typedef enum {
  * so no path can reach anything but a page in the directory. */
 bool ds4_share_id_of_path(const char *url_path, char id[DS4_SHARE_ID_CHARS + 1]);
 
+/* A new id from the system's random source. */
+bool ds4_share_new_id(char id[DS4_SHARE_ID_CHARS + 1]);
+
 /* Make the directory and its parents, for this user alone. */
 bool ds4_share_prepare(const char *dir, char *err, size_t err_len);
 

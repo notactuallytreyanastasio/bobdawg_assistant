@@ -361,6 +361,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--ui-dir DIR", "Serve the built chat page from DIR at /chat.");
+    opt(fp, c, "--workspaces on|off", "Give the chat page a sandboxed workspace in Docker. Default: off");
     opt(fp, c, "--share-dir DIR", "Keep pages shared from the chat in DIR, opened at /chat/shared. Default: off");
     opt(fp, c, "--chat-graph on|off", "Record the page's chats in the decision graph. Default: on");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
