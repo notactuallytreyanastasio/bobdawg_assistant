@@ -1682,6 +1682,33 @@ static char *agent_build_system_prompt_reminder(ds4_engine *engine,
     return out;
 }
 
+/* Qwen's chat_append_message keeps system text plain, which is right for text a
+ * user supplied and wrong for the tool prompt: its examples would spell <tool_call>
+ * in ordinary tokens, the model would sometimes copy that spelling instead of
+ * emitting the real token, and the call would come apart on the next line. */
+static char *agent_qwen_trusted_system(const char *prompt) {
+    static const char open[] = "<|im_start|>system\n";
+    static const char close[] = "<|im_end|>\n";
+    size_t n = strlen(prompt);
+    char *out = xmalloc(sizeof(open) - 1 + n + sizeof(close));
+    memcpy(out, open, sizeof(open) - 1);
+    memcpy(out + sizeof(open) - 1, prompt, n);
+    memcpy(out + sizeof(open) - 1 + n, close, sizeof(close));
+    return out;
+}
+
+/* Append DS4's own control text as a system message, with its markers as tokens. */
+static void agent_append_trusted_system(ds4_engine *engine, ds4_tokens *tokens,
+                                        const char *prompt) {
+    if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_QWEN) {
+        char *rendered = agent_qwen_trusted_system(prompt);
+        ds4_tokenize_rendered_chat(engine, rendered, tokens);
+        free(rendered);
+    } else {
+        ds4_chat_append_message(engine, tokens, "system", prompt);
+    }
+}
+
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
                                        const char *extra, bool edit_upto) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
@@ -1691,7 +1718,7 @@ static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
      * ｜DSML｜ must remain plain content, not control tokens. */
     char *tools_prompt = agent_build_tools_prompt(engine, edit_upto);
     if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(engine)))
-        ds4_chat_append_message(engine, tokens, "system", tools_prompt);
+        agent_append_trusted_system(engine, tokens, tools_prompt);
     else {
         if (ds4_engine_is_deepseek41(engine))
             ds4_chat_append_message(engine, tokens, "system", "");
@@ -1868,7 +1895,7 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
     if (agent_syntax_is_xml_tool_call(agent_tool_syntax_for_engine(w->engine))) {
-        ds4_chat_append_message(w->engine, &w->transcript, "system", reminder);
+        agent_append_trusted_system(w->engine, &w->transcript, reminder);
     } else {
         ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
     }
@@ -5700,6 +5727,15 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
                                     text, text_len, &w->transcript,
                                     NULL,
                                     load_err, sizeof(load_err));
+        /* The same text can tokenize differently after a change to how the
+         * prompt is built, and the old graph state would then shape every turn. */
+        if (loaded && (w->transcript.len != sys.len ||
+                       memcmp(w->transcript.v, sys.v,
+                              (size_t)sys.len * sizeof(sys.v[0])) != 0)) {
+            agent_trace(w, "sysprompt kv stale tokens file=%s", w->sysprompt_path);
+            ds4_session_invalidate(w->session);
+            loaded = false;
+        }
         if (loaded) {
             agent_trace(w, "sysprompt kv hit file=%s tokens=%d",
                         w->sysprompt_path, w->transcript.len);
@@ -7963,6 +7999,12 @@ static char *agent_test_stream_capture(agent_tool_syntax syntax,
     return agent_tail_capture_take(&tail, NULL);
 }
 
+static void test_agent_qwen_trusted_system_is_rendered_chat(void) {
+    char *out = agent_qwen_trusted_system("<tool_call>\nexample");
+    AGENT_TEST_ASSERT(!strcmp(out, "<|im_start|>system\n<tool_call>\nexample<|im_end|>\n"));
+    free(out);
+}
+
 static void test_agent_qwen_tool_parser_chunked_multi_arg(void) {
     const char *a = "<tool_call>\n<function=bash>\n<parameter=command>\nprintf hi\n";
     const char *b = "</param";
@@ -8540,6 +8582,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_tool_parser_multiple_adjacent_calls();
     test_agent_glm_stream_tool_call_chunked();
     test_agent_tool_argument_literal_markup();
+    test_agent_qwen_trusted_system_is_rendered_chat();
     test_agent_qwen_tool_parser_chunked_multi_arg();
     test_agent_qwen_tool_parser_two_calls_and_error();
     test_agent_qwen_stream_tool_call_chunked();
