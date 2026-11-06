@@ -60,6 +60,13 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 
 This list is not complete, check the files for more info.
 
+## The project log
+
+`docs/index.html` is the fork's public log, served by GitHub Pages. When a line of work
+lands, add a dated entry at the top of the entries: what changed, why, and what went wrong,
+in plain hand-written HTML with no build step. Say what is not done yet. Credit upstream's
+work as upstream's, and keep machine names, addresses and local paths out of it.
+
 ## Testing
 
 Use `make` for build validation. Use `make test` for unit/regression tests when a

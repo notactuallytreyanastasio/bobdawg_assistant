@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bobdawg_assistant: notes on a fork of DwarfStar</title>
+<meta name="description" content="A running log of what this fork has changed in antirez's DwarfStar (ds4).">
+<style>
+  :root { color-scheme: light dark; }
+  body { max-width: 40em; margin: 2em auto; padding: 0 1em; font: 1.05em/1.6 Georgia, serif; }
+  h1 { font-size: 1.5em; margin-bottom: 0; }
+  h2 { font-size: 1.15em; margin-top: 2.5em; }
+  code { font-size: .9em; }
+  time, .small { color: GrayText; font-size: .9em; }
+</style>
+</head>
+<body>
+
+<h1>bobdawg_assistant</h1>
+<p class="small">A running log of a fork of <a href="https://github.com/antirez/ds4">DwarfStar (ds4)</a>. Newest first.</p>
+
+<p>DwarfStar is antirez's small native inference engine for running a few large
+language models on hardware people can actually own. This
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant">fork</a> is not
+part of that project, and antirez and the DwarfStar authors have nothing to do with
+what is written here. It is one person's experiment, built on their work under its MIT
+license.</p>
+
+<h2>What is different from upstream</h2>
+
+<p>The short version: <strong>we have not changed the inference engine.</strong>
+<code>ds4.c</code>, the Metal kernels and the CUDA code are exactly as upstream left them,
+and the speed is all theirs. Everything here sits around the engine, and is mostly about
+one question: what does a local model need around it to do real work over more than one
+sitting?</p>
+
+<p>Fourteen commits on top of upstream's <code>b3f5018</code> so far, about 17,000 lines
+added and 28 removed:</p>
+
+<ul>
+  <li><strong>A memory for the agent.</strong> <code>ds4-agent</code> records goals, the
+    options it weighed, what it decided and how it turned out in a shared
+    <a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/blob/main/docs/DECISION_GRAPH.md">decision graph</a>,
+    so the reasoning outlives the context window.</li>
+  <li><strong>A link from that memory to git.</strong> Commits are tied to the goals that
+    produced them, and a push the graph cannot vouch for is refused.</li>
+  <li><strong>A hooks engine for the agent.</strong> Rules kept by the harness, rather
+    than by the model remembering them.</li>
+  <li><strong>A chat page</strong>, served by <code>ds4-server</code> itself, whose
+    conversations go into the same graph.</li>
+  <li><strong>Serving over a tailnet</strong>, so other machines can use the model
+    without opening it to the local network.</li>
+  <li><strong>A session recorder</strong>, and a Tetris written to give all of this
+    something real to do.</li>
+</ul>
+
+<p>The only upstream code touched is <code>ds4_agent.c</code> and
+<code>ds4_server.c</code> (about 880 lines added between them), plus the agent's tests,
+the Makefile, the help text and some docs.</p>
+
+<p>A note on who wrote this. A good part of the fork was written by the model running on
+it: the graph records <code>ds4-agent</code> sessions on Qwen3.8 Flash Next behind the
+Tetris, the tailnet serving and the first chat page. Later work, including this page, was
+done with Claude Code. A person directed all of it. The commits carry one name, so the
+decision graph is the better record of who did what.</p>
+
+<h2 id="2026-11-06-publishing">This page, and rewriting history safely</h2>
+<p><time datetime="2026-11-06">2026-11-06</time></p>
+
+<p>Publishing the fork meant first taking a private network address out of the docs, and
+that meant rewriting commits that had never been pushed. Ten of the twelve got new hashes.
+The graph moved with them, and we checked that directly rather than trusting a clean audit,
+because the backup branch kept the old commits alive and the audit could not see them as
+gone.</p>
+
+<p>One gap turned up. <code>git filter-branch</code> fires no git hooks, so the hook that
+updates the graph never ran, and the old-to-new map had to be fed through
+<code>ds4-graph rewrite</code> by hand. Ordinary rebases and amends are automatic.</p>
+
+<h2 id="2026-11-05-git">The graph learns about git</h2>
+<p><time datetime="2026-11-05">2026-11-05</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/b99f699">b99f699</a></p>
+
+<p>We went to rewrite those commits and asked what would happen to the hashes the graph
+held. The answer was that it held almost none: one node in 400 named a commit. The graph
+barely knew git was there.</p>
+
+<p>A hash stops being true when history is rewritten, so the link could not be the hash.
+It is a <code>Deciduous-Goal:</code> trailer in the commit message, which goes wherever the
+commit goes. Four git hooks do the rest: stamp the trailer, write the commit into the
+graph, move nodes to new hashes after a rewrite, and audit what is being pushed. The gate
+is the push and not the commit, because a graph server being down should not stop anyone
+committing.</p>
+
+<p>The agent gained a small hooks engine in the same change. Commands in
+<code>.ds4/hooks</code> run at session and tool events, and exit code 2 refuses a tool and
+tells the model why. The rules that ship refuse <code>--no-verify</code>, though that is a
+tripwire and not a sandbox.</p>
+
+<p>Running it on the real repository caught what the tests had not. The audit flagged a
+stale hash in the sentence "commit discipline for the directory (4931eb9d)", which is a
+node id. A gate that cries wolf gets bypassed, so a hash now only counts straight after the
+word commit.</p>
+
+<h2 id="2026-11-05-chats">Chats go in the graph too</h2>
+<p><time datetime="2026-11-05">2026-11-05</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/43ad2c2">43ad2c2</a></p>
+
+<p>Each conversation on the chat page is now a goal, and each exchange a step under it. A
+chat model has no tools to write with, so <code>ds4-server</code> writes on its behalf, and
+the token stays on the server. Chats go on a branch of their own, in the same tree, so they
+do not bury the agent's goals.</p>
+
+<p>This is only the write side. The chat model is not briefed from the graph yet, so
+conversations are stored but it cannot use them.</p>
+
+<h2 id="2026-11-05-review">Reviewing the graph wiring</h2>
+<p><time datetime="2026-11-05">2026-11-05</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/b78d9a9">b78d9a9</a></p>
+
+<p>A review of the wiring against the live graph found the record going wrong in ways a
+session could not see. <code>/new</code> did not really let go of a goal, so new work
+filed under the old one. A reply cut off halfway counted as success, so the agent could be
+told a decision was logged when nobody could say so. A restarted server broke every later
+write. The model was being taught different rules from the ones the server asked for,
+which fits sessions closing with decisions and no steps.</p>
+
+<p>And <code>op=board all=1</code> promised the newest messages and returned the oldest
+twenty, which the review missed and a failing test found. A small fake server now sits in
+the tests, cutting replies short and forgetting sessions on purpose.</p>
+
+<h2 id="2026-11-05-chat-page">A chat page worth using</h2>
+<p><time datetime="2026-11-05">2026-11-05</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/9a5ce15">9a5ce15</a></p>
+
+<p>The first page was one column of text that forgot everything on reload. It now has saved
+chats, markdown, a thinking fold, retry, and a phone layout. Several things the server
+already said were being ignored: an answer cut off at the length limit looked finished, and
+one ended by a server error looked the same.</p>
+
+<p>Run through the real server, a follow-up with thinking on came to 1,317 tokens at 56.9
+tok/s, with the server's own log saying 56.02. That is a 147 GB model on a 64 GB Mac, which
+is antirez's work, not ours.</p>
+
+<h2 id="2026-11-05-first-page">Chatting from a browser</h2>
+<p><time datetime="2026-11-05">2026-11-05</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/b06c7b6">b06c7b6</a>,
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/3bc2d9e">3bc2d9e</a></p>
+
+<p>A React page on TypeScript, written test-first. <code>ds4-server --ui-dir</code> serves
+it from the same origin as the API, so no address is baked into the page and no
+cross-origin headers are needed. The resolver refuses anything that could reach a file
+outside the built directory, because that endpoint has no authentication.</p>
+
+<h2 id="2026-11-05-tetris">Tetris, as a test of the whole idea</h2>
+<p><time datetime="2026-11-05">2026-11-05</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/fedd6b4">fedd6b4</a></p>
+
+<p>The point was less the game than the process: give the agent a real project, in
+TypeScript with test-driven development and no <code>any</code>, and see whether the graph
+held up. It wrote 64 tests and logged 77 decisions. It also taught us things about the
+harness: that compaction destroys the raw exchange, and that printing the tool-call
+markers in its own prose confused the parser.</p>
+
+<h2 id="2026-11-05-tailnet">Serving over a tailnet</h2>
+<p><time datetime="2026-11-05">2026-11-05</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/e9afebb">e9afebb</a></p>
+
+<p><code>ds4-server</code> has no authentication, so binding it to every interface would
+open it to anyone on the same WiFi. <code>serve-tailnet.sh</code> binds only the Tailscale
+address, which leaves the tailnet as the access control.</p>
+
+<h2 id="2026-11-05-graph">Giving the agent a memory</h2>
+<p><time datetime="2026-11-05">2026-11-05</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/cfbb2ce">cfbb2ce</a></p>
+
+<p>Where it started. A long session loses its reasoning to compaction, and the next session
+starts blind. So <code>ds4-agent</code> writes goals, decisions and outcomes to a shared
+deciduous server, reads them back before it acts, and leaves a note for the next session.
+The server is the only store: no local file, cache or mirror to drift out of date.</p>
+
+<p>A session recorder
+(<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/82c3a3a">82c3a3a</a>)
+turns a session and its graph into a recording you can replay in a terminal.</p>
+
+<p class="small">Upstream is <a href="https://github.com/antirez/ds4">antirez/ds4</a>. MIT
+licensed; copyright the ds4.c authors.</p>
+
+</body>
+</html>
