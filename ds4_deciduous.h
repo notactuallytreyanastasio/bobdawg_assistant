@@ -187,4 +187,13 @@ char *ds4_dec_git_audit(ds4_dec *d, const char *range, int *problems,
  * re-read from the server rather than summarised from the transcript. */
 char *ds4_dec_compaction_digest(ds4_dec *d);
 
+/* The server's tools by name, for a client that shows the model all of them rather
+ * than the eight operations above. Both stay inside this seam's workspace pin, so a
+ * page reaching them through ds4-server sees this repository's graph and no other.
+ * The list comes back as the raw tools/list result. A call answers with the tool's
+ * text, or NULL with err set, and a tool's own refusal counts as an error. */
+char *ds4_dec_tool_list(ds4_dec *d, char *err, size_t err_len);
+char *ds4_dec_tool_call(ds4_dec *d, const char *tool, const char *args_json,
+                        char *err, size_t err_len);
+
 #endif /* DS4_DECIDUOUS_H */

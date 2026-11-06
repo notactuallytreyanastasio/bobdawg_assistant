@@ -2927,3 +2927,21 @@ const char *ds4_dec_prompt_section(const ds4_dec *d) {
              text, d->workspace, d->branch, d->url, goal);
     return shown;
 }
+
+char *ds4_dec_tool_list(ds4_dec *d, char *err, size_t err_len) {
+    char *result = NULL;
+    if (!d || !dec_rpc(d, "tools/list", "{}", false, &result, err, err_len)) {
+        free(result);
+        return NULL;
+    }
+    return result;
+}
+
+char *ds4_dec_tool_call(ds4_dec *d, const char *tool, const char *args_json,
+                        char *err, size_t err_len) {
+    if (!d || !tool || !tool[0]) {
+        dec_set_err(err, err_len, "no tool to call");
+        return NULL;
+    }
+    return dec_tool(d, tool, args_json, err, err_len);
+}

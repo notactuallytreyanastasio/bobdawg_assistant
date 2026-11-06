@@ -15471,6 +15471,15 @@ static bool chat_record_parse(const char *body, chat_record *r) {
 #define DS4_CHAT_RECORD_PATH DS4_UI_URL_PREFIX "/record"
 #define DS4_CHAT_GRAPH_BRANCH "chat"
 
+/* Held under chat_graph_mu. A graph that was not there last time may be there now. */
+static void chat_graph_open(server *s, char *err, size_t err_len) {
+    if (s->chat_graph) return;
+    char root[PATH_MAX];
+    if (ds4_dec_find_root(NULL, root, sizeof(root))) s->chat_graph = ds4_dec_open(root, "ds4-chat");
+    if (s->chat_graph) ds4_dec_use_branch(s->chat_graph, DS4_CHAT_GRAPH_BRANCH);
+    else snprintf(err, err_len, "%s", ds4_dec_open_error() ? ds4_dec_open_error() : "no graph to write to");
+}
+
 static bool http_chat_record(int fd, server *s, const http_request *hr) {
     if (!s->ui_dir || strcmp(hr->method, "POST") != 0 || strcmp(hr->path, DS4_CHAT_RECORD_PATH) != 0)
         return false;
@@ -15492,13 +15501,7 @@ static bool http_chat_record(int fd, server *s, const http_request *hr) {
     char err[512] = {0};
     char *goal = NULL;
     pthread_mutex_lock(&s->chat_graph_mu);
-    if (!s->chat_graph) {
-        char root[PATH_MAX];
-        if (ds4_dec_find_root(NULL, root, sizeof(root))) s->chat_graph = ds4_dec_open(root, "ds4-chat");
-        if (s->chat_graph) ds4_dec_use_branch(s->chat_graph, DS4_CHAT_GRAPH_BRANCH);
-        else snprintf(err, sizeof(err), "%s", ds4_dec_open_error() ? ds4_dec_open_error()
-                                                                   : "no graph to write to");
-    }
+    chat_graph_open(s, err, sizeof(err));
     if (s->chat_graph) {
         ds4_dec_chat_turn turn = {.chat_id = r.chat, .first_question = r.first,
                                   .question = r.question, .answer = r.answer,
@@ -15519,6 +15522,105 @@ static bool http_chat_record(int fd, server *s, const http_request *hr) {
     buf_puts(&b, "}");
     free(goal);
     http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return true;
+}
+
+#define DS4_CHAT_GRAPH_TOOLS_PATH DS4_UI_URL_PREFIX "/graph/tools"
+#define DS4_CHAT_GRAPH_CALL_PATH DS4_UI_URL_PREFIX "/graph/call"
+#define DS4_CHAT_GRAPH_TOOL_MAX 64
+
+/* One tool call from the graph page: its name, and its arguments as they were written. */
+static bool chat_graph_call_parse(const char *body, char **tool, char **args) {
+    const char *p = body;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        json_ws(&p);
+        bool ok;
+        if (!strcmp(key, "tool")) ok = json_string_replace(&p, tool);
+        else if (!strcmp(key, "args") && *p == '{' && !*args) ok = json_raw_value(&p, args);
+        else ok = json_skip_value(&p);
+        free(key);
+        if (!ok) return false;
+        json_ws(&p);
+        if (*p == ',') {
+            p++;
+            json_ws(&p);
+        }
+    }
+    return *p == '}';
+}
+
+static bool chat_graph_tool_is_usable(const char *tool) {
+    size_t n = tool ? strlen(tool) : 0;
+    if (n == 0 || n > DS4_CHAT_GRAPH_TOOL_MAX) return false;
+    return strspn(tool, "abcdefghijklmnopqrstuvwxyz_") == n;
+}
+
+/* The graph page reaches every deciduous tool through here, for the reason turns are
+ * recorded through /chat/record: the token must not reach a page served with no
+ * authentication. The seam pins its own workspace, so other projects on the same
+ * deciduous server stay out of reach. Writes are as open as the port: the page asks
+ * the reader first, and only Tailscale ACLs say who the reader can be. */
+static bool http_chat_graph(int fd, server *s, const http_request *hr) {
+    bool list = !strcmp(hr->path, DS4_CHAT_GRAPH_TOOLS_PATH);
+    bool call = !strcmp(hr->path, DS4_CHAT_GRAPH_CALL_PATH);
+    if (!s->ui_dir || strcmp(hr->method, "POST") != 0 || (!list && !call)) return false;
+    if (s->chat_graph_off) {
+        http_error(fd, s->enable_cors, 404, "this server has no graph for the page");
+        return true;
+    }
+    if (!hr->json_body) {
+        http_error(fd, s->enable_cors, 415, "a graph call is sent as application/json");
+        return true;
+    }
+    char *tool = NULL, *args = NULL;
+    if (call && (!chat_graph_call_parse(hr->body ? hr->body : "", &tool, &args) ||
+                 !chat_graph_tool_is_usable(tool))) {
+        free(tool);
+        free(args);
+        http_error(fd, s->enable_cors, 400, "a graph call needs a tool and its args");
+        return true;
+    }
+
+    char err[512] = {0};
+    char *answer = NULL;
+    pthread_mutex_lock(&s->chat_graph_mu);
+    chat_graph_open(s, err, sizeof(err));
+    if (s->chat_graph) {
+        answer = list ? ds4_dec_tool_list(s->chat_graph, err, sizeof(err))
+                      : ds4_dec_tool_call(s->chat_graph, tool, args, err, sizeof(err));
+    }
+    pthread_mutex_unlock(&s->chat_graph_mu);
+    free(tool);
+    free(args);
+
+    buf b = {0};
+    if (list && answer) {
+        buf_puts(&b, answer);
+    } else {
+        /* A refused call is an answer the model can read and act on, not a broken server. */
+        buf_puts(&b, answer ? "{\"ok\":true,\"text\":" : "{\"ok\":false,\"text\":");
+        json_escape(&b, answer ? answer : err[0] ? err : "the graph did not answer");
+        buf_puts(&b, "}");
+    }
+    free(answer);
+    if (list && b.ptr && strncmp(b.ptr, "{\"ok\":false", 11) == 0) {
+        http_error(fd, s->enable_cors, 503, err[0] ? err : "the graph did not answer");
+    } else {
+        http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    }
     buf_free(&b);
     return true;
 }
@@ -15765,7 +15867,7 @@ static void *client_main(void *arg) {
     /* The built chat page answers from this origin when --ui-dir names it, so
      * the page asks relative /v1 paths and needs no server address baked into
      * its bundle and no cross-origin headers on the API. */
-    if (http_workspace(fd, s, &hr) || http_shared_page(fd, s, &hr) || http_page_response(fd, s, &hr) || http_chat_record(fd, s, &hr)) {
+    if (http_workspace(fd, s, &hr) || http_shared_page(fd, s, &hr) || http_page_response(fd, s, &hr) || http_chat_graph(fd, s, &hr) || http_chat_record(fd, s, &hr)) {
         http_request_free(&hr);
         goto done;
     }
@@ -17755,6 +17857,51 @@ static char *chat_record_reply(server *s, bool json, const char *body) {
     close(sv[0]);
     close(sv[1]);
     return out;
+}
+
+static char *chat_graph_reply(server *s, const char *path, bool json, const char *body) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+    http_request hr = {0};
+    snprintf(hr.method, sizeof(hr.method), "POST");
+    snprintf(hr.path, sizeof(hr.path), "%s", path);
+    hr.body = (char *)body;
+    hr.json_body = json;
+    bool served = http_chat_graph(sv[0], s, &hr);
+    shutdown(sv[0], SHUT_WR);
+    char *out = served ? read_socket_text(sv[1]) : NULL;
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+/* What the graph itself answers is the seam's. Here is who gets that far. */
+static void test_chat_graph_route(void) {
+    server s = {.ui_dir = "/tmp"};
+    char *out;
+    TEST_ASSERT(chat_graph_reply(&s, "/chat/graph/other", true, "{}") == NULL);
+    out = chat_graph_reply(&s, DS4_CHAT_GRAPH_CALL_PATH, false, "{\"tool\":\"get_graph\"}");
+    TEST_ASSERT(out && strstr(out, " 415 "));
+    free(out);
+    out = chat_graph_reply(&s, DS4_CHAT_GRAPH_CALL_PATH, true, "{\"args\":{}}");
+    TEST_ASSERT(out && strstr(out, " 400 "));
+    free(out);
+    out = chat_graph_reply(&s, DS4_CHAT_GRAPH_CALL_PATH, true, "{\"tool\":\"../etc\",\"args\":{}}");
+    TEST_ASSERT(out && strstr(out, " 400 "));
+    free(out);
+    s.chat_graph_off = true;
+    out = chat_graph_reply(&s, DS4_CHAT_GRAPH_TOOLS_PATH, true, "{}");
+    TEST_ASSERT(out && strstr(out, " 404 "));
+    free(out);
+    s.ui_dir = NULL;
+    TEST_ASSERT(chat_graph_reply(&s, DS4_CHAT_GRAPH_TOOLS_PATH, true, "{}") == NULL);
+
+    char *tool = NULL, *args = NULL;
+    TEST_ASSERT(chat_graph_call_parse("{\"tool\":\"show_node\",\"args\":{\"node_id\":\"a\"}}", &tool, &args));
+    TEST_ASSERT(tool && !strcmp(tool, "show_node"));
+    TEST_ASSERT(args && !strcmp(args, "{\"node_id\":\"a\"}"));
+    free(tool);
+    free(args);
 }
 
 /* The turn itself is written by the seam and tested with it; what is checked here
@@ -24006,6 +24153,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_sse_headers();
     test_chat_page_serving();
     test_chat_record_route();
+    test_chat_graph_route();
     test_shared_pages();
     test_workspaces();
     test_anthropic_live_stream_sends_incremental_blocks();
