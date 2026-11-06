@@ -1199,3 +1199,324 @@ button:disabled {
   min-height: 0;
   padding: 6px 12px;
 }
+
+/* Working in the sandbox: thinking, changes and the chat side by side. Only a screen wide enough
+   for all three gets them; anything narrower keeps the plain transcript, which still shows it all. */
+
+.work-panes {
+  display: none;
+}
+
+@media (min-width: 1101px) {
+  .app.work .menu {
+    display: block;
+  }
+
+  .app.work .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 4;
+    width: 300px;
+    transform: translateX(-100%);
+    transition: transform 180ms ease;
+  }
+
+  .app.work .sidebar.open {
+    transform: none;
+    box-shadow: var(--shadow);
+  }
+
+  .app.work .work-panes {
+    flex: 1;
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(250px, 300px) minmax(0, 1fr);
+    position: relative;
+  }
+
+  .app.work .page {
+    flex: none;
+    width: clamp(340px, 28vw, 440px);
+    border-left: 1px solid var(--line);
+    background: var(--side);
+  }
+
+  .app.work .panel.open {
+    position: fixed;
+    inset: 0 0 0 auto;
+    z-index: 3;
+    box-shadow: var(--shadow);
+  }
+
+  /* Both of these have a pane of their own here. */
+  .app.work .transcript .reasoning,
+  .app.work .transcript .file-change {
+    display: none;
+  }
+}
+
+.work-pane {
+  min-width: 0;
+  min-height: 0;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.work-pane.thinking {
+  background: var(--side);
+  border-right: 1px solid var(--line);
+}
+
+.work-head {
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dim);
+  border-bottom: 1px solid var(--line);
+}
+
+.work-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+/* The line from a thought to its change crosses here and nowhere else. */
+.work-scroll.gutter {
+  padding-left: 56px;
+}
+
+.work-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.work-thought {
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.work-thought summary {
+  cursor: pointer;
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+
+.work-thought .led {
+  display: block;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--accent);
+}
+
+.work-thought p {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--dim);
+}
+
+.work-thought.selected {
+  border-color: var(--accent);
+  background: var(--raised);
+}
+
+.work-did {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.work-hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--dim);
+}
+
+.work-change {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.work-change.selected {
+  border-color: var(--accent);
+  box-shadow: var(--shadow);
+}
+
+.work-why {
+  padding: 9px 12px;
+}
+
+.work-why h3 {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  margin: 0;
+  font-size: 14px;
+}
+
+.work-why .state {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--dim);
+}
+
+.work-why p {
+  margin: 4px 0 0;
+  font-size: 14px;
+}
+
+.work-why .goal {
+  font-size: 13px;
+  color: var(--dim);
+}
+
+.work-diff {
+  overflow-x: auto;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+  background: var(--code-bg);
+  font: 12.5px/1.5 var(--mono);
+}
+
+.work-line {
+  width: max-content;
+  min-width: 100%;
+  padding: 0 12px;
+  white-space: pre;
+  border-left: 3px solid transparent;
+}
+
+.work-line.add {
+  color: var(--up);
+  background: color-mix(in srgb, var(--up) 12%, transparent);
+}
+
+.work-line.del {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.work-line.marked {
+  border-left-color: var(--accent);
+}
+
+.work-line.struck {
+  border-left-color: var(--danger);
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
+.work-note {
+  position: sticky;
+  left: 12px;
+  width: min(calc(100% - 24px), 520px);
+  margin: 6px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  white-space: normal;
+}
+
+.work-note b {
+  display: block;
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.work-note.reject b {
+  color: var(--danger);
+}
+
+.work-note textarea {
+  display: block;
+  width: 100%;
+  min-height: 60px;
+  margin: 4px 0 6px;
+  padding: 6px 8px;
+  resize: vertical;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.work-note-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.work-note-row .go {
+  color: var(--on-accent);
+  background: var(--accent);
+}
+
+.work-note-row .go:disabled {
+  opacity: 0.5;
+}
+
+.work-thread {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.work-thread path {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 4;
+}
+
+.work-menu {
+  position: fixed;
+  z-index: 5;
+  display: grid;
+  min-width: 200px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.work-menu p {
+  margin: 0 0 3px;
+  padding: 3px 10px 5px;
+  font-size: 12px;
+  color: var(--dim);
+  border-bottom: 1px solid var(--line);
+}
+
+.work-menu button {
+  padding: 5px 10px;
+  text-align: left;
+  border-radius: 6px;
+}
+
+.work-menu button:hover {
+  background: var(--raised);
+}
+
+.work-menu .danger {
+  color: var(--danger);
+}

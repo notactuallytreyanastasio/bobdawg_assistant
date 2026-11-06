@@ -2,7 +2,7 @@
 // question box, and whatever the server complained about last. Nothing here decides any
 // rule - the reducer does, and the hook runs the turn.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { platformFetch } from './api/chatClient';
 import type { FetchLike } from './api/chatClient';
 import { fetchModels } from './api/models';
@@ -27,7 +27,10 @@ import {
   saveWorkspaceOn,
 } from './chat/storage';
 import type { StoreLike } from './chat/storage';
+import { noteMessage, workOf } from './chat/work';
+import type { Note } from './chat/work';
 import { ArtifactPanel } from './components/ArtifactPanel';
+import { WorkPanes } from './components/WorkPanes';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import type { PanelTab } from './components/ArtifactPanel';
 import { Composer } from './components/Composer';
@@ -80,6 +83,10 @@ export function App({
   const [openArtifact, setOpenArtifact] = useState<string | null>(null);
   const [panelTab, setPanelTab] = useState<PanelTab>('preview');
   const [fullView, setFullView] = useState(false);
+  // What the reader said about the code in this chat, and what still waits for the turn to end.
+  const [notes, setNotes] = useState<readonly Note[]>([]);
+  const [queued, setQueued] = useState<readonly string[]>([]);
+  const noteIds = useRef(0);
 
   const artifacts = useArtifacts({
     onReveal: (callId) => {
@@ -123,6 +130,24 @@ export function App({
     onTurn: record,
   });
   const { messages, streaming } = chat.conversation;
+
+  // A note sent while the model is working waits for the turn to end, and goes as one message.
+  useEffect(() => {
+    if (streaming || queued.length === 0) return;
+    setQueued([]);
+    chat.send(queued.join('\n\n'));
+  }, [streaming, queued]);
+
+  function addNote(note: Omit<Note, 'id'>): void {
+    noteIds.current += 1;
+    setNotes((held) => [...held, { ...note, id: `note-${noteIds.current}` }]);
+    setQueued((waiting) => [...waiting, noteMessage(note)]);
+  }
+
+  function clearNotes(): void {
+    setNotes([]);
+    setQueued([]);
+  }
 
   // The server may still be loading the model, or not started yet: the page keeps asking
   // until it answers, so opening the page early costs nothing.
@@ -194,6 +219,7 @@ export function App({
     library.save(activeId, messages);
     library.select(null);
     clearPanel();
+    clearNotes();
     chat.reset();
     setActiveId(newChatId());
     setDrawer(false);
@@ -207,6 +233,7 @@ export function App({
     library.save(activeId, messages);
     library.select(id);
     clearPanel();
+    clearNotes();
     chat.load(saved.messages);
     setActiveId(id);
   }
@@ -215,6 +242,7 @@ export function App({
     library.remove(id);
     if (id === activeId) {
       clearPanel();
+      clearNotes();
       chat.reset();
       setActiveId(newChatId());
     }
@@ -263,8 +291,10 @@ export function App({
       : 'Connecting to ds4-server';
   const lastStats = messages.findLast((message) => message.stats !== null)?.stats ?? null;
 
+  const working = workspace && messages.length > 0;
+
   return (
-    <div className="app">
+    <div className={working ? 'app work' : 'app'}>
       <Sidebar
         chats={library.chats}
         activeId={activeId}
@@ -274,6 +304,9 @@ export function App({
         onDelete={remove}
         onClose={() => setDrawer(false)}
       />
+      {working ? (
+        <WorkPanes work={workOf(messages)} notes={notes} live={streaming} queued={queued.length} onNote={addNote} />
+      ) : null}
       <main className="page">
         <header className="header">
           <button className="menu" type="button" aria-label="Open chats" onClick={() => setDrawer(true)}>

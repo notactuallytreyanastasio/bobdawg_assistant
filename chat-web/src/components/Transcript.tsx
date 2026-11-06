@@ -190,8 +190,10 @@ function sameEntry(a: EntryProps, b: EntryProps): boolean {
 // is watching; a finished step folds away like thinking does.
 function StepRow({ step }: { readonly step: Step }) {
   const state = step.ok === null ? 'step running' : step.ok ? 'step' : 'step failed';
+  // Beside the changes pane, an edit is already on screen in a better form.
+  const change = step.label.startsWith('edit ') || step.label.startsWith('write ');
   return (
-    <details className={state}>
+    <details className={change ? `${state} file-change` : state}>
       <summary>
         <code>{step.label}</code>
       </summary>
