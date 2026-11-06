@@ -6,6 +6,8 @@ import { memo, useEffect, useState } from 'react';
 import { artifactsOf, consentText } from '../chat/artifact';
 import type { Artifact } from '../chat/artifact';
 import { canRetry } from '../chat/conversation';
+import { stepsOf } from '../chat/steps';
+import type { Step } from '../chat/steps';
 import type { Conversation } from '../chat/conversation';
 import { formatDuration, formatStats } from '../chat/format';
 import type { ChatMessage } from '../chat/message';
@@ -153,6 +155,7 @@ type EntryProps = CardActions & {
   // A later round of the same turn, which needs no name of its own.
   readonly continued: boolean;
   readonly artifacts: readonly Artifact[];
+  readonly steps: readonly Step[];
   readonly onRetry: (() => void) | undefined;
 };
 
@@ -163,8 +166,14 @@ function sameEntry(a: EntryProps, b: EntryProps): boolean {
     const other = b.artifacts[index];
     return card.key === other?.key && card.status === other.status && card.detail === other.detail;
   };
+  const sameStep = (step: Step, index: number) => {
+    const other = b.steps[index];
+    return step.key === other?.key && step.ok === other.ok && step.output === other.output;
+  };
   return (
     a.message === b.message &&
+    a.steps.length === b.steps.length &&
+    a.steps.every(sameStep) &&
     a.live === b.live &&
     a.continued === b.continued &&
     a.onRetry === b.onRetry &&
@@ -177,7 +186,22 @@ function sameEntry(a: EntryProps, b: EntryProps): boolean {
   );
 }
 
-const Entry = memo(function Entry({ message, live, continued, artifacts, onRetry, ...actions }: EntryProps) {
+// One thing the model did in its workspace. Open while it runs, because that is when anyone
+// is watching; a finished step folds away like thinking does.
+function StepRow({ step }: { readonly step: Step }) {
+  const state = step.ok === null ? 'step running' : step.ok ? 'step' : 'step failed';
+  return (
+    <details className={state}>
+      <summary>
+        <code>{step.label}</code>
+      </summary>
+      {step.detail === '' ? null : <pre className="step-text">{step.detail}</pre>}
+      {step.output === '' ? null : <pre className="step-text">{step.output}</pre>}
+    </details>
+  );
+}
+
+const Entry = memo(function Entry({ message, live, continued, artifacts, steps, onRetry, ...actions }: EntryProps) {
   if (message.role === 'user') {
     return (
       <li className="entry user">
@@ -201,6 +225,9 @@ const Entry = memo(function Entry({ message, live, continued, artifacts, onRetry
           <Card key={artifact.key} artifact={artifact} {...actions} />
         ),
       )}
+      {steps.map((step) => (
+        <StepRow key={step.key} step={step} />
+      ))}
       {message.ending === null ? null : <p className="ending">{ENDINGS[message.ending]}</p>}
       {live || (message.text === '' && onRetry === undefined && stats === '') ? null : (
         <div className="tools">
@@ -246,6 +273,7 @@ export function Transcript({ conversation, onRetry, pending = null, onRun, onCod
                   live={newest && streaming}
                   continued={messages[index - 1]?.role === 'tool'}
                   artifacts={artifacts.filter((artifact) => artifact.key.startsWith(`${message.id}/`))}
+                  steps={stepsOf(messages, index)}
                   pending={pending}
                   onRun={onRun}
                   onCode={onCode}

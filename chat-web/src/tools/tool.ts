@@ -38,10 +38,10 @@ export const ONE_CALL_LINE = 'not run: one call per reply. Send it again if it i
 // The page's own line, which goes above anything the running code wrote. The model has no other
 // way to know what a call costs, and without this it spent whole turns on debug runs. The result
 // of the last round reaches it only if the chat goes on, so the warning comes one round early.
-export function roundLine(round: number, max: number): string {
+export function roundLine(round: number, max: number, thing = 'chart'): string {
   if (round >= max) return `Round ${max} of ${max}: no rounds left.`;
   if (round === max - 1) {
-    return `Round ${round} of ${max}: your next call is your last, and you will not see its result. Send the whole finished chart, not a test.`;
+    return `Round ${round} of ${max}: your next call is your last, and you will not see its result. Send the whole finished ${thing}, not a test.`;
   }
   return `Round ${round} of ${max}.`;
 }

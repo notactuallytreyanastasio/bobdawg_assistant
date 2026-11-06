@@ -134,7 +134,9 @@ export function useChat(config: ChatConfig): Chat {
               });
       if (myTurn !== turn.current) return null;
       const over = result.fatal === true || fatal !== undefined || signal.aborted;
-      const text = over ? result.text : `${roundLine(round, MAX_ROUNDS)}\n${result.text}`;
+      const max = assistant.rounds ?? MAX_ROUNDS;
+      const thing = assistant.rounds === undefined ? 'chart' : 'work';
+      const text = over ? result.text : `${roundLine(round, max, thing)}\n${result.text}`;
       apply(myTurn, { type: 'result', id: ids.assistant(), callId: call.id, ok: result.ok, text });
       results.push(result);
     }
@@ -167,7 +169,7 @@ export function useChat(config: ChatConfig): Chat {
           ? { type: 'end', ending: 'stopped', stats }
           : last.fatal === true
             ? { type: 'end', ending: 'gaveup', stats, error: last.text }
-            : round === MAX_ROUNDS
+            : round === (assistant.rounds ?? MAX_ROUNDS)
               ? { type: 'end', ending: last.ok ? 'capped' : 'gaveup', stats }
               : null;
         if (finalEvent !== null) {

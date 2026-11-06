@@ -13,6 +13,8 @@ export type StoreLike = {
 const LIBRARY_KEY = 'ds4.chat.library';
 const THINKING_KEY = 'ds4.chat.thinking';
 const PLOT_KEY = 'ds4.chat.plot';
+const WORKSPACE_ON_KEY = 'ds4.chat.workspace';
+const WORKSPACE_ID_KEY = 'ds4.chat.workspace.id';
 
 export function platformStore(): StoreLike | null {
   try {
@@ -68,6 +70,23 @@ export function saveThinking(store: StoreLike | null, thinking: boolean): boolea
 // Plot is off unless it was turned on: it is the one setting that lets model code run.
 export function loadPlot(store: StoreLike | null): boolean {
   return read(store, PLOT_KEY) === 'on';
+}
+
+// Off unless turned on, like Plot. The id is what makes a workspace this browser's own.
+export function loadWorkspaceOn(store: StoreLike | null): boolean {
+  return read(store, WORKSPACE_ON_KEY) === 'on';
+}
+
+export function saveWorkspaceOn(store: StoreLike | null, on: boolean): boolean {
+  return write(store, WORKSPACE_ON_KEY, on ? 'on' : 'off');
+}
+
+export function loadWorkspaceId(store: StoreLike | null): string | null {
+  return read(store, WORKSPACE_ID_KEY);
+}
+
+export function saveWorkspaceId(store: StoreLike | null, id: string): boolean {
+  return write(store, WORKSPACE_ID_KEY, id);
 }
 
 export function savePlot(store: StoreLike | null, plot: boolean): boolean {

@@ -2,18 +2,29 @@
 // question box, and whatever the server complained about last. Nothing here decides any
 // rule - the reducer does, and the hook runs the turn.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { platformFetch } from './api/chatClient';
 import type { FetchLike } from './api/chatClient';
 import { fetchModels } from './api/models';
 import type { ModelInfo } from './api/models';
 import { recordTurn, turnRecordOf } from './api/recordTurn';
 import { sharePage } from './api/sharePage';
+import { NO_WORKSPACES, createWorkspace, isWorkspaceId, runInWorkspace } from './api/workspace';
 import type { RecordResult } from './api/recordTurn';
 import { artifactsOf } from './chat/artifact';
 import type { Conversation } from './chat/conversation';
 import { contextPercent } from './chat/format';
-import { loadPlot, loadThinking, platformStore, savePlot, saveThinking } from './chat/storage';
+import {
+  loadPlot,
+  loadThinking,
+  loadWorkspaceId,
+  loadWorkspaceOn,
+  platformStore,
+  savePlot,
+  saveThinking,
+  saveWorkspaceId,
+  saveWorkspaceOn,
+} from './chat/storage';
 import type { StoreLike } from './chat/storage';
 import { ArtifactPanel } from './components/ArtifactPanel';
 import type { PanelTab } from './components/ArtifactPanel';
@@ -28,6 +39,8 @@ import type { HostFactory } from './hooks/useArtifacts';
 import { useChat } from './hooks/useChat';
 import { useLibrary } from './hooks/useLibrary';
 import { plotAssistant } from './tools/assistant';
+import { workspaceAssistant } from './tools/workspace';
+import type { WorkspaceRunner } from './tools/workspace';
 
 export type AppProps = {
   readonly origin?: string;
@@ -59,6 +72,7 @@ export function App({
   const [thinking, setThinking] = useState(() => loadThinking(store));
   const [graph, setGraph] = useState<RecordResult | null>(null);
   const [plot, setPlot] = useState(() => loadPlot(store));
+  const [workspace, setWorkspace] = useState(() => loadWorkspaceOn(store));
   // The chart in the panel, by its key, or by call id for one the turn has only just made.
   const [openArtifact, setOpenArtifact] = useState<string | null>(null);
   const [panelTab, setPanelTab] = useState<PanelTab>('preview');
@@ -71,7 +85,21 @@ export function App({
     },
     ...(createHost === undefined ? {} : { createHost }),
   });
-  const assistant = useMemo(() => (plot ? plotAssistant(artifacts.runner) : null), [plot, artifacts.runner]);
+  // Made on first use, so that nobody who never turns this on has a workspace at all.
+  const runInSandbox = useCallback<WorkspaceRunner>(
+    async (tool, args, signal) => {
+      const held = loadWorkspaceId(store);
+      const id = isWorkspaceId(held) ? held : await createWorkspace(origin, send);
+      if (id === null) return { ok: false, fatal: true, text: NO_WORKSPACES };
+      if (id !== held) saveWorkspaceId(store, id);
+      return runInWorkspace({ origin, id, tool, args, signal, fetchImpl: send });
+    },
+    [origin, send, store],
+  );
+  const assistant = useMemo(() => {
+    if (workspace) return workspaceAssistant(runInSandbox);
+    return plot ? plotAssistant(artifacts.runner) : null;
+  }, [workspace, plot, artifacts.runner, runInSandbox]);
 
   // Every finished turn goes to the decision graph by way of the server. The answer is on
   // the page either way, so all that comes back is whether to say it did not land.
@@ -197,6 +225,17 @@ export function App({
   function choosePlot(next: boolean): void {
     setPlot(next);
     savePlot(store, next);
+    if (next) chooseWorkspace(false);
+  }
+
+  // One or the other: a turn has one assistant, and each has its own system prompt.
+  function chooseWorkspace(next: boolean): void {
+    setWorkspace(next);
+    saveWorkspaceOn(store, next);
+    if (next) {
+      setPlot(false);
+      savePlot(store, false);
+    }
   }
 
   const ready = model !== null;
@@ -272,8 +311,10 @@ export function App({
           thinking={thinking}
           contextPercent={contextPercent(lastStats?.contextTokens ?? null, model?.contextLength ?? null)}
           onThinking={chooseThinking}
-          plot={plot}
+          plot={plot && !workspace}
           onPlot={choosePlot}
+          workspace={workspace}
+          onWorkspace={chooseWorkspace}
           onSend={chat.send}
           onStop={chat.stop}
           {...(notice === undefined ? {} : { notice })}

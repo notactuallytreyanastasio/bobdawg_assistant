@@ -423,6 +423,36 @@ button:disabled {
   animation: pulse 1.6s ease-in-out infinite;
 }
 
+.step {
+  margin: 4px 0;
+  font-size: 13px;
+  color: var(--dim);
+}
+
+.step summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.step.failed summary {
+  color: var(--danger);
+}
+
+.step.running summary {
+  color: var(--accent);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+.step-text {
+  max-height: 22rem;
+  margin: 6px 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border-left: 2px solid var(--line);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .ending {
   margin: 8px 0 0;
   color: var(--dim);

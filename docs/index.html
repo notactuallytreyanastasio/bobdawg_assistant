@@ -146,6 +146,30 @@ without one.</p>
   <li><strong>A browsing tool</strong> for the chat is still only an idea.</li>
 </ul>
 
+<h2 id="2026-11-06-workspace">A coding agent in the browser</h2>
+<p><time datetime="2026-11-06">2026-11-06</time></p>
+
+<p>Turn on Workspace in the chat and the model has a shell and a directory of its own. Asked to
+write a module and its tests, run them and commit, it did all of that from the web page in 49
+seconds, and the commit and passing tests were checked from outside afterwards.</p>
+
+<p>A web page handing a shell to a model is the most dangerous thing here. The server has no
+login, and the model reads whatever people paste. So nothing runs on the host. Each tool call is
+a container with no network, a read-only root, no capabilities and limits on memory and processes,
+and a workspace is a volume inside Docker's VM rather than a folder of this machine. The file
+tools run in there too, because a host opening those files could be led out by a symlink. From
+inside, the internet, the host and the server were all unreachable, a fork bomb hit the process
+limit, and a 3 GB allocation was killed, with the next call working normally.</p>
+
+<p>The first run produced a scare: the model mentioned a dashboard from a "previous turn" in what
+should have been a new browser. It looked like one person's chat reaching another. It was a stale
+test browser with its old history, and a proper test with two separate browsers showed neither
+sees the other. What separates two people is a random id in the browser, not a login, and nobody
+independent has attacked any of this.</p>
+
+<p>We also wrote a coding eval, eight tasks judged by checks the model never sees. Qwen passed all
+eight on its first run, at about 46 seconds each, so the eval needs to get harder.</p>
+
 <h2 id="2026-11-06-agent-trust">An agent you can leave your files with</h2>
 <p><time datetime="2026-11-06">2026-11-06</time></p>
 

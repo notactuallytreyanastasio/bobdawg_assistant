@@ -19,6 +19,7 @@ function Icon({ children }: { children: ReactNode }) {
   );
 }
 
+export const TerminalIcon = () => <Icon><path d="m5 8 4 4-4 4M12 17h7" /></Icon>;
 export const PlusIcon = () => <Icon><path d="M12 5v14M5 12h14" /></Icon>;
 export const MenuIcon = () => <Icon><path d="M4 7h16M4 12h16M4 17h16" /></Icon>;
 export const TrashIcon = () => <Icon><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" /></Icon>;

@@ -200,6 +200,23 @@ What this does not stop:
   boundary. Its pattern for HTML-parsing method names should be rechecked when Chrome updates,
   because Chrome keeps adding them.
 
+## Workspace
+
+With **Workspace** on, the model is a coding agent: it has a shell and file tools in a directory
+of its own, and each step shows in the transcript as it happens, folded open to what it ran and
+what came back. The directory belongs to this browser and lasts between chats. No Run is asked
+for, because nothing here runs in the page or on the server's own machine.
+
+Each tool call is one container from `sandbox/`, with no network, a read-only root, no
+capabilities, an ordinary user, and limits on memory, CPU and processes. The workspace is a named
+volume in Docker's VM, so no directory of the host is mounted, and the file tools run inside as
+well, so a symlink has nothing on the host to lead to. Build the image once with
+`docker build -t ds4-sandbox sandbox`. `ds4_workspace.h` has the reasoning.
+
+What holds it apart from another person's workspace is a random id kept in this browser, so
+clearing the browser's storage loses the way back to it. Nothing limits disk but the VM's own
+size, and this has been tested by us and not independently.
+
 ## Pages and links
 
 Asked for a page, a report or a dashboard, the model calls the `page` tool instead of

@@ -6,7 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 import { canSend } from '../chat/conversation';
 import type { Conversation } from '../chat/conversation';
-import { BulbIcon, ChartIcon, SendIcon, StopIcon } from './icons';
+import { BulbIcon, ChartIcon, SendIcon, StopIcon, TerminalIcon } from './icons';
 
 export type ComposerProps = {
   readonly conversation: Conversation;
@@ -17,6 +17,8 @@ export type ComposerProps = {
   readonly onThinking?: (thinking: boolean) => void;
   readonly plot?: boolean;
   readonly onPlot?: (plot: boolean) => void;
+  readonly workspace?: boolean;
+  readonly onWorkspace?: (workspace: boolean) => void;
   readonly onSend: (text: string) => void;
   readonly onStop: () => void;
 };
@@ -32,6 +34,8 @@ export function Composer({
   contextPercent = null,
   onThinking,
   plot,
+  workspace,
+  onWorkspace,
   onPlot,
   onSend,
   onStop,
@@ -116,6 +120,22 @@ export function Composer({
             >
               <ChartIcon />
               Plot
+            </button>
+          )}
+          {workspace === undefined || onWorkspace === undefined ? null : (
+            <button
+              className={workspace ? 'toggle on' : 'toggle'}
+              type="button"
+              aria-pressed={workspace}
+              title={
+                workspace
+                  ? 'The model works in a sandboxed directory of yours, with a shell and no network'
+                  : 'Plain chat: no code runs'
+              }
+              onClick={() => onWorkspace(!workspace)}
+            >
+              <TerminalIcon />
+              Workspace
             </button>
           )}
           {notice === undefined ? null : <span className="hint">{notice}</span>}

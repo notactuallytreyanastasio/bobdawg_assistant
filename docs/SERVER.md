@@ -84,6 +84,14 @@ repository's workspace; a server with no deciduous configured answers `503` and 
 says the turn was not recorded. `--chat-graph off` turns it off. See
 [the chat page in the decision graph docs](DECISION_GRAPH.md#the-chat-page).
 
+`--workspaces on` gives the chat page a sandboxed workspace, with Docker and the
+`ds4-sandbox` image from `sandbox/`. `POST /chat/workspace` makes an id, and `POST
+/chat/workspace/run` takes `id`, `tool` and `args` as `application/json`. Each call is one
+container with no network, a read-only root, no capabilities and limits on memory, CPU and
+processes, and at most four run at once. The routes do not exist under `--cors`, and without
+Docker or the image the server says so and carries on. Anyone who can reach the port can
+make a workspace and run code in one, so disk in Docker's VM is the shared limit.
+
 `--share-dir DIR` lets the page keep a finished chart or page for a link. `POST
 /chat/shared` takes `application/json` holding `title` and `page`, and answers with
 a `path`; `GET /chat/shared/<id>` opens it. The directory is made for this user
