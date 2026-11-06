@@ -84,6 +84,13 @@ repository's workspace; a server with no deciduous configured answers `503` and 
 says the turn was not recorded. `--chat-graph off` turns it off. See
 [the chat page in the decision graph docs](DECISION_GRAPH.md#the-chat-page).
 
+`/chat/graph.html` explores that graph. Its `POST /chat/graph/tools` and `POST
+/chat/graph/call` reach every deciduous tool without handing the page the token, and
+stay inside this repository's workspace. They need `application/json`, and `--chat-graph
+off` turns them off. The page asks before a write, but **the port has no authentication,
+so anyone who can reach it can call these directly, deletes included**. Restrict it with
+Tailscale ACLs.
+
 `--workspaces on` gives the chat page a sandboxed workspace, with Docker and the
 `ds4-sandbox` image from `sandbox/`. `POST /chat/workspace` makes an id, and `POST
 /chat/workspace/run` takes `id`, `tool` and `args` as `application/json`. Each call is one
