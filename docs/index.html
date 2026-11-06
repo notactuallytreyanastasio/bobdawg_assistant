@@ -12,6 +12,9 @@
   h2 { font-size: 1.15em; margin-top: 2.5em; }
   code { font-size: .9em; }
   time, .small { color: GrayText; font-size: .9em; }
+  img { max-width: 100%; height: auto; border: 1px solid GrayText; }
+  figure { margin: 1.5em 0; }
+  figcaption { color: GrayText; font-size: .9em; }
 </style>
 </head>
 <body>
@@ -34,7 +37,7 @@ and the speed is all theirs. Everything here sits around the engine, and is most
 one question: what does a local model need around it to do real work over more than one
 sitting?</p>
 
-<p>Fourteen commits on top of upstream's <code>b3f5018</code> so far, about 17,000 lines
+<p>Nineteen commits on top of upstream's <code>b3f5018</code> so far, about 28,000 lines
 added and 28 removed:</p>
 
 <ul>
@@ -47,8 +50,9 @@ added and 28 removed:</p>
   <li><strong>A hooks engine for the agent.</strong> Rules kept by the harness, rather
     than by the model remembering them.</li>
   <li><strong>A chat page</strong>, served by <code>ds4-server</code> itself, whose
-    conversations go into the same graph. With Plot on, the model can turn pasted data into a
-    D3 chart that runs in a sandbox beside the chat.</li>
+    conversations go into the same graph.</li>
+  <li><strong>Artifacts.</strong> With Plot on, the model turns pasted data into a D3 chart
+    or a whole page, which runs in a sandbox beside the chat and can be shared by link.</li>
   <li><strong>Serving over a tailnet</strong>, so other machines can use the model
     without opening it to the local network.</li>
   <li><strong>A session recorder</strong>, and a Tetris written to give all of this
@@ -56,7 +60,7 @@ added and 28 removed:</p>
 </ul>
 
 <p>The only upstream code touched is <code>ds4_agent.c</code> and
-<code>ds4_server.c</code> (about 880 lines added between them), plus the agent's tests,
+<code>ds4_server.c</code> (about 1,100 lines added between them), plus the agent's tests,
 the Makefile, the help text and some docs.</p>
 
 <p>A note on who wrote this. A good part of the fork was written by the model running on
@@ -65,8 +69,87 @@ Tetris, the tailnet serving and the first chat page. Later work, including this 
 done with Claude Code. A person directed all of it. The commits carry one name, so the
 decision graph is the better record of who did what.</p>
 
+<h2 id="tour">A tour of what is here</h2>
+
+<p><strong>The chat page.</strong> <code>ds4-server --ui-dir</code> serves it from the same
+origin as the API. It keeps chats in the browser, renders markdown, folds the model's thinking
+away and follows it when opened, and shows when an answer was cut off or failed. Every exchange
+goes into the decision graph, on a branch of its own. The
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/blob/main/chat-web/README.md">page's README</a> covers all of it, including the
+sandbox.</p>
+
+<figure>
+<img src="chat-page.png" width="1400" height="900" loading="lazy" alt="The chat page with a question and answer on the left, and a model-built page beside them showing a heading, a summary and a chart.">
+<figcaption>The model built this page from six rows of made-up data and is about to share it.
+The panel asks first. Its totals are right, and its bars came out as thin dashes rather than
+rising from zero, which is why the panel says to check what it shows.</figcaption>
+</figure>
+
+<p><strong>Tools and artifacts.</strong> The page speaks the server's tool calls, and the first
+tools are <code>plot</code> and <code>page</code>. The code the model writes runs only after you
+press Run. If it throws, the error goes back to the model, which gets five rounds in all to
+repair it.</p>
+
+<p><strong>Links.</strong> With <code>--share-dir</code> the server keeps a finished page and
+gives back an address. What opens there is a plain line saying a model wrote this, with the page
+in a sandboxed frame below it.</p>
+
+<figure>
+<img src="shared-page.png" width="1200" height="900" loading="lazy" alt="A shared page open on its own, under a line saying it was written by a language model.">
+<figcaption>The same page opened from its link, with no chat around it.</figcaption>
+</figure>
+
+<p><strong>The decision graph.</strong> <code>ds4-agent</code> and the chat write to one
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/blob/main/docs/DECISION_GRAPH.md">graph</a> of goals, options, decisions and
+outcomes, kept on a deciduous server and nowhere else. <code>main</code> holds 499 nodes as of
+this entry. <code>ds4-graph audit</code> checks the graph against git, and the
+<code>pre-push</code> hook runs it.</p>
+
+<p><strong>Hooks.</strong> <code>.ds4/hooks</code> holds rules run by the harness at session
+start and end, and before and after a tool call. A rule can refuse a tool call outright, so it
+does not depend on the model remembering it.</p>
+
+<p><strong>Serving.</strong> <code>./serve-tailnet.sh</code> binds the tailnet address and no
+other, builds the page if it is stale, and turns on sharing. The server has no authentication,
+so the tailnet is the access control. See
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/blob/main/docs/TAILNET.md">TAILNET.md</a> and
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/blob/main/docs/SERVER.md">SERVER.md</a>.</p>
+
+<h2 id="running">Running it</h2>
+
+<p>You need what upstream needs: a machine that can run a model, and the weights. The rest is
+this, with the model set up as upstream's docs describe:</p>
+
+<pre><code>make ds4-server ds4-agent ds4-graph
+npm --prefix chat-web install
+./serve-tailnet.sh               # or: ./ds4-server --ui-dir chat-web/dist --share-dir ~/.ds4/shared
+./ds4-graph install              # once per clone: the git hooks
+</code></pre>
+
+<p>The chat page is then at <code>/chat/</code> on that address. Turn on Plot beside Thinking
+and paste something. Recording to the graph needs a deciduous server, and the page works
+without one.</p>
+
+<h2 id="not-done">What is not done</h2>
+
+<ul>
+  <li><strong>Nobody independent has attacked the sandbox.</strong> Two attacker agents were set
+    up for it and neither ran. The tests below are the builders' own.</li>
+  <li><strong>The escape tests are not in the repository yet.</strong> The results are written
+    down here, and the scripts behind them cannot be rerun by anyone else.</li>
+  <li><strong>Only desktop Chrome has been tested.</strong> Not Safari, and not real phones.</li>
+  <li><strong>Links last until a file is deleted by hand.</strong> There is no way to take one
+    down from the page.</li>
+  <li><strong>The chat model is not briefed from the graph.</strong> It writes to the graph and
+    does not read it. The agent does, and the
+    <a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/blob/main/docs/DECISION_GRAPH_ROADMAP.md">roadmap</a> says how far that has got.</li>
+  <li><strong>A browsing tool</strong> for the chat is still only an idea.</li>
+</ul>
+
 <h2 id="2026-11-06-pages">Whole pages, and links to them</h2>
-<p><time datetime="2026-11-06">2026-11-06</time></p>
+<p><time datetime="2026-11-06">2026-11-06</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/f9e67a2">f9e67a2</a>,
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/d141c5b">d141c5b</a></p>
 
 <p>The chart tool grew. Ask for a report or a dashboard and the model now builds a whole page,
 with headings, words, tables and charts, in the same sandbox and under the same Run. A page that
@@ -87,8 +170,17 @@ reader's. DNS was not measured here, and should be expected to leak as it does i
 carries the data with it and lasts until its file is deleted, so the page says so before it
 shares. All of this is Chrome desktop, tested by us, and nobody independent has attacked it.</p>
 
+<h2 id="2026-11-06-thinking">Thinking you can watch</h2>
+<p><time datetime="2026-11-06">2026-11-06</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/2d4c700">2d4c700</a></p>
+
+<p>An open thinking box scrolls on its own once it is full, so the newest thinking arrived out
+of sight. It now follows the model the way the transcript does. Scrolling up lets go, and a box
+opened after the thinking is over starts at the top, where a reader begins.</p>
+
 <h2 id="2026-11-06-artifacts">Charts the model writes and the page runs</h2>
-<p><time datetime="2026-11-06">2026-11-06</time></p>
+<p><time datetime="2026-11-06">2026-11-06</time> ·
+<a href="https://github.com/notactuallytreyanastasio/bobdawg_assistant/commit/3c4c3a7">3c4c3a7</a></p>
 
 <p>The chat page can now use tools. The first one is a plot assistant: paste something messy,
 and the model writes D3 code for a chart, which runs beside the chat once you press Run. Think
