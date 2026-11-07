@@ -41,6 +41,8 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   tool-call mapping, disk KV cache policy.
 - `ds4_agent.c`: the local agent harness: system prompt assembly, per-model tool
   formats and tool dispatch, sessions, compaction, and the deciduous integration.
+- `ds4_remote.c`, `ds4_remote.h`: `--remote`, chat completions over plain HTTP. Wire
+  only; the loop that uses it is `worker_run_remote_turn` in `ds4_agent.c`.
 - `ds4_deciduous.c`, `ds4_deciduous.h`: the deciduous seam, in full. MCP-over-HTTP
   client, the eight graph operations the model is offered, the git link and audit, the prompt teaching and
   the graph briefing, the recovery note, the compaction digest and the closing

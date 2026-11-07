@@ -140,3 +140,4 @@ __pycache__/
 # graph.json is the shared copy; commit it deliberately once the graph is worth sharing.
 /.deciduous/deciduous.db
 /BOBBY.md
+tests/test_remote

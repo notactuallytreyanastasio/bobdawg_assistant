@@ -323,6 +323,8 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     opt(fp, c, "--goal TEXT", "Record TEXT as this workspace's goal node on the deciduous server; the opening prompt becomes the goal otherwise.");
+    opt(fp, c, "--remote URL", "Run against a ds4-server over /v1/chat/completions; no local model is loaded. Default: DS4_REMOTE_URL, then the first line of ~/.ds4/remote. off stays local.");
+    opt(fp, c, "--remote-model ID", "Which model id on the server. Default: the first it lists.");
     opt(fp, c, "--label LABEL", "Who this session is when it writes decisions or posts to the board. Default: DECIDUOUS_AGENT_LABEL or ds4.");
     opt(fp, c, "--hooks on|off", "Run the repository's .ds4/hooks at session and tool events. Default: on");
     opt(fp, c, "--continue", "Open the newest saved session for this model.");

@@ -160,6 +160,22 @@ without one.</p>
     the changes pane does not show what a shell command changed.</li>
 </ul>
 
+<h2 id="2026-11-06-remote-agent">The agent without a model</h2>
+<p><time datetime="2026-11-06">2026-11-06</time></p>
+
+<p><code>ds4-agent --remote URL</code> runs the whole harness on a machine with no GGUF, against a
+<code>ds4-server</code> somewhere else. The tokenizer lives in the model file, so the agent cannot make
+a single token without one: a remote session keeps chat messages instead of tokens and lets the server
+render them. It has to be <code>/v1/chat/completions</code>, because <code>/v1/completions</code> wraps
+its prompt as a user message and would quote a rendered transcript inside a second template.</p>
+<p>Testing it turned up a bug that was already here. The permission prompt read 31 bytes and looked at
+the first letter, so a long sentence typed at it was split, and a piece starting with "a" granted
+"always allow all file edits". It now takes only the whole word.</p>
+<p>A request stopped with Ctrl+C came back on the next message, because a request with no reply is still
+open. A system note saying not to resume it did not work; a closing assistant reply did.</p>
+<p>Not done: remote sessions are not saved, so <code>/save</code>, <code>--continue</code> and the commands
+around them refuse. Images do not work remotely, and neither does <code>/think</code>.</p>
+
 <h2 id="2026-11-06-graph-page">A page for walking the graph</h2>
 <p><time datetime="2026-11-06">2026-11-06</time></p>
 

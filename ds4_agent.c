@@ -8,6 +8,7 @@
 #include "ds4_tp.h"
 #include "ds4_web.h"
 #include "ds4_deciduous.h"
+#include "ds4_remote.h"
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -99,6 +100,9 @@ typedef struct {
     const char *chdir_path;
     const char *goal;      /* --goal: the decision-graph goal this session serves */
     const char *dec_label; /* --label: who this session is on the graph */
+    const char *remote_url;   /* --remote: inference over HTTP, no local model */
+    const char *remote_model; /* --remote-model: which id it serves */
+    ds4_remote *remote;
     bool graph_off;        /* --graph off: stay blind to any decision graph */
     bool hooks_off;        /* --hooks off: run no .ds4/hooks */
     bool instructions_off; /* --instructions off: read no AGENT.md */
@@ -204,6 +208,14 @@ typedef struct {
     char tool_approval_message[512];
     ds4_permit *permit;
     ds4_undo *undo;
+    /* With --remote there is no engine, session or token transcript: these are
+     * the transcript, one JSON message each, and what the server last counted. */
+    ds4_remote *remote;
+    char **rmsgs;
+    int rmsg_len;
+    int rmsg_cap;
+    int rused_tokens;   /* the prompt and reply of the last request */
+    size_t rnew_bytes;  /* message text added since, which nothing has counted yet */
     char *next_note;  /* said to the model ahead of the next prompt; owned */
     char *todo;       /* the model's task list; owned */
     bool queued_user_drain_pending;
@@ -479,10 +491,44 @@ static bool agent_syntax_is_xml_tool_call(agent_tool_syntax syntax) {
     return syntax == AGENT_TOOL_SYNTAX_GLM || syntax == AGENT_TOOL_SYNTAX_QWEN;
 }
 
+static void *xmalloc(size_t n);
+
+/* Appends one message, already JSON, to the remote transcript; takes ownership. */
+static void agent_remote_push_json(agent_worker *w, char *json) {
+    if (w->rmsg_len == w->rmsg_cap) {
+        w->rmsg_cap = w->rmsg_cap ? w->rmsg_cap * 2 : 64;
+        w->rmsgs = realloc(w->rmsgs, (size_t)w->rmsg_cap * sizeof(w->rmsgs[0]));
+        if (!w->rmsgs) abort();
+    }
+    w->rmsgs[w->rmsg_len++] = json;
+    w->rnew_bytes += strlen(json);
+}
+
+static void agent_remote_push(agent_worker *w, const char *role, const char *text) {
+    char *quoted = ds4_remote_json_quote(text);
+    size_t n = strlen(role) + strlen(quoted) + 32;
+    char *json = xmalloc(n);
+    snprintf(json, n, "{\"role\":\"%s\",\"content\":%s}", role, quoted);
+    free(quoted);
+    agent_remote_push_json(w, json);
+}
+
+/* System text from the harness, into whichever transcript this session keeps. */
+static void agent_worker_say_system(agent_worker *w, const char *text) {
+    if (w->remote) agent_remote_push(w, "system", text);
+    else ds4_chat_append_message(w->engine, &w->transcript, "system", text);
+}
+
 static void agent_worker_append_assistant_turn_end(agent_worker *w) {
     if (agent_tool_syntax_assistant_turn_uses_eos(
             agent_tool_syntax_for_engine(w->engine)))
         ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
+}
+
+/* Tokens in the session. A remote one has no token transcript, so this is what the
+ * server last counted plus about three bytes a token for what it has not seen. */
+static int agent_worker_ctx_used(const agent_worker *w) {
+    return w->remote ? w->rused_tokens + (int)(w->rnew_bytes / 3) : w->transcript.len;
 }
 
 static int agent_worker_effective_ctx_size(const agent_worker *w) {
@@ -1025,6 +1071,10 @@ static agent_config parse_options(int argc, char **argv) {
                 fprintf(stderr, "ds4-agent: --hooks wants on or off\n");
                 exit(2);
             }
+        } else if (!strcmp(arg, "--remote")) {
+            c.remote_url = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--remote-model")) {
+            c.remote_model = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--graph")) {
             const char *mode = need_arg(&i, argc, argv, arg);
             if (!strcmp(mode, "off")) c.graph_off = true;
@@ -1663,7 +1713,7 @@ static void agent_worker_append_hints_context(agent_worker *w) {
     const char *note = agent_hints_note(&w->hints);
     pthread_mutex_unlock(&w->mu);
     if (!note) return;
-    ds4_chat_append_message(w->engine, &w->transcript, "system", note);
+    agent_worker_say_system(w, note);
     agent_trace_text(w, "hints-context", note, strlen(note));
     pthread_mutex_lock(&w->mu);
     w->session_dirty = true;
@@ -1792,7 +1842,7 @@ static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
     snprintf(msg, sizeof(msg),
              "Current local date and time at session start: %s. "
              "Use this only when date or time matters.", when);
-    ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
+    agent_worker_say_system(w, msg);
     agent_trace_text(w, "datetime-context", msg, strlen(msg));
     w->datetime_context_injected = true;
 }
@@ -1824,7 +1874,7 @@ static void agent_worker_maybe_load_hooks(agent_worker *w, const agent_config *c
         return;
     }
     ds4_hook_result r = ds4_hooks_run(w->hooks, DS4_HOOK_SESSION_START, "", "", NULL, -1);
-    if (r.output[0]) ds4_chat_append_message(w->engine, &w->transcript, "system", r.output);
+    if (r.output[0]) agent_worker_say_system(w, r.output);
     free(r.output);
 }
 
@@ -1896,7 +1946,7 @@ static void agent_worker_maybe_open_graph(agent_worker *w, const agent_config *c
         strcat(msg, note);
     }
     if (brief && brief[0]) strcat(msg, brief);
-    ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
+    agent_worker_say_system(w, msg);
     agent_trace_text(w, "decision-graph", msg, strlen(msg));
     free(msg);
     free(brief);
@@ -5731,6 +5781,8 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
  * rendered prompt text still matches the file.  The same fixed path is shared
  * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
  * model families rebuilds this cache instead of restoring incompatible KV. */
+static void agent_remote_reset(agent_worker *w);
+
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
     agent_todo_clear(w);
     char *closing;
@@ -5747,6 +5799,10 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     free(closing);
     ds4_dec_release_goal(w->dec);
     w->dec_note_injected = false;
+    if (w->remote) {
+        agent_remote_reset(w);
+        return true;
+    }
     ds4_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
 
@@ -5897,6 +5953,7 @@ static bool agent_worker_has_user_session(agent_worker *w) {
 }
 
 static bool agent_worker_needs_save(agent_worker *w) {
+    if (w->remote) return false;  /* sessions are KV files; a remote one has none here */
     pthread_mutex_lock(&w->mu);
     bool yes = w->user_activity && w->session_dirty;
     pthread_mutex_unlock(&w->mu);
@@ -6725,7 +6782,7 @@ static void agent_switch_completion_callback(const char *buf,
     agent_worker *w = agent_completion_worker;
     static const char cmd[] = "/switch";
     const size_t cmd_len = sizeof(cmd) - 1;
-    if (!w || !buf || strncmp(buf, cmd, cmd_len) != 0) return;
+    if (!w || w->remote || !buf || strncmp(buf, cmd, cmd_len) != 0) return;
 
     const char *p = buf + cmd_len;
     if (*p && *p != ' ' && *p != '\t') return;
@@ -7018,7 +7075,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->user_activity = true;
         w->session_dirty = false;
         w->status.state = AGENT_WORKER_IDLE;
-        w->status.ctx_used = w->transcript.len;
+        w->status.ctx_used = agent_worker_ctx_used(w);
         w->status.ctx_size = agent_worker_effective_ctx_size(w);
         w->status.prefill_tps = 0.0;
         w->status.greedy_sampling = false;
@@ -9938,6 +9995,10 @@ static void agent_tool_view_image(agent_worker *w,
         agent_tool_observation_puts(obs, "Tool error: view_image requires path\n");
         return;
     }
+    if (w->remote) {
+        agent_tool_observation_puts(obs, "Tool error: view_image is not available with --remote\n");
+        return;
+    }
     if (!ds4_engine_has_vision(w->engine)) {
         agent_tool_observation_puts(
             obs, "Tool error: view_image requires ds4-agent --vision FILE\n");
@@ -11572,6 +11633,441 @@ observation_error:
     }
 }
 
+/* ============================================================================
+ * Remote Inference
+ * ============================================================================
+ *
+ * With --remote the model lives on a ds4-server and this process holds no engine.
+ * The tokenizer is in the GGUF, so nothing here can make a token: the transcript
+ * is chat messages instead, and the server renders them. Everything around the
+ * model is the same code as a local turn, because agent_execute_tool_observation
+ * is where permissions, hooks, undo and the graph all happen.
+ *
+ * /v1/chat/completions is the only endpoint that can carry this. /v1/completions
+ * wraps its prompt as one user message, so a transcript rendered here would be
+ * quoted inside a second chat template rather than continued. */
+
+/* What the KV-backed and engine-backed commands would need and a remote session
+ * does not have. */
+static bool agent_remote_refuses(const char *cmd) {
+    static const char *const refused[] = {
+        "/save", "/list", "/switch", "/del", "/strip", "/history", "/power", "/steer", "/think",
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        size_t n = strlen(refused[i]);
+        if (!strncmp(cmd, refused[i], n) && (!cmd[n] || cmd[n] == ' ')) return true;
+    }
+    return false;
+}
+
+static void agent_remote_messages_clear(agent_worker *w) {
+    for (int i = 0; i < w->rmsg_len; i++) free(w->rmsgs[i]);
+    w->rmsg_len = 0;
+    w->rused_tokens = 0;
+    w->rnew_bytes = 0;
+}
+
+/* The same schemas a local Qwen session gets in its prompt, sent as real tools so
+ * the server renders them and hands back structured calls. */
+static const char *agent_remote_tools_json(void) {
+    static char *json;
+    if (json) return json;
+    agent_buf b = {0};
+    agent_buf_puts(&b, "[");
+    const char *p = agent_glm_tool_schemas;
+    for (bool first = true; *p; first = false) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (!first) agent_buf_puts(&b, ",");
+        agent_buf_puts(&b, "{\"type\":\"function\",\"function\":");
+        agent_buf_append(&b, p, len);
+        agent_buf_puts(&b, "}");
+        p += len + (nl ? 1 : 0);
+    }
+    agent_buf_puts(&b, "]");
+    json = agent_buf_take(&b);
+    return json;
+}
+
+/* The local Qwen prompt less its schemas and call syntax, which the server's own
+ * template supplies once tools are sent as tools. */
+static char *agent_remote_system_prompt(void) {
+    const char *role_end = strstr(agent_qwen_tools_prompt_intro, "# Tools");
+    const char *rules = strstr(agent_qwen_tools_prompt_after_schemas, "# Rules");
+    agent_buf b = {0};
+    agent_buf_append(&b, agent_qwen_tools_prompt_intro,
+                     (size_t)(role_end - agent_qwen_tools_prompt_intro));
+    agent_buf_puts(&b, AGENT_TOOL_CONTRACTS);
+    agent_buf_puts(&b, rules);
+    agent_buf_puts(&b, agent_glm_tools_prompt_edit_exact);
+    agent_buf_puts(&b, agent_glm_tools_prompt_rules_tail);
+    return agent_buf_take(&b);
+}
+
+static void agent_remote_reset(agent_worker *w) {
+    agent_remote_messages_clear(w);
+    agent_worker_clear_session_identity(w);
+    w->datetime_context_injected = false;
+    char *prompt = agent_remote_system_prompt();
+    agent_remote_push(w, "system", prompt);
+    free(prompt);
+    if (w->cfg->gen.system && w->cfg->gen.system[0])
+        agent_remote_push(w, "system", w->cfg->gen.system);
+}
+
+static char *agent_remote_messages_json(const agent_worker *w) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "[");
+    for (int i = 0; i < w->rmsg_len; i++) {
+        if (i) agent_buf_puts(&b, ",");
+        agent_buf_puts(&b, w->rmsgs[i]);
+    }
+    agent_buf_puts(&b, "]");
+    return agent_buf_take(&b);
+}
+
+typedef struct {
+    agent_worker *w;
+    bool in_reasoning;
+    bool at_line_start;
+    double started;
+} agent_remote_stream;
+
+static void agent_remote_end_reasoning(agent_remote_stream *st) {
+    if (!st->in_reasoning) return;
+    st->in_reasoning = false;
+    if (isatty(STDOUT_FILENO)) agent_publish(st->w, "\x1b[0m", strlen("\x1b[0m"));
+    agent_publish(st->w, "\n", 1);
+    st->at_line_start = true;
+}
+
+static void agent_remote_on_text(void *ud, bool reasoning, const char *text, size_t len) {
+    agent_remote_stream *st = ud;
+    agent_worker *w = st->w;
+
+    pthread_mutex_lock(&w->mu);
+    w->status.state = AGENT_WORKER_GENERATING;
+    w->status.generated++;
+    double elapsed = now_sec() - st->started;
+    if (elapsed > 0.0) w->status.gen_tps = w->status.generated / elapsed;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+
+    /* Without a terminal, stdout is the answer. */
+    if (reasoning && w->cfg->non_interactive) return;
+    if (reasoning && !st->in_reasoning) {
+        st->in_reasoning = true;
+        if (isatty(STDOUT_FILENO)) agent_publish(w, "\x1b[38;5;245m", strlen("\x1b[38;5;245m"));
+    } else if (!reasoning) {
+        agent_remote_end_reasoning(st);
+    }
+    agent_publish(w, text, len);
+    st->at_line_start = text[len - 1] == '\n';
+}
+
+static bool agent_remote_stream_cancelled(void *ud) {
+    return worker_should_interrupt(((agent_remote_stream *)ud)->w);
+}
+
+/* st carries both the text and the way to cancel; compaction passes one that is
+ * silent by leaving on_text off. */
+static ds4_remote_status agent_remote_ask(agent_worker *w, const char *tools, int max_tokens,
+                                          agent_remote_stream *st, bool show,
+                                          ds4_remote_reply *reply, char *err, size_t err_len) {
+    const agent_generation_options *gen = &w->cfg->gen;
+    ds4_remote_request req = {
+        .max_tokens = max_tokens,
+        .temperature = gen->temperature_set ? gen->temperature : -1.0f,
+        .on_text = show ? agent_remote_on_text : NULL,
+        .cancelled = agent_remote_stream_cancelled,
+        .ud = st,
+    };
+    char *messages = agent_remote_messages_json(w);
+    agent_trace(w, "remote request messages=%d bytes=%zu", w->rmsg_len, strlen(messages));
+    ds4_remote_status rc = ds4_remote_chat(w->remote, messages, tools, &req, reply, err, err_len);
+    free(messages);
+    return rc;
+}
+
+/* Asks the model for the same durable summary a local compaction does, then keeps
+ * every system message and that summary. System messages are kept whole because
+ * they are the graph rules, hooks and instructions, which no summary should
+ * paraphrase. */
+static bool agent_remote_compact(agent_worker *w, const char *reason, char *err, size_t err_len) {
+    static const char system_prefix[] = "{\"role\":\"system\"";
+    agent_set_status(w, AGENT_WORKER_COMPACTING);
+    agent_publishf_system_status(w, "Compacting: %s", reason);
+
+    char *prompt = agent_compact_make_prompt(reason);
+    agent_remote_push(w, "user", prompt);
+    free(prompt);
+    agent_remote_stream st = {.w = w};
+    ds4_remote_reply reply;
+    ds4_remote_status rc = agent_remote_ask(w, NULL, AGENT_COMPACT_SUMMARY_MAX_TOKENS, &st, false,
+                                            &reply, err, err_len);
+    free(w->rmsgs[--w->rmsg_len]);
+    if (rc == DS4_REMOTE_CANCELLED) snprintf(err, err_len, "interrupted");
+    if (rc == DS4_REMOTE_OK && (!reply.content || !reply.content[0])) {
+        snprintf(err, err_len, "compaction failed: the model returned no summary");
+        rc = DS4_REMOTE_FAILED;
+    }
+    if (rc != DS4_REMOTE_OK) {
+        ds4_remote_reply_free(&reply);
+        return false;
+    }
+
+    agent_trace_text(w, "compaction-summary", reply.content, strlen(reply.content));
+    int kept = 0;
+    size_t bytes = 0;
+    for (int i = 0; i < w->rmsg_len; i++) {
+        if (strncmp(w->rmsgs[i], system_prefix, sizeof(system_prefix) - 1)) {
+            free(w->rmsgs[i]);
+            continue;
+        }
+        bytes += strlen(w->rmsgs[i]);
+        w->rmsgs[kept++] = w->rmsgs[i];
+    }
+    w->rmsg_len = kept;
+    w->rused_tokens = 0;
+    w->rnew_bytes = bytes;
+    agent_buf b = {0};
+    agent_buf_puts(&b, "[ds4-agent compacted earlier conversation. Durable task-state summary follows.]\n");
+    agent_buf_puts(&b, reply.content);
+    agent_buf_puts(&b, "\n[End compacted summary. Continue the work from here.]\n");
+    char *summary = agent_buf_take(&b);
+    agent_remote_push(w, "user", summary);
+    free(summary);
+    ds4_remote_reply_free(&reply);
+    return true;
+}
+
+static void agent_remote_take_arg(void *ud, const char *key, const char *value, bool is_string) {
+    agent_tool_call *call = ud;
+    /* Added as not-a-string: that path skips the XML unescape, which belongs to tool
+     * calls written as text and would rewrite a literal &lt;/parameter> in JSON. */
+    agent_tool_call_add_arg(call, key, value, strlen(value), false, NULL);
+    call->args[call->argc - 1].is_string = is_string;
+}
+
+static bool agent_remote_parse_call(const ds4_remote_call *in, agent_tool_call *out) {
+    memset(out, 0, sizeof(*out));
+    if (!in->name || !in->name[0]) return false;
+    out->name = xstrdup(in->name);
+    const char *args = in->arguments && in->arguments[0] ? in->arguments : "{}";
+    return ds4_remote_json_each(args, agent_remote_take_arg, out);
+}
+
+static char *agent_remote_assistant_json(const ds4_remote_reply *reply) {
+    agent_buf b = {0};
+    char *q = ds4_remote_json_quote(reply->content ? reply->content : "");
+    agent_buf_puts(&b, "{\"role\":\"assistant\",\"content\":");
+    agent_buf_puts(&b, q);
+    free(q);
+    if (reply->reasoning && reply->reasoning[0]) {
+        q = ds4_remote_json_quote(reply->reasoning);
+        agent_buf_puts(&b, ",\"reasoning_content\":");
+        agent_buf_puts(&b, q);
+        free(q);
+    }
+    if (reply->call_count) agent_buf_puts(&b, ",\"tool_calls\":[");
+    for (int i = 0; i < reply->call_count; i++) {
+        const ds4_remote_call *c = &reply->calls[i];
+        char fallback[32];
+        snprintf(fallback, sizeof(fallback), "call_%d", i);
+        if (i) agent_buf_puts(&b, ",");
+        q = ds4_remote_json_quote(c->id ? c->id : fallback);
+        agent_buf_puts(&b, "{\"id\":");
+        agent_buf_puts(&b, q);
+        free(q);
+        q = ds4_remote_json_quote(c->name ? c->name : "");
+        agent_buf_puts(&b, ",\"type\":\"function\",\"function\":{\"name\":");
+        agent_buf_puts(&b, q);
+        free(q);
+        q = ds4_remote_json_quote(c->arguments && c->arguments[0] ? c->arguments : "{}");
+        agent_buf_puts(&b, ",\"arguments\":");
+        agent_buf_puts(&b, q);
+        free(q);
+        agent_buf_puts(&b, "}}");
+    }
+    if (reply->call_count) agent_buf_puts(&b, "]");
+    agent_buf_puts(&b, "}");
+    return agent_buf_take(&b);
+}
+
+static void agent_remote_push_tool_result(agent_worker *w, const char *id, int index,
+                                          const char *text) {
+    char fallback[32];
+    snprintf(fallback, sizeof(fallback), "call_%d", index);
+    char *qid = ds4_remote_json_quote(id ? id : fallback);
+    char *qtext = ds4_remote_json_quote(text);
+    size_t n = strlen(qid) + strlen(qtext) + 64;
+    char *json = xmalloc(n);
+    snprintf(json, n, "{\"role\":\"tool\",\"tool_call_id\":%s,\"content\":%s}", qid, qtext);
+    free(qid);
+    free(qtext);
+    agent_remote_push_json(w, json);
+}
+
+static void agent_remote_announce_call(agent_worker *w, const agent_tool_call *call) {
+    const char *arg = agent_hook_arg(call);
+    int shown = (int)strcspn(arg, "\n");
+    if (shown > 100) shown = 100;
+    if (isatty(STDOUT_FILENO))
+        agent_publishf(w, "\x1b[36m● %s\x1b[0m %.*s\n", call->name, shown, arg);
+    else
+        agent_publishf(w, "[tool] %s %.*s\n", call->name, shown, arg);
+}
+
+/* Runs every call in the reply and adds one tool message for each. True when all of
+ * them could at least be understood. */
+static bool agent_remote_run_calls(agent_worker *w, const ds4_remote_reply *reply) {
+    bool understood = true;
+    for (int i = 0; i < reply->call_count; i++) {
+        const ds4_remote_call *in = &reply->calls[i];
+        agent_tool_call call;
+        if (!agent_remote_parse_call(in, &call)) {
+            understood = false;
+            agent_tool_call_free(&call);
+            agent_remote_push_tool_result(w, in->id, i,
+                "Tool error: the call had no name, or its arguments were not a JSON object. "
+                "It did not run.\n");
+            continue;
+        }
+        agent_remote_announce_call(w, &call);
+        agent_tool_calls one = {.v = &call, .len = 1, .cap = 1};
+        agent_tool_observation obs = agent_execute_tool_observation(w, &one);
+        agent_buf text = {0};
+        for (size_t p = 0; p < obs.part_count; p++)
+            if (obs.parts[p].text) agent_buf_puts(&text, obs.parts[p].text);
+        char *result = agent_buf_take(&text);
+        agent_remote_push_tool_result(w, in->id, i, result ? result : "");
+        free(result);
+        agent_tool_observation_free(&obs);
+        agent_tool_call_free(&call);
+    }
+    return understood;
+}
+
+static int worker_remote_stop(agent_worker *w, ds4_remote_status rc, const char *err) {
+    if (rc == DS4_REMOTE_CANCELLED || agent_err_is_interrupted(err)) {
+        agent_trace(w, "remote turn interrupted");
+        agent_publish_system_status(w, "Interrupted.");
+        /* The request stays in the transcript, and a request with no reply is still
+         * open: the model takes it back up on the next message, even when a system
+         * note says not to. A reply is what closes it. */
+        agent_remote_push(w, "assistant", "[Stopped: the user interrupted this request. "
+                                          "I will not continue it unless they ask.]");
+        worker_clear_interrupt(w);
+        agent_set_status(w, AGENT_WORKER_IDLE);
+        return 0;
+    }
+    agent_set_error(w, err[0] ? err : "remote request failed");
+    return 1;
+}
+
+/* The shape of worker_run_turn: tools and model take turns until the model answers
+ * without a call. There is no ceiling on rounds here either. */
+static int worker_run_remote_turn(agent_worker *w, const char *user_text) {
+    agent_config *cfg = w->cfg;
+    pthread_mutex_lock(&w->mu);
+    w->interrupt = false;
+    w->status.error[0] = '\0';
+    w->status.ctx_size = agent_worker_effective_ctx_size(w);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+
+    agent_worker_maybe_append_datetime_context(w);
+    agent_worker_maybe_load_hooks(w, cfg);
+    agent_worker_maybe_open_graph(w, cfg, user_text);
+    agent_worker_append_hints_context(w);
+    agent_trace_text(w, "user", user_text ? user_text : "", user_text ? strlen(user_text) : 0);
+    agent_remote_push(w, "user", user_text ? user_text : "");
+
+    bool call_rejected = false;
+    int call_retries = 0;
+    for (;;) {
+        const int ctx = agent_worker_effective_ctx_size(w);
+        char err[320] = {0};
+        if (agent_worker_ctx_used(w) >= ctx - ctx / 8 &&
+            !agent_remote_compact(w, "soft limit before remote request", err, sizeof(err)))
+            return worker_remote_stop(w, DS4_REMOTE_FAILED, err);
+        agent_worker_append_hints_context(w);
+
+        int room = ctx - agent_worker_ctx_used(w);
+        int max_tokens = cfg->gen.n_predict > 0 && cfg->gen.n_predict < room ?
+            cfg->gen.n_predict : room;
+        if (max_tokens < 1) {
+            agent_set_error(w, "context full after compaction; use /new");
+            return 1;
+        }
+
+        pthread_mutex_lock(&w->mu);
+        w->status.state = AGENT_WORKER_PREFILL;
+        w->status.prefill_done = 0;
+        w->status.prefill_total = 0;
+        w->status.prefill_label = agent_next_prefill_label();
+        w->status.generated = 0;
+        w->status.gen_tps = 0.0;
+        agent_wake_locked(w);
+        pthread_mutex_unlock(&w->mu);
+
+        agent_remote_stream st = {.w = w, .at_line_start = true, .started = now_sec()};
+        ds4_remote_reply reply;
+        ds4_remote_status rc = agent_remote_ask(w, agent_remote_tools_json(), max_tokens, &st, true,
+                                                &reply, err, sizeof(err));
+        agent_remote_end_reasoning(&st);
+        if (!st.at_line_start) agent_publish(w, "\n", 1);
+        if (rc != DS4_REMOTE_OK) {
+            ds4_remote_reply_free(&reply);
+            return worker_remote_stop(w, rc, err);
+        }
+        agent_trace(w, "remote reply prompt=%d cached=%d completion=%d finish=%s calls=%d",
+                    reply.prompt_tokens, reply.cached_tokens, reply.completion_tokens,
+                    reply.finish, reply.call_count);
+        w->rused_tokens = reply.prompt_tokens + reply.completion_tokens;
+        w->rnew_bytes = 0;
+        pthread_mutex_lock(&w->mu);
+        w->status.ctx_used = w->rused_tokens;
+        pthread_mutex_unlock(&w->mu);
+
+        agent_remote_push_json(w, agent_remote_assistant_json(&reply));
+        w->rnew_bytes = 0;  /* the server just counted this reply */
+
+        /* A reply cut off here may be a tool call the server dropped as incomplete,
+         * so stopping quietly would look like the model chose to finish. */
+        if (!strcmp(reply.finish, "length")) {
+            ds4_remote_reply_free(&reply);
+            agent_set_error(w, "the reply was cut off at max_tokens");
+            return 1;
+        }
+
+        if (!reply.call_count) {
+            const char *note = agent_call_retry_note(
+                call_rejected, agent_reply_fakes_tool_call(reply.content), call_retries);
+            ds4_remote_reply_free(&reply);
+            if (!note) {
+                agent_set_status(w, AGENT_WORKER_IDLE);
+                return 0;
+            }
+            call_retries++;
+            call_rejected = false;
+            agent_remote_push(w, "user", note);
+            continue;
+        }
+
+        call_rejected = !agent_remote_run_calls(w, &reply);
+        if (!call_rejected) call_retries = 0;
+        ds4_remote_reply_free(&reply);
+
+        char *queued = worker_request_queued_user_drain(w);
+        if (queued && queued[0]) {
+            agent_trace_text(w, "queued_user", queued, strlen(queued));
+            agent_remote_push(w, "user", queued);
+        }
+        free(queued);
+    }
+}
+
 static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
     pthread_mutex_lock(&w->mu);
@@ -11786,7 +12282,7 @@ static void worker_apply_requested_think(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->cfg->gen.think_mode = mode;
     w->session_dirty |= changed;
-    w->status.ctx_used = w->transcript.len;
+    w->status.ctx_used = agent_worker_ctx_used(w);
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     agent_publishf(w, "\nThinking mode: %s.\n", ds4_think_mode_name(mode));
@@ -11848,6 +12344,18 @@ static void worker_run_deferred_save(agent_worker *w) {
 
 static void worker_run_deferred_compact(agent_worker *w) {
     if (!worker_take_compact_requested(w)) return;
+    if (w->remote) {
+        char err[256] = {0};
+        if (agent_remote_compact(w, "user requested compaction", err, sizeof(err))) {
+            agent_set_status(w, AGENT_WORKER_IDLE);
+        } else if (agent_err_is_interrupted(err)) {
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+        } else {
+            agent_set_error(w, err);
+        }
+        return;
+    }
     if (!agent_worker_has_user_session(w)) {
         agent_publishf(w, "\ncompact skipped: nothing to compact\n");
         return;
@@ -11885,7 +12393,7 @@ static void *worker_main(void *arg) {
                 w->cfg->engine.model_path ? w->cfg->engine.model_path : "",
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};
-    bool init_ok = agent_worker_wait_distributed_route(w, init_err, sizeof(init_err));
+    bool init_ok = w->remote || agent_worker_wait_distributed_route(w, init_err, sizeof(init_err));
     if (init_ok && !w->cfg->gen.raw_prompt)
         init_ok = agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err));
     if (!init_ok) {
@@ -11893,7 +12401,7 @@ static void *worker_main(void *arg) {
     }
     if (w->cfg->gen.raw_prompt)
         agent_trace(w, "raw one-shot prompt mode: skipping agent system prompt");
-    else
+    else if (!w->remote)
         agent_trace_tokens(w, "initial_system_prompt", &w->transcript, 0);
     pthread_mutex_lock(&w->mu);
     w->initialized = true;
@@ -11938,7 +12446,9 @@ static void *worker_main(void *arg) {
         w->cmd_text = NULL;
         pthread_mutex_unlock(&w->mu);
 
-        if (w->cfg->gen.raw_prompt)
+        if (w->remote)
+            worker_run_remote_turn(w, cmd);
+        else if (w->cfg->gen.raw_prompt)
             worker_run_raw_prompt(w, cmd);
         else
             worker_run_turn(w, cmd);
@@ -12059,7 +12569,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
         w->out_len = 0;
         w->out_cap = 0;
     }
-    w->status.ctx_used = w->transcript.len;
+    w->status.ctx_used = agent_worker_ctx_used(w);
     w->status.ctx_size = agent_worker_effective_ctx_size(w);
     w->status.power_percent = worker_status_power_locked(w);
     if (status) *status = w->status;
@@ -12069,7 +12579,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
 
 static void worker_get_status(agent_worker *w, agent_status *status) {
     pthread_mutex_lock(&w->mu);
-    w->status.ctx_used = w->transcript.len;
+    w->status.ctx_used = agent_worker_ctx_used(w);
     w->status.ctx_size = agent_worker_effective_ctx_size(w);
     w->status.power_percent = worker_status_power_locked(w);
     *status = w->status;
@@ -12087,7 +12597,7 @@ static bool worker_is_idle(agent_worker *w) {
 
 static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     pthread_mutex_lock(&w->mu);
-    w->status.ctx_used = w->transcript.len;
+    w->status.ctx_used = agent_worker_ctx_used(w);
     w->status.ctx_size = agent_worker_effective_ctx_size(w);
     w->status.power_percent = worker_status_power_locked(w);
     if (status) *status = w->status;
@@ -13430,7 +13940,8 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     int old_flags;
     set_nonblock(w->wake_fd[0], true, &old_flags);
     set_nonblock(w->wake_fd[1], true, &old_flags);
-    if (ds4_session_create(&w->session, engine, cfg->gen.ctx_size) != 0) {
+    w->remote = cfg->remote;
+    if (!w->remote && ds4_session_create(&w->session, engine, cfg->gen.ctx_size) != 0) {
         fprintf(stderr, "ds4-agent: session backend is required\n");
         return -1;
     }
@@ -13490,8 +14001,10 @@ static void agent_worker_free(agent_worker *w) {
     }
     w->dec = NULL;
     ds4_web_free(w->web);
-    ds4_session_free(w->session);
+    if (w->session) ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
+    agent_remote_messages_clear(w);
+    free(w->rmsgs);
     agent_worker_images_clear(w);
     free(w->cache_dir);
     free(w->sysprompt_path);
@@ -14197,6 +14710,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 bool busy = !worker_is_idle(&worker);
                 if (!cmd[0]) {
                     /* Empty input: just reopen the editor. */
+                } else if (worker.remote && agent_remote_refuses(cmd)) {
+                    printf("%s needs a local model and is not available with --remote\n", cmd);
                 } else if (!strcmp(cmd, "/help")) {
                     runtime_help();
                 } else if (!strcmp(cmd, "/save")) {
@@ -14557,6 +15072,83 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 }
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
+/* The server this session talks to: --remote, then DS4_REMOTE_URL, then the first
+ * line of ~/.ds4/remote. Naming a local model with -m, or --remote off, keeps the
+ * session local. */
+static void agent_remote_resolve(agent_config *cfg) {
+    static char line[512];
+    if (cfg->remote_url) {
+        if (!strcmp(cfg->remote_url, "off")) cfg->remote_url = NULL;
+        return;
+    }
+    if (strcmp(cfg->engine.model_path, "ds4flash.gguf") != 0) return;
+    const char *env = getenv("DS4_REMOTE_URL");
+    if (env && env[0]) {
+        cfg->remote_url = env;
+        return;
+    }
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/.ds4/remote", home);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    if (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, " \t\r\n")] = '\0';
+        if (line[0]) cfg->remote_url = line;
+    }
+    fclose(fp);
+}
+
+static int agent_main_remote(agent_config *cfg) {
+    const char *refused =
+        cfg->gen.raw_prompt ? "--raw-prompt" :
+        cfg->edit_upto ? "--edit-upto" :
+        cfg->resume_latest ? "--continue" :
+        cfg->gen.prefix.count ? "--prefix-file" :
+        ds4_think_mode_level(cfg->gen.think_mode) >= 0 ? "--think-level" : NULL;
+    if (refused) {
+        fprintf(stderr, "ds4-agent: %s needs a local model and does not work with --remote\n",
+                refused);
+        return 2;
+    }
+
+    char err[320] = {0};
+    cfg->remote = ds4_remote_open(cfg->remote_url, cfg->remote_model, err, sizeof(err));
+    if (!cfg->remote) {
+        fprintf(stderr, "ds4-agent: remote %s: %s\n", cfg->remote_url, err);
+        return 1;
+    }
+    /* The server's context is the session's: asking for less here would change nothing
+     * it allocated, and more would only fail later. */
+    cfg->gen.ctx_size = ds4_remote_context(cfg->remote);
+    fprintf(stderr, "ds4-agent: remote model %s at %s, context %d\n",
+            ds4_remote_model(cfg->remote), cfg->remote_url, cfg->gen.ctx_size);
+
+    if (cfg->chdir_path && chdir(cfg->chdir_path) != 0) {
+        fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
+                cfg->chdir_path, strerror(errno));
+        ds4_remote_close(cfg->remote);
+        return 1;
+    }
+    if (!cfg->non_interactive) agent_own_output_descriptions();
+    agent_load_instructions(cfg);
+
+    struct sigaction old_int;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = agent_sigint_handler;
+    bool sigint_installed = !cfg->non_interactive && sigaction(SIGINT, &sa, &old_int) == 0;
+
+    int rc = cfg->non_interactive ? run_agent_non_interactive(NULL, cfg) : run_agent(NULL, cfg);
+
+    if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
+    ds4_remote_close(cfg->remote);
+    free(cfg->gen.prompt_owned);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path) {
@@ -14572,6 +15164,8 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    agent_remote_resolve(&cfg);
+    if (cfg.remote_url) return agent_main_remote(&cfg);
 #ifdef __APPLE__
     agent_start_beside_binary(&cfg);
 #endif

@@ -136,6 +136,20 @@ Run each binary with `--help` for its full options.
 the token history and live model state together, shows prefill progress, and
 uses the model's native tool format. DeepSeek and GLM have their own templates.
 
+With `--remote URL` it holds no model at all and talks to a `ds4-server` over
+`/v1/chat/completions`. Tools, permissions, hooks, `/undo`, `/compact` and the
+decision graph are the same code as a local session; only the model moved.
+
+```sh
+./ds4-agent --remote http://your-server:8000/v1
+```
+
+`DS4_REMOTE_URL` or the first line of `~/.ds4/remote` sets it for every run, and
+`--remote off` or `-m FILE` stays local. Plain HTTP only, so keep it on a tailnet.
+The KV-backed commands (`/save`, `/list`, `/switch`, `/del`, `/strip`, `/history`,
+`--continue`) and the engine-backed ones (`/think`, `/power`, `/steer`, `view_image`)
+need a local model and say so. A remote session is gone when it exits.
+
 Use `/hints on` for occasional, brief explanations of the programming choices
 behind the work, and `/hints off` to stop them. Changes take effect at the next
 conversation boundary without rebuilding the cached context. New and resumed
