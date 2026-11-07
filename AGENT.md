@@ -44,7 +44,7 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 - `ds4_remote.c`, `ds4_remote.h`: `--remote`, chat completions over plain HTTP. Wire
   only; the loop that uses it is `worker_run_remote_turn` in `ds4_agent.c`.
 - `ds4_deciduous.c`, `ds4_deciduous.h`: the deciduous seam, in full. MCP-over-HTTP
-  client, the eight graph operations the model is offered, the git link and audit, the prompt teaching and
+  client (https through the system libcurl on macOS, refused elsewhere), the eight graph operations the model is offered, the git link and audit, the prompt teaching and
   the graph briefing, the recovery note, the compaction digest and the closing
   note. The shared server is the only writer; ds4 stores no graph itself, marks a
   goal completed only through the explicit `/done`, and posts a closing note only

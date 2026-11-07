@@ -25,7 +25,11 @@ DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+# The system's libcurl carries the graph to an https server. Elsewhere https is
+# refused by name and the build needs nothing new.
+TLS_LDLIBS := -lcurl
+TLS_CFLAGS := -DDS4_TLS
+METAL_LDLIBS := $(LDLIBS) $(TLS_LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
@@ -910,7 +914,7 @@ ds4_remote.o: ds4_remote.c ds4_remote.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_remote.c
 
 ds4_deciduous.o: ds4_deciduous.c ds4_deciduous.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_deciduous.c
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) -c -o $@ ds4_deciduous.c
 
 ds4_hooks.o: ds4_hooks.c ds4_hooks.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_hooks.c
@@ -929,7 +933,7 @@ ds4_graph.o: ds4_graph.c ds4_deciduous.h
 
 # The graph's side of git. It links no model, so a git hook can afford to run it.
 ds4-graph: ds4_graph.o ds4_deciduous.o
-	$(CC) $(CFLAGS) -o $@ ds4_graph.o ds4_deciduous.o
+	$(CC) $(CFLAGS) -o $@ ds4_graph.o ds4_deciduous.o $(TLS_LDLIBS)
 
 test-graph-git: ds4-graph
 	./tests/test_graph_git.sh

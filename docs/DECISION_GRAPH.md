@@ -34,17 +34,24 @@ note, the compaction digest, the closing note and the explicit `/done`.
 | Source | What it sets |
 | --- | --- |
 | `~/.config/deciduous/server/.env` | `http://DECIDUOUS_BIND_ADDRESS:DECIDUOUS_PORT/mcp` (default `127.0.0.1:4000`) and `DECIDUOUS_MCP_TOKEN` |
+| `~/.ds4/graph` | first line, a server url, for `ds4-agent` only: `ds4-server`, `ds4-graph` and the tests do not read it |
 | `.deciduous/config.toml` in the workspace or an ancestor | `[remote] url` and `[remote] workspace`, for a repository that lives on a different server |
 | `DECIDUOUS_MCP_URL`, `DECIDUOUS_MCP_TOKEN`, `DECIDUOUS_WORKSPACE`, `DECIDUOUS_BRANCH` | override all of the above |
 | `~/.config/deciduous/credentials` | the token, first line, when nothing else supplied one |
+
+The `.env` token is only ever sent to the server that `.env` describes. Any other
+server gets `DECIDUOUS_MCP_TOKEN` or the credentials file. Outside a repository the
+workspace is `scratch`, the server's own name for work that belongs to no project.
 
 The workspace defaults to the repository directory name and the branch to
 `git branch --show-current` (`main` when that fails); both ride on every request
 as `workspace`/`branch` arguments plus an `X-Deciduous-Workspace` pin. The first
 write creates the workspace server-side, so an empty workspace reads as "nothing
 has been written to it yet" rather than an error ds4 invents. A bare URL gets the
-`/mcp` path. `https://` is refused: ds4 has no TLS client, so point at a plain
-`http://` endpoint — a local server, or a local proxy that speaks TLS onward.
+`/mcp` path. `https://` goes through the system libcurl on macOS, which checks the
+certificate, and takes the url exactly as written, so give it the full path. Other
+platforms have no TLS client and refuse it: point those at a plain `http://`
+endpoint — a local server, or a local proxy that speaks TLS onward.
 
 ## One tool, eight operations
 

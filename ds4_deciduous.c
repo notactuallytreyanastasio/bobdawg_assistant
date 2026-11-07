@@ -16,6 +16,11 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#ifdef DS4_TLS
+#include <curl/curl.h>
+#include <pthread.h>
+#endif
+
 /* The whole seam.  Every read and write goes to the shared deciduous server:
  * MCP over HTTP against the Postgres behind it.  There is no local graph, no
  * cache, and no CLI involved - a write that fails is an error, never a silent
@@ -383,8 +388,8 @@ static void dec_uuid(char *out) {
 
 /* ---- the endpoint ------------------------------------------------------ */
 
-/* http://host:port/path only.  TLS is not implemented in ds4, so https is
- * refused with a clear reason rather than failing silently later. */
+/* http://host:port/path only: https never gets here in a build with TLS, and in
+ * one without it is refused with a clear reason rather than failing later. */
 static bool dec_split_url(const char *url, char *host, size_t host_cap, int *port,
                           char *path, size_t path_cap, char *err, size_t err_len) {
     if (!url || !url[0]) { dec_set_err(err, err_len, "no deciduous server url is set"); return false; }
@@ -392,8 +397,9 @@ static bool dec_split_url(const char *url, char *host, size_t host_cap, int *por
     if (!strncasecmp(p, "http://", 7)) { p += 7; *port = 80; }
     else if (!strncasecmp(p, "https://", 8)) {
         dec_set_err(err, err_len,
-                    "deciduous over https needs TLS and ds4 has no TLS client; point "
-                    "at a plain http:// endpoint (a local server, or an http->https proxy)");
+                    "deciduous over https needs TLS and this build of ds4 has no TLS "
+                    "client; point at a plain http:// endpoint (a local server, or an "
+                    "http->https proxy)");
         return false;
     } else {
         dec_set_err(err, err_len, "deciduous server url must start with http://: %s", url);
@@ -540,9 +546,156 @@ static bool dec_hdr_get(const char *folded, size_t folded_len, const char *name,
     return false;
 }
 
+/* What a reply means once its body is whole, however it travelled. Takes text. */
+static bool dec_http_finish(const char *host, int status, bool event_stream, char *text,
+                            char **out_body, char *err, size_t err_len) {
+    if (!text) text = calloc(1, 1);
+
+    if (status < 200 || status >= 300) {
+        /* A 4xx reply carries the reason the request needs: JSON-RPC nests it
+         * inside error, the REST endpoints keep it at the top level, and a
+         * refused token is only {"error":"unauthorized"}. */
+        const char *nested = dec_json_member(text, "error");
+        char *msg = nested ? dec_json_str(nested, "message") : NULL;
+        if (!msg || !msg[0]) {
+            free(msg);
+            msg = dec_json_str(text, "message");
+        }
+        if (!msg || !msg[0]) {
+            free(msg);
+            msg = dec_json_str(text, "error");
+        }
+        dec_set_err(err, err_len, "%s replied %d%s%s", host, status,
+                    msg && msg[0] ? ": " : "", msg ? msg : "");
+        free(msg);
+        free(text);
+        return false;
+    }
+
+    if (event_stream) {
+        char *msg = dec_sse_payload(text);
+        if (msg) {
+            free(text);
+            text = msg;
+        }
+    }
+    if (!text || !text[0]) {
+        dec_set_err(err, err_len, "%s returned an empty body", host);
+        free(text);
+        return false;
+    }
+    if (out_body) *out_body = text; else free(text);
+    return true;
+}
+
+#ifdef DS4_TLS
+/* https goes through the system's libcurl: the certificate check is the
+ * platform's, and writing a TLS client here would be the one part of this file
+ * nobody could review. Only the wire differs; dec_http_finish reads the reply. */
+
+typedef struct {
+    dec_buf body;
+    char *session;
+} dec_curl_reply;
+
+static size_t dec_curl_body(char *data, size_t size, size_t count, void *ud) {
+    dec_curl_reply *r = ud;
+    size_t n = size * count;
+    /* Short of n ends the transfer with an error, so an oversized reply is
+     * reported, never read as an answer. */
+    if (r->body.len + n > DEC_BODY_MAX || !dec_buf_addn(&r->body, data, n)) return 0;
+    return n;
+}
+
+static size_t dec_curl_header(char *data, size_t size, size_t count, void *ud) {
+    dec_curl_reply *r = ud;
+    size_t n = size * count;
+    const char name[] = "mcp-session-id:";
+    size_t name_len = sizeof(name) - 1;
+    if (r->session && n > name_len && !strncasecmp(data, name, name_len)) {
+        const char *p = data + name_len, *end = data + n;
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        while (end > p && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ')) end--;
+        snprintf(r->session, DEC_SESSION_MAX, "%.*s", (int)(end - p), p);
+    }
+    return n;
+}
+
+static void dec_curl_init(void) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+}
+
+static bool dec_https_post(const char *url, const char *token, const char *session,
+                           const char *pin, const char *body, char **out_body,
+                           int *out_status, char *session_out, char *err, size_t err_len) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, dec_curl_init);
+    CURL *c = curl_easy_init();
+    if (!c) {
+        dec_set_err(err, err_len, "cannot start an https request");
+        return false;
+    }
+
+    struct curl_slist *headers = NULL;
+    char line[DEC_TOKEN_MAX + 64];
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: application/json, text/event-stream");
+    if (token && token[0]) {
+        snprintf(line, sizeof(line), "Authorization: Bearer %s", token);
+        headers = curl_slist_append(headers, line);
+    }
+    if (session && session[0]) {
+        snprintf(line, sizeof(line), "Mcp-Session-Id: %s", session);
+        headers = curl_slist_append(headers, line);
+    }
+    if (pin && pin[0] && !strchr(pin, '*')) {
+        snprintf(line, sizeof(line), "X-Deciduous-Workspace: %s", pin);
+        headers = curl_slist_append(headers, line);
+    }
+
+    dec_curl_reply reply = {.session = session_out};
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "ds4-agent/1");
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(body));
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, dec_curl_body);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &reply);
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, dec_curl_header);
+    curl_easy_setopt(c, CURLOPT_HEADERDATA, &reply);
+    /* Same limit as the plain socket: stalled this long is gone, slow is not. */
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, (long)DEC_TIMEOUT_MS);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, (long)(DEC_TIMEOUT_MS / 1000));
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L); /* the agent writes from worker threads */
+
+    CURLcode rc = curl_easy_perform(c);
+    long status = 0;
+    char *ctype = NULL;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &ctype);
+    bool event_stream = ctype && strstr(ctype, "text/event-stream");
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(c);
+
+    if (rc != CURLE_OK) {
+        dec_set_err(err, err_len, "%s: %s", url, curl_easy_strerror(rc));
+        free(reply.body.p);
+        return false;
+    }
+    if (out_status) *out_status = (int)status;
+    return dec_http_finish(url, (int)status, event_stream, reply.body.p, out_body, err, err_len);
+}
+#endif
+
 static bool dec_http_post(const char *url, const char *token, const char *session,
                           const char *pin, const char *body, char **out_body,
                           int *out_status, char *session_out, char *err, size_t err_len) {
+#ifdef DS4_TLS
+    if (!strncasecmp(url, "https://", 8))
+        return dec_https_post(url, token, session, pin, body, out_body, out_status,
+                              session_out, err, err_len);
+#endif
     char host[256], path[DEC_URL_MAX];
     int port = 80;
     if (!dec_split_url(url, host, sizeof(host), &port, path, sizeof(path), err, err_len)) return false;
@@ -654,43 +807,7 @@ static bool dec_http_post(const char *url, const char *token, const char *sessio
         raw.p = NULL;
         text = copy;
     }
-    if (!text) text = calloc(1, 1);
-
-    if (status < 200 || status >= 300) {
-        /* A 4xx reply carries the reason the request needs: JSON-RPC nests it
-         * inside error, the REST endpoints keep it at the top level, and a
-         * refused token is only {"error":"unauthorized"}. */
-        const char *nested = dec_json_member(text, "error");
-        char *msg = nested ? dec_json_str(nested, "message") : NULL;
-        if (!msg || !msg[0]) {
-            free(msg);
-            msg = dec_json_str(text, "message");
-        }
-        if (!msg || !msg[0]) {
-            free(msg);
-            msg = dec_json_str(text, "error");
-        }
-        dec_set_err(err, err_len, "%s replied %d%s%s", host, status,
-                    msg && msg[0] ? ": " : "", msg ? msg : "");
-        free(msg);
-        free(text);
-        return false;
-    }
-
-    if (event_stream) {
-        char *msg = dec_sse_payload(text);
-        if (msg) {
-            free(text);
-            text = msg;
-        }
-    }
-    if (!text || !text[0]) {
-        dec_set_err(err, err_len, "%s returned an empty body", host);
-        free(text);
-        return false;
-    }
-    if (out_body) *out_body = text; else free(text);
-    return true;
+    return dec_http_finish(host, status, event_stream, text, out_body, err, err_len);
 }
 
 /* ---- where the server is ----------------------------------------------- */
@@ -873,8 +990,21 @@ static bool dec_path_home(char *out, size_t cap, const char *relative) {
     return n > 0 && (size_t)n < cap && access(out, R_OK) == 0;
 }
 
+/* The first line of a small file, without its line ending. */
+static bool dec_first_line(const char *path, char *out, size_t cap) {
+    if (!dec_read_file_small(path, out, cap, NULL)) return false;
+    out[strcspn(out, "\r\n")] = '\0';
+    return out[0] != '\0';
+}
+
+static bool dec_user_server;
+
+void ds4_dec_use_user_server(bool on) {
+    dec_user_server = on;
+}
+
 static bool dec_resolve(ds4_dec *d, const char *root, char *err, size_t err_len) {
-    char home[PATH_MAX], url[DEC_URL_MAX], token[DEC_TOKEN_MAX] = {0};
+    char home[PATH_MAX], url[DEC_URL_MAX] = {0}, token[DEC_TOKEN_MAX] = {0};
     char scratch[DEC_URL_MAX];
     bool have_url = false;
 
@@ -892,7 +1022,13 @@ static bool dec_resolve(ds4_dec *d, const char *root, char *err, size_t err_len)
         snprintf(d->url, sizeof(d->url), "%s", url);
         have_url = true;
         dec_env_value(home, "DECIDUOUS_MCP_TOKEN", token, sizeof(token));
-        if (token[0]) snprintf(d->token, sizeof(d->token), "%s", token);
+    }
+
+    /* This machine's choice of server, under a repository's own. */
+    if (dec_user_server && dec_path_home(home, sizeof(home), ".ds4/graph") &&
+        dec_first_line(home, scratch, sizeof(scratch))) {
+        snprintf(d->url, sizeof(d->url), "%s", scratch);
+        have_url = true;
     }
 
     char cfg[PATH_MAX];
@@ -911,6 +1047,9 @@ static bool dec_resolve(ds4_dec *d, const char *root, char *err, size_t err_len)
     }
     const char *env_token = getenv("DECIDUOUS_MCP_TOKEN");
     if (env_token && env_token[0]) snprintf(d->token, sizeof(d->token), "%s", env_token);
+    /* The local server's token opens the local server. Anywhere else it would
+     * be handing that server's secret to a stranger. */
+    else if (token[0] && !strcmp(d->url, url)) snprintf(d->token, sizeof(d->token), "%s", token);
     const char *env_ws = getenv("DECIDUOUS_WORKSPACE");
     if (env_ws && env_ws[0]) snprintf(d->workspace, sizeof(d->workspace), "%s", env_ws);
     const char *env_branch = getenv("DECIDUOUS_BRANCH");
@@ -918,17 +1057,15 @@ static bool dec_resolve(ds4_dec *d, const char *root, char *err, size_t err_len)
 
     if (!d->token[0] && dec_path_home(home, sizeof(home), ".config/deciduous/credentials")) {
         char creds[DEC_TOKEN_MAX];
-        if (dec_read_file_small(home, creds, sizeof(creds), NULL)) {
-            size_t cut = strcspn(creds, "\r\n");
-            creds[cut] = '\0';
-            if (creds[0]) snprintf(d->token, sizeof(d->token), "%s", creds);
-        }
+        if (dec_first_line(home, creds, sizeof(creds)))
+            snprintf(d->token, sizeof(d->token), "%s", creds);
     }
 
     if (!have_url || !d->url[0]) {
         dec_set_err(err, err_len,
                     "no deciduous server. Point ds4 at the shared graph with [remote] url "
-                    "in %s/.deciduous/config.toml, or DECIDUOUS_MCP_URL. ds4 keeps no local "
+                    "in %s/.deciduous/config.toml, DECIDUOUS_MCP_URL, or for ds4-agent the "
+                    "first line of ~/.ds4/graph. ds4 keeps no local "
                     "graph, so without the server there is nothing to write to.", root);
         return false;
     }
@@ -939,7 +1076,13 @@ static bool dec_resolve(ds4_dec *d, const char *root, char *err, size_t err_len)
         return false;
     }
     if (!d->workspace[0] && !dec_worktree_repo(root, d->workspace, sizeof(d->workspace))) {
-        snprintf(d->workspace, sizeof(d->workspace), "%s", dec_basename(root));
+        /* Outside a repository find_root stops at the top of the path, and a
+         * workspace called Users is no one's project. scratch is the server's
+         * own name for work that belongs to none. */
+        char git[PATH_MAX];
+        snprintf(git, sizeof(git), "%s/.git", root);
+        bool repo = access(git, F_OK) == 0 || access(cfg, R_OK) == 0;
+        snprintf(d->workspace, sizeof(d->workspace), "%s", repo ? dec_basename(root) : "scratch");
     }
     if (!d->branch[0]) {
         if (!dec_git_branch(root, d->branch, sizeof(d->branch)))

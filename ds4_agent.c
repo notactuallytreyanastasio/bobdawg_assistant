@@ -15164,6 +15164,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    ds4_dec_use_user_server(true);
     agent_remote_resolve(&cfg);
     if (cfg.remote_url) return agent_main_remote(&cfg);
 #ifdef __APPLE__

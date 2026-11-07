@@ -43,6 +43,11 @@ typedef struct {
  * falls back to the directory itself. */
 bool ds4_dec_find_root(const char *start, char *out, size_t cap);
 
+/* Let ~/.ds4/graph, a first line holding a server url, choose the server for this
+ * process. A repository's [remote] url and DECIDUOUS_MCP_URL still win. Off unless
+ * asked for, so ds4-server, ds4-graph and the live tests stay where they are. */
+void ds4_dec_use_user_server(bool on);
+
 /* Resolve the server (URL, token, workspace, branch) from the machine and
  * repository configuration, open an MCP session against it and fetch the
  * server's own agent-facing instructions.  NULL when no server is configured

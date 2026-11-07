@@ -146,6 +146,9 @@ decision graph are the same code as a local session; only the model moved.
 
 `DS4_REMOTE_URL` or the first line of `~/.ds4/remote` sets it for every run, and
 `--remote off` or `-m FILE` stays local. Plain HTTP only, so keep it on a tailnet.
+
+The first line of `~/.ds4/graph` picks the deciduous server the agent writes to,
+and https works there on macOS. See [the decision graph](docs/DECISION_GRAPH.md).
 The KV-backed commands (`/save`, `/list`, `/switch`, `/del`, `/strip`, `/history`,
 `--continue`) and the engine-backed ones (`/think`, `/power`, `/steer`, `view_image`)
 need a local model and say so. A remote session is gone when it exits.

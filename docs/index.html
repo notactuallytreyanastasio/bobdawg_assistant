@@ -175,6 +175,11 @@ the first letter, so a long sentence typed at it was split, and a piece starting
 open. A system note saying not to resume it did not work; a closing assistant reply did.</p>
 <p>Not done: remote sessions are not saved, so <code>/save</code>, <code>--continue</code> and the commands
 around them refuse. Images do not work remotely, and neither does <code>/think</code>.</p>
+<p>The agent can now write to a graph server over https, through the system's libcurl, on macOS only.
+The first line of <code>~/.ds4/graph</code> names the server. Pointing at another server exposed a leak:
+the local server's token was loaded first and kept, so it would have gone to whichever server came
+next. A token now goes only to the server it belongs to. Outside a repository the workspace had been the
+top of the path, <code>Users</code> or <code>private</code>; it is now <code>scratch</code>.</p>
 
 <h2 id="2026-11-06-graph-page">A page for walking the graph</h2>
 <p><time datetime="2026-11-06">2026-11-06</time></p>

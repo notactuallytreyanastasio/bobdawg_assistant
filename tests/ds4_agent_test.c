@@ -759,6 +759,7 @@ typedef struct {
     volatile int tool_calls;
     char last_body[8192];
     size_t last_len;
+    char last_auth[128];
     pthread_t thread;
 } fake_mcp;
 
@@ -792,7 +793,10 @@ static void *fake_mcp_main(void *arg) {
         body = body ? body + 4 : req;
         if (strstr(body, "\"initialize\"")) {
             char head[96];
+            const char *auth = strcasestr(req, "authorization:");
             f->initializes++;
+            snprintf(f->last_auth, sizeof(f->last_auth), "%.*s",
+                     auth ? (int)strcspn(auth, "\r\n") : 0, auth ? auth : "");
             snprintf(head, sizeof(head), "200 OK\r\nMcp-Session-Id: fake-%d", f->initializes);
             fake_reply(fd, head, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":"
                                  "{\"instructions\":\"the fake rules\"}}");
@@ -855,6 +859,78 @@ static char *fake_call(ds4_dec *d, const char *tool, const ds4_dec_arg *args, in
                        char *err, size_t err_len) {
     ds4_dec_call call = {.tool = tool, .args = args, .argc = argc};
     return ds4_dec_execute(d, &call, err, err_len);
+}
+
+/* Which server, with whose token, under which workspace. HOME is a throwaway so
+ * the machine's real files play no part. */
+static void test_deciduous_server_choice(void) {
+    fake_mcp f;
+    ds4_dec *d;
+    char dir[] = "/tmp/ds4-choice-XXXXXX";
+    char home[PATH_MAX], path[PATH_MAX + 64], cmd[PATH_MAX * 2], url[64];
+    const char *real_home = getenv("HOME");
+    char *saved_home = real_home ? strdup(real_home) : NULL;
+    FILE *fp;
+
+    AGENT_TEST_ASSERT(mkdtemp(dir) != NULL);
+    snprintf(home, sizeof(home), "%s/home", dir);
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/.config/deciduous/server %s/.ds4 %s/plain/sub", home, home, dir);
+    AGENT_TEST_ASSERT(system(cmd) == 0);
+    setenv("HOME", home, 1);
+    AGENT_TEST_ASSERT(fake_mcp_start(&f));
+    snprintf(url, sizeof(url), "%s", getenv("DECIDUOUS_MCP_URL"));
+    unsetenv("DECIDUOUS_MCP_TOKEN");
+    unsetenv("DECIDUOUS_WORKSPACE");
+    unsetenv("DECIDUOUS_BRANCH");
+
+    snprintf(path, sizeof(path), "%s/.config/deciduous/server/.env", home);
+    fp = fopen(path, "w");
+    AGENT_TEST_ASSERT(fp != NULL);
+    /* Nothing listens on port 1: reaching the fake proves the choice was made. */
+    fprintf(fp, "DECIDUOUS_BIND_ADDRESS=127.0.0.1\nDECIDUOUS_PORT=1\nDECIDUOUS_MCP_TOKEN=local-secret\n");
+    fclose(fp);
+    snprintf(path, sizeof(path), "%s/.config/deciduous/credentials", home);
+    fp = fopen(path, "w");
+    AGENT_TEST_ASSERT(fp != NULL);
+    fprintf(fp, "hosted-token\n");
+    fclose(fp);
+
+    /* The local server's token never leaves for another server. */
+    snprintf(path, sizeof(path), "%s/plain/sub", dir);
+    d = ds4_dec_open(path, "tester");
+    AGENT_TEST_ASSERT(d != NULL && ds4_dec_active(d));
+    AGENT_TEST_ASSERT(strstr(f.last_auth, "hosted-token") != NULL);
+    AGENT_TEST_ASSERT(strstr(f.last_auth, "local-secret") == NULL);
+    /* Outside a repository the work is scratch, not the path's top directory. */
+    AGENT_TEST_ASSERT(strstr(ds4_dec_prompt_section(d), "Workspace \"scratch\"") != NULL);
+    ds4_dec_close(d);
+
+    /* ~/.ds4/graph counts only for a process that asked, and only then. */
+    unsetenv("DECIDUOUS_MCP_URL");
+    snprintf(path, sizeof(path), "%s/.ds4/graph", home);
+    fp = fopen(path, "w");
+    AGENT_TEST_ASSERT(fp != NULL);
+    fprintf(fp, "%s\nnot this line\n", url);
+    fclose(fp);
+    snprintf(path, sizeof(path), "%s/plain", dir);
+    int before = f.initializes;
+    d = ds4_dec_open(path, "tester");
+    AGENT_TEST_ASSERT(!ds4_dec_active(d));
+    AGENT_TEST_ASSERT(f.initializes == before);
+    ds4_dec_close(d);
+    ds4_dec_use_user_server(true);
+    d = ds4_dec_open(path, "tester");
+    ds4_dec_use_user_server(false);
+    AGENT_TEST_ASSERT(d != NULL && ds4_dec_active(d));
+    AGENT_TEST_ASSERT(f.initializes == before + 1);
+    AGENT_TEST_ASSERT(strstr(f.last_auth, "hosted-token") != NULL);
+    ds4_dec_close(d);
+
+    fake_mcp_stop(&f);
+    if (saved_home) setenv("HOME", saved_home, 1); else unsetenv("HOME");
+    free(saved_home);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    AGENT_TEST_ASSERT(system(cmd) == 0);
 }
 
 static void test_deciduous_seam_failures(void) {
@@ -2337,6 +2413,7 @@ int main(int argc, char **argv) {
     test_output_descriptions();
     test_todo_and_edit_all();
     test_deciduous_git();
+    test_deciduous_server_choice();
     test_deciduous_seam_failures();
     test_deciduous_graph();
     if (agent_test_failures) {
