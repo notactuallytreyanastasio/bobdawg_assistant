@@ -1921,7 +1921,7 @@ static void agent_worker_maybe_open_graph(agent_worker *w, const agent_config *c
             return;
         }
         if (cfg->goal && cfg->goal[0]) {
-            goal_obs = ds4_dec_bind_goal(w->dec, cfg->goal);
+            goal_obs = ds4_dec_claim_goal(w->dec, cfg->goal);
             if (goal_obs && goal_obs[0]) {
                 fprintf(stderr, "ds4-agent: %s\n", goal_obs);
                 agent_trace_text(w, "decision-graph-goal", goal_obs, strlen(goal_obs));
@@ -14753,7 +14753,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         if (closing && closing[0]) fprintf(stderr, "ds4-agent: %s\n", closing);
                         free(closing);
                         ds4_dec_release_goal(worker.dec);
-                        obs = ds4_dec_bind_goal(worker.dec, arg);
+                        obs = ds4_dec_claim_goal(worker.dec, arg);
                         if (!ds4_dec_goal_bound(worker.dec)) {
                             printf("could not bind that goal: %s\n", obs ? obs : "no reason given");
                         } else {

@@ -150,6 +150,9 @@ static int run_hook(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc < 2) return usage();
+    /* Commits belong in the graph the agent writes to. The hook tests turn this
+     * off, because they must never reach a real graph. */
+    ds4_dec_use_user_server(!getenv("DS4_GRAPH_LOCAL"));
     const char *cmd = argv[1];
     if (!strcmp(cmd, "hook")) return run_hook(argc - 2, argv + 2);
     if (!strcmp(cmd, "install")) {

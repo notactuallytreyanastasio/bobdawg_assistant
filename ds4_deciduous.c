@@ -2696,6 +2696,55 @@ char *ds4_dec_bind_goal(ds4_dec *d, const char *prompt) {
     return dec_op_goal(d, prompt);
 }
 
+/* The open goal in this workspace with exactly this title, from any branch: the
+ * work outlives the branch it began on. The search is the server's and is loose,
+ * so the title is compared here. */
+static char *dec_open_goal_titled(ds4_dec *d, const char *title, char *err, size_t err_len) {
+    dec_args a;
+    dec_args_init(&a);
+    dec_args_str(&a, "type", "goal");
+    dec_args_str(&a, "status", "active");
+    dec_args_str(&a, "search", title);
+    dec_args_int(&a, "limit", 50);
+    char *payload = dec_tool_ctx(d, "query_nodes", &a, false, err, err_len);
+    if (!payload) return NULL;
+    char *nodes = dec_json_raw(payload, "nodes");
+    free(payload);
+    char *found = NULL;
+    for (int i = 0; nodes && !found; i++) {
+        const char *elem = dec_json_elem(nodes, i);
+        if (!elem) break;
+        char *have = dec_json_str(elem, "title");
+        if (have && !strcmp(have, title)) found = dec_json_str(elem, "id");
+        free(have);
+    }
+    free(nodes);
+    return found;
+}
+
+char *ds4_dec_claim_goal(ds4_dec *d, const char *text) {
+    if (!d || !d->active) return NULL;
+    if (!text || !text[0] || d->goal_id[0]) return dec_op_goal(d, text);
+
+    char err[512] = {0}, title[DS4_DEC_GOAL_TITLE_MAX];
+    dec_clip_title(title, sizeof(title), text);
+    char *id = dec_open_goal_titled(d, title, err, sizeof(err));
+    /* Unable to look is not the same as nothing there, and writing on would make
+     * the duplicate this exists to prevent. */
+    if (err[0]) return dec_fail(err);
+    if (!id) return dec_op_goal(d, text);
+
+    snprintf(d->goal_id, sizeof(d->goal_id), "%s", id);
+    snprintf(d->goal_title, sizeof(d->goal_title), "%s", title);
+    d->goal_bound = true;
+    d->offered_goal_id[0] = '\0';
+    dec_export_goal(d);
+    dec_buf b = {0};
+    dec_buf_addf(&b, "Goal already open on the server, claimed\nid %s, held by this session\n", id);
+    free(id);
+    return b.p ? b.p : strdup("");
+}
+
 void ds4_dec_release_goal(ds4_dec *d) {
     if (!d) return;
     /* The goal stays on offer on purpose: a new session in the same workspace

@@ -749,6 +749,7 @@ typedef enum {
     FAKE_TRUNCATE_DECLARED,   /* promises more bytes than it sends */
     FAKE_TRUNCATE_JSON,       /* closes cleanly in the middle of the JSON */
     FAKE_STALE_ONCE,          /* refuses the current session, once */
+    FAKE_OPEN_GOALS,          /* lists open goals for a query_nodes */
 } fake_mode;
 
 typedef struct {
@@ -811,6 +812,14 @@ static void *fake_mcp_main(void *arg) {
                 fake_reply(fd, "404 Not Found",
                            "{\"error\":{\"code\":-32001,\"message\":\"Session not found\"},"
                            "\"id\":1,\"jsonrpc\":\"2.0\"}");
+            } else if (f->mode == FAKE_OPEN_GOALS && strstr(body, "query_nodes")) {
+                /* A loose match first: the server's search is not an equality. */
+                fake_reply(fd, "200 OK",
+                           "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\","
+                           "\"text\":\"{\\\"nodes\\\":["
+                           "{\\\"id\\\":\\\"22222222-near\\\",\\\"title\\\":\\\"ship the thing soon\\\"},"
+                           "{\\\"id\\\":\\\"33333333-open\\\",\\\"title\\\":\\\"ship the thing\\\"}"
+                           "]}\"}]}}");
             } else if (f->mode == FAKE_TRUNCATE_DECLARED) {
                 const char *cut = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                                   "Content-Length: 500\r\n\r\n{\"jsonrpc\":\"2.0\",\"res";
@@ -925,6 +934,31 @@ static void test_deciduous_server_choice(void) {
     AGENT_TEST_ASSERT(f.initializes == before + 1);
     AGENT_TEST_ASSERT(strstr(f.last_auth, "hosted-token") != NULL);
     ds4_dec_close(d);
+
+    /* A goal the operator names is taken up when it is open, title for title. */
+    f.mode = FAKE_OPEN_GOALS;
+    setenv("DECIDUOUS_MCP_URL", url, 1);
+    d = ds4_dec_open(path, "tester");
+    AGENT_TEST_ASSERT(d != NULL);
+    char *held = ds4_dec_claim_goal(d, "ship the thing");
+    AGENT_TEST_ASSERT(held && strstr(held, "33333333-open") != NULL);
+    AGENT_TEST_ASSERT(strstr(f.last_body, "add_node") == NULL);
+    free(held);
+    ds4_dec_close(d);
+    /* A near match is a different goal, and an opening prompt never claims. */
+    d = ds4_dec_open(path, "tester");
+    AGENT_TEST_ASSERT(d != NULL);
+    held = ds4_dec_claim_goal(d, "ship the");
+    AGENT_TEST_ASSERT(held && strstr(held, "11111111-aaaa") != NULL);
+    free(held);
+    ds4_dec_close(d);
+    d = ds4_dec_open(path, "tester");
+    AGENT_TEST_ASSERT(d != NULL);
+    held = ds4_dec_bind_goal(d, "ship the thing");
+    AGENT_TEST_ASSERT(held && strstr(held, "11111111-aaaa") != NULL);
+    free(held);
+    ds4_dec_close(d);
+    f.mode = FAKE_OK;
 
     fake_mcp_stop(&f);
     if (saved_home) setenv("HOME", saved_home, 1); else unsetenv("HOME");

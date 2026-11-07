@@ -160,6 +160,19 @@ without one.</p>
     the changes pane does not show what a shell command changed.</li>
 </ul>
 
+<h2 id="2026-11-07-one-goal-one-graph">One goal, one graph, and a flaky test that was a bug</h2>
+<p><time datetime="2026-11-07">2026-11-07</time></p>
+
+<p><code>--goal</code> and <code>/goal</code> now take up an open goal of exactly that title instead of
+writing a second one. An opening prompt still writes its own, because the same words a month later are
+usually new work. <code>ds4-graph</code> now reads <code>~/.ds4/graph</code> too, so commits are audited
+against the graph the agent writes to.</p>
+<p>A live test had been failing about one run in twenty-seven with no visible cause. The audit only
+accepted a commit hash with a letter in it, and one short hash in twenty-seven is all digits. Such a hash
+went unread, and it ended the list it sat in, so the hash after it went unread as well. A test with a
+fixed all-digit hash failed every time; the fix passed twelve runs in a row. An all-letter hash, about one
+in a thousand, is still skipped, because it cannot be told from a word like "defaced".</p>
+
 <h2 id="2026-11-06-remote-agent">The agent without a model</h2>
 <p><time datetime="2026-11-06">2026-11-06</time></p>
 

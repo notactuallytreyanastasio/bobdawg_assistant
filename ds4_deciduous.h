@@ -45,7 +45,7 @@ bool ds4_dec_find_root(const char *start, char *out, size_t cap);
 
 /* Let ~/.ds4/graph, a first line holding a server url, choose the server for this
  * process. A repository's [remote] url and DECIDUOUS_MCP_URL still win. Off unless
- * asked for, so ds4-server, ds4-graph and the live tests stay where they are. */
+ * asked for, so ds4-server and the live tests stay where they are. */
 void ds4_dec_use_user_server(bool on);
 
 /* Resolve the server (URL, token, workspace, branch) from the machine and
@@ -89,6 +89,11 @@ char *ds4_dec_briefing(ds4_dec *d);
  * observation, which on failure says why: ds4_dec_goal_bound() is what tells the
  * two apart, because a refusal is text too. */
 char *ds4_dec_bind_goal(ds4_dec *d, const char *prompt);
+
+/* The same for a goal the operator named: an open goal in this workspace with exactly
+ * this title is taken up instead of written again. An opening prompt does not come
+ * here, because "run the tests" a month later is new work with an old name. */
+char *ds4_dec_claim_goal(ds4_dec *d, const char *text);
 
 /* Whether a goal is already bound; lets the harness auto-bind the opening
  * user request as the goal when --goal was not supplied. */

@@ -9,6 +9,7 @@ trap 'rm -rf "$work"' EXIT
 # A branch per run: the last run's repository is gone, so its hashes really are stale.
 export DECIDUOUS_WORKSPACE=ds4-selftest DECIDUOUS_BRANCH=githooks-selftest-$$-$(date +%s)
 unset DS4_DEC_GOAL
+export DS4_GRAPH_LOCAL=1 # ~/.ds4/graph may name a real graph
 failed=0
 check() { # check "what" command...
   what=$1; shift

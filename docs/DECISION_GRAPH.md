@@ -34,7 +34,7 @@ note, the compaction digest, the closing note and the explicit `/done`.
 | Source | What it sets |
 | --- | --- |
 | `~/.config/deciduous/server/.env` | `http://DECIDUOUS_BIND_ADDRESS:DECIDUOUS_PORT/mcp` (default `127.0.0.1:4000`) and `DECIDUOUS_MCP_TOKEN` |
-| `~/.ds4/graph` | first line, a server url, for `ds4-agent` only: `ds4-server`, `ds4-graph` and the tests do not read it |
+| `~/.ds4/graph` | first line, a server url, for `ds4-agent` and `ds4-graph`: `ds4-server` and the tests do not read it |
 | `.deciduous/config.toml` in the workspace or an ancestor | `[remote] url` and `[remote] workspace`, for a repository that lives on a different server |
 | `DECIDUOUS_MCP_URL`, `DECIDUOUS_MCP_TOKEN`, `DECIDUOUS_WORKSPACE`, `DECIDUOUS_BRANCH` | override all of the above |
 | `~/.config/deciduous/credentials` | the token, first line, when nothing else supplied one |
