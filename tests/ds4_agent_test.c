@@ -1711,6 +1711,21 @@ static void test_deciduous_git(void) {
         AGENT_TEST_ASSERT(strstr(out, "4931eb9d") == NULL);
         free(out);
 
+        /* About one short hash in twenty-seven is all digits, and rewriting a mention
+         * can make one. It is still a hash, and the list goes on after it. */
+        {
+            const ds4_dec_arg digits[] = {{"title", "a claim in digits"},
+                                          {"description", "Commits 7654321, fed8765."}};
+            ds4_dec_call claim = {.tool = "note", .args = digits, .argc = 2};
+            out = ds4_dec_execute(d, &claim, err, sizeof(err));
+            AGENT_TEST_ASSERT(out != NULL);
+            free(out);
+            out = ds4_dec_git_audit(d, "HEAD", &problems, err, sizeof(err));
+            AGENT_TEST_ASSERT(out && strstr(out, "names 7654321") != NULL);
+            AGENT_TEST_ASSERT(strstr(out, "names fed8765") != NULL);
+            free(out);
+        }
+
         /* A mention in text moves too, at the length it was written. */
         out = ds4_dec_git_rewrite(d, "abc1234", "HEAD", err, sizeof(err));
         AGENT_TEST_ASSERT(out && strstr(out, "in 1 node") != NULL);

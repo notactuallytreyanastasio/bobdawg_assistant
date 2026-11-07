@@ -2287,17 +2287,17 @@ static void dec_hash_add(dec_hash_set *s, const char *hash, size_t len) {
 }
 
 /* One hex word at p, of a length a commit is written at, with something in it no plain
- * word has: a digit and a letter. Returns its length, or 0. */
+ * word has: a digit. "defaced" is English; 1234567 after the word commit is a hash, and
+ * about one short hash in twenty-seven looks like that. Returns its length, or 0. */
 static size_t dec_hash_word(const char *p) {
     size_t len = 0;
-    bool digit = false, letter = false;
+    bool digit = false;
     while (dec_is_hex(p[len])) {
         if (isdigit((unsigned char)p[len])) digit = true;
-        else letter = true;
         len++;
     }
     bool whole = !isalnum((unsigned char)p[len]) && p[len] != '-';
-    return len >= 7 && len <= 40 && digit && letter && whole ? len : 0;
+    return len >= 7 && len <= 40 && digit && whole ? len : 0;
 }
 
 /* Hashes written as such: "commit X", "Committed as X", "Commits X, Y and Z". The hash
