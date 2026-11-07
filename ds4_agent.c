@@ -13530,7 +13530,25 @@ static const char *agent_yes_no_auto_name(agent_yes_no_auto answer) {
     }
 }
 
-/* y, n or a, waiting as long as it takes. A closed terminal is a no. */
+/* A whole answer, or 0. The whole line has to be the word: this grants permission, so
+ * a sentence that happens to start with one of these letters must not count. */
+static char agent_parse_choice(const char *line) {
+    static const struct {
+        const char *word;
+        char choice;
+    } words[] = {{"y", 'y'}, {"yes", 'y'}, {"n", 'n'}, {"no", 'n'}, {"a", 'a'}, {"always", 'a'}};
+    while (*line == ' ' || *line == '\t') line++;
+    size_t n = strlen(line);
+    while (n && isspace((unsigned char)line[n - 1])) n--;
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+        if (strlen(words[i].word) == n && !strncasecmp(line, words[i].word, n))
+            return words[i].choice;
+    return 0;
+}
+
+/* y, n or a, waiting as long as it takes. A closed terminal is a no. A line too long
+ * for buf is read to its end and refused: left in the stream, its next piece would be
+ * taken as the answer, and "...and what" would then read as "a", always allow. */
 static char agent_prompt_choice(const char *prompt) {
     char buf[32];
     for (;;) {
@@ -13540,13 +13558,17 @@ static char agent_prompt_choice(const char *prompt) {
         if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
             fcntl(STDIN_FILENO, F_SETFL, saved_flags & ~O_NONBLOCK);
         bool got_line = fgets(buf, sizeof(buf), stdin) != NULL;
+        bool whole = got_line && strchr(buf, '\n') != NULL;
+        if (got_line && !whole) {
+            int c;
+            while ((c = getchar()) != EOF && c != '\n') {}
+            if (c == EOF) got_line = false;
+        }
         if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
             fcntl(STDIN_FILENO, F_SETFL, saved_flags);
         if (!got_line) return 'n';
-        char *p = buf;
-        while (*p == ' ' || *p == '\t') p++;
-        char c = (char)tolower((unsigned char)*p);
-        if (c == 'y' || c == 'n' || c == 'a') return c;
+        char c = whole ? agent_parse_choice(buf) : 0;
+        if (c) return c;
     }
 }
 

@@ -23,6 +23,20 @@ static void test_fixture(const char *name, const char *data, size_t len) {
     AGENT_TEST_ASSERT(fclose(fp) == 0);
 }
 
+/* Permission is granted by this parse, so only the whole word may count. */
+static void test_permission_answers(void) {
+    AGENT_TEST_ASSERT(agent_parse_choice("y\n") == 'y');
+    AGENT_TEST_ASSERT(agent_parse_choice("  YES \n") == 'y');
+    AGENT_TEST_ASSERT(agent_parse_choice("n\n") == 'n');
+    AGENT_TEST_ASSERT(agent_parse_choice("no\n") == 'n');
+    AGENT_TEST_ASSERT(agent_parse_choice("a\n") == 'a');
+    AGENT_TEST_ASSERT(agent_parse_choice("always\n") == 'a');
+    AGENT_TEST_ASSERT(agent_parse_choice("at is the project code word\n") == 0);
+    AGENT_TEST_ASSERT(agent_parse_choice("yeah go on\n") == 0);
+    AGENT_TEST_ASSERT(agent_parse_choice("nope\n") == 0);
+    AGENT_TEST_ASSERT(agent_parse_choice("\n") == 0);
+}
+
 static void test_tool_arg(agent_tool_call *call, const char *name, const char *value) {
     agent_tool_call_add_arg(call, name, value, strlen(value), true, "</arg_value>");
 }
@@ -2299,6 +2313,7 @@ int main(int argc, char **argv) {
         AGENT_TEST_ASSERT(!bcfg.graph_off);
     }
     ds4_agent_unit_tests_run();
+    test_permission_answers();
     test_v41_tool_syntax();
     test_qwen_tool_syntax();
     test_compaction_boundaries();
